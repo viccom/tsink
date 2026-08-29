@@ -455,7 +455,10 @@ impl ChunkStorage {
         tracing::error!(
             worker = worker,
             fail_fast_enabled,
-            error = %error,
+            // Debug rendering carries the full error chain (e.g. an
+            // IoWithPath variant embeds the io::Error source with its OS
+            // code), unlike Display which only shows the top-level message.
+            error = ?error,
             "Background worker execution failed"
         );
     }

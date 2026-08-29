@@ -1162,7 +1162,13 @@ fn test_close_failure_can_be_retried_on_same_handle() {
     fs::write(&numeric_lane_root, b"conflict").unwrap();
 
     let first_close_err = storage.close().unwrap_err();
-    assert!(matches!(first_close_err, TsinkError::Io(_)));
+    // The staging-directory instrumentation enriches pathless IO failures
+    // with the offending path, so close failures may surface as either
+    // IO-class variant.
+    assert!(matches!(
+        first_close_err,
+        TsinkError::Io(_) | TsinkError::IoWithPath { .. }
+    ));
 
     fs::remove_file(&numeric_lane_root).unwrap();
     storage.close().unwrap();

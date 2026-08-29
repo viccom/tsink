@@ -133,7 +133,14 @@ impl SegmentWriter {
 
         sync_dir(&self.staging_layout.root)?;
         ensure_publish_target_clear(&self.layout)?;
-        fs::rename(&self.staging_layout.root, &self.layout.root)?;
+        // Instrument the publish rename with the destination path so os error 3
+        // (path not found) forensics point at the affected segment directory.
+        fs::rename(&self.staging_layout.root, &self.layout.root).map_err(|source| {
+            TsinkError::IoWithPath {
+                path: self.layout.root.clone(),
+                source,
+            }
+        })?;
 
         let publish_sync_result = (|| -> Result<()> {
             sync_dir(&self.layout.root)?;
@@ -161,9 +168,15 @@ fn prepare_staging_dir(path: &Path) -> Result<()> {
             "staging directory has no parent".to_string(),
         ));
     };
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(|source| TsinkError::IoWithPath {
+        path: parent.to_path_buf(),
+        source,
+    })?;
     remove_path_if_exists(path)?;
-    fs::create_dir_all(path)?;
+    fs::create_dir_all(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
