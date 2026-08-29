@@ -179,6 +179,7 @@ impl StorageStateAssembly {
             compaction_thread: Mutex::new(compaction_thread),
             flush_thread: Mutex::new(None),
             flush_thread_wakeup_requested: AtomicBool::new(false),
+            flush_thread_pressure_relief_requested: AtomicBool::new(false),
             persisted_refresh_thread: Mutex::new(None),
             rollup_thread: Mutex::new(None),
             fail_fast_enabled: background_fail_fast,

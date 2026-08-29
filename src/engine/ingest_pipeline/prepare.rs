@@ -299,7 +299,11 @@ impl<'a> WriteAdmissionControlContext<'a> {
 
         self.observability
             .record_admission_pressure_relief_request();
-        self.workers.notify_flush_thread();
+        // Relief must be able to release the current head's memory: with all
+        // buffered data in the live head (the steady-state shape), an
+        // eligible-only wakeup seals nothing and the writer idles until
+        // write_timeout with nothing reclaimable.
+        self.workers.notify_flush_thread_pressure_relief();
         self.workers.notify_persisted_refresh_thread();
         true
     }

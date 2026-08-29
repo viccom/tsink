@@ -236,6 +236,7 @@ struct BackgroundWorkerSupervisorState {
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread_wakeup_requested: AtomicBool,
+    flush_thread_pressure_relief_requested: AtomicBool,
     persisted_refresh_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     rollup_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     fail_fast_enabled: bool,

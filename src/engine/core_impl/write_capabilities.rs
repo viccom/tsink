@@ -19,11 +19,15 @@ impl<'a> WorkerWakeContext<'a> {
         }
     }
 
-    pub(in crate::engine::storage_engine) fn notify_flush_thread(self) {
+    /// Admission pressure relief needs a flush that can also seal the current
+    /// head: a plain eligible-only wakeup cannot release the memory a writer
+    /// idling on budget pressure is waiting for, so this raises a dedicated
+    /// wakeup flag that the flush worker services with a bounded pass.
+    pub(in crate::engine::storage_engine) fn notify_flush_thread_pressure_relief(self) {
         let background = self.background;
         Self::wake_thread(
             &background.flush_thread,
-            Some(&background.flush_thread_wakeup_requested),
+            Some(&background.flush_thread_pressure_relief_requested),
         );
     }
 

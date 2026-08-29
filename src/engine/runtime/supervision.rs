@@ -80,6 +80,11 @@ impl BackgroundWorkerSupervisorState {
             .swap(false, Ordering::SeqCst)
     }
 
+    pub(super) fn take_flush_pressure_relief_request(&self) -> bool {
+        self.flush_thread_pressure_relief_requested
+            .swap(false, Ordering::SeqCst)
+    }
+
     fn take_thread(&self, worker: BackgroundThreadKind) -> Option<std::thread::JoinHandle<()>> {
         self.thread_slot(worker).lock().take()
     }
@@ -203,6 +208,7 @@ mod tests {
             compaction_thread: Mutex::new(None),
             flush_thread: Mutex::new(None),
             flush_thread_wakeup_requested: AtomicBool::new(false),
+            flush_thread_pressure_relief_requested: AtomicBool::new(false),
             persisted_refresh_thread: Mutex::new(None),
             rollup_thread: Mutex::new(None),
             fail_fast_enabled: false,
