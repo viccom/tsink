@@ -312,7 +312,16 @@ impl SeriesRegistry {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_existing_dictionary_walks(&self) -> usize {
+        self.resolve_existing_dictionary_walks
+            .load(Ordering::Acquire)
+    }
+
     pub fn resolve_existing(&self, metric: &str, labels: &[Label]) -> Option<SeriesResolution> {
+        #[cfg(test)]
+        self.resolve_existing_dictionary_walks
+            .fetch_add(1, Ordering::AcqRel);
         validate_metric(metric).ok()?;
         let metric_id = self.metric_dict.read().get_id(metric)?;
         let normalized_labels = canonicalize_labels(labels).ok()?;

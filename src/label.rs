@@ -52,6 +52,21 @@ pub fn canonical_series_identity(metric: &str, labels: &[Label]) -> Vec<u8> {
     marshal_metric_name(metric, labels)
 }
 
+/// Order-insensitive equality between a canonical (sorted) label set and a
+/// candidate label set in arbitrary order. The candidate pays one
+/// clone-and-sort only when it is not already sorted.
+pub fn labels_equal_canonical(canonical: &[Label], candidate: &[Label]) -> bool {
+    if canonical.len() != candidate.len() {
+        return false;
+    }
+    if candidate.is_sorted() {
+        return canonical == candidate;
+    }
+    let mut sorted = candidate.to_vec();
+    sorted.sort();
+    canonical == sorted
+}
+
 /// Computes a collision-safe canonical string key for a metric series.
 pub fn canonical_series_identity_key(metric: &str, labels: &[Label]) -> String {
     fn push_hex_byte(out: &mut String, byte: u8) {
@@ -389,6 +404,34 @@ mod tests {
                 vec![Label::new("", "invalid"), Label::new("k", "v")],
             ),
         ]
+    }
+
+    #[test]
+    fn labels_equal_canonical_matches_multiset_equality_modulo_order() {
+        let canonical = vec![Label::new("a", "1"), Label::new("b", "2")];
+
+        assert!(labels_equal_canonical(
+            &canonical,
+            &[Label::new("b", "2"), Label::new("a", "1")]
+        ));
+        assert!(labels_equal_canonical(
+            &canonical,
+            &[Label::new("a", "1"), Label::new("b", "2")]
+        ));
+        assert!(!labels_equal_canonical(
+            &canonical,
+            &[Label::new("a", "2"), Label::new("b", "2")]
+        ));
+        assert!(!labels_equal_canonical(&canonical, &[Label::new("a", "1")]));
+        assert!(!labels_equal_canonical(
+            &canonical,
+            &[
+                Label::new("a", "1"),
+                Label::new("b", "2"),
+                Label::new("c", "3")
+            ]
+        ));
+        assert!(labels_equal_canonical(&[], &[]));
     }
 
     #[test]

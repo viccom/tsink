@@ -144,6 +144,11 @@ pub struct SeriesRegistry {
     metric_postings_shards: [RwLock<MetricPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
     label_postings_shards: [RwLock<LabelPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
     series_count: AtomicUsize,
+    /// Test-only instrumentation: counts dictionary-walk resolve_existing
+    /// executions (i.e. every lookup that was not served by the identity
+    /// cache). Used by ingest-pipeline tests to pin batch/cross-batch dedup.
+    #[cfg(test)]
+    resolve_existing_dictionary_walks: AtomicUsize,
 }
 
 impl Default for SeriesRegistry {
@@ -174,6 +179,8 @@ impl SeriesRegistry {
                 RwLock::new(LabelPostingsShard::default())
             }),
             series_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            resolve_existing_dictionary_walks: AtomicUsize::new(0),
         }
     }
 
