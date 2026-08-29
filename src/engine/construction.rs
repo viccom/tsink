@@ -182,6 +182,8 @@ impl ChunkStorage {
             ),
             #[cfg(test)]
             persist_test_hooks: PersistTestHooks::default(),
+            #[cfg(test)]
+            lane_validation_probes: AtomicUsize::new(0),
         };
 
         storage.prime_wal_registry_snapshot();

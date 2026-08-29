@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -264,6 +266,11 @@ pub struct ChunkStorage {
     current_time_override: AtomicI64,
     #[cfg(test)]
     persist_test_hooks: PersistTestHooks,
+    /// Test-only instrumentation: counts three-probe lane validations
+    /// (active + sealed + persisted) executed by the ingest pipeline. Used
+    /// by ingest tests to pin per-batch (series, lane) dedup.
+    #[cfg(test)]
+    lane_validation_probes: AtomicUsize,
 }
 
 struct MetadataShardIndex {

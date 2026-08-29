@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -458,7 +458,19 @@ impl<'a> WritePreparer<'a> {
         &self,
         resolved: ResolvedWrite,
     ) -> std::result::Result<PreparedWrite, PrepareResolvedWriteError> {
+        // Lane validation probes three lock-guarded indexes (active, sealed,
+        // persisted) per invocation, and batches repeat series constantly, so
+        // probe once per distinct (series, lane) pair. Dedup granularity is
+        // the pair, not the series: same-series points on different lanes
+        // must each be checked against the series' lane state. First-seen
+        // order keeps the first failing pair — and thus the error — identical
+        // to the previous per-point scan.
+        let mut lane_validated_pairs =
+            HashSet::<(SeriesId, ValueLane)>::with_capacity(resolved.pending_points.len());
         for point in &resolved.pending_points {
+            if !lane_validated_pairs.insert((point.series_id, point.lane)) {
+                continue;
+            }
             if let Err(err) = WriteApplier::validate_series_lane_compatible(
                 self.engine.series_validation,
                 point.series_id,
@@ -615,7 +627,127 @@ mod tests {
     use super::super::resolve::WriteResolver;
     use super::*;
     use crate::engine::storage_engine::ChunkStorage;
-    use crate::{DataPoint, Label, Row};
+    use crate::storage::Storage;
+    use crate::{DataPoint, Label, Row, Value};
+
+    #[test]
+    fn batch_lane_validation_probes_once_per_distinct_series_lane_pair() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_lane_dedup_metric";
+        let labels = vec![Label::new("host", "a")];
+
+        // First batch commits the series so the next batch validates against
+        // real lane state.
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let before = storage.lane_validation_probes();
+
+        // Same series repeated within one batch: every point shares one
+        // (series, lane) pair, so the three lock-guarded probes (active,
+        // sealed, persisted) must run exactly once for the batch.
+        let rows: Vec<Row> = (0..8)
+            .map(|i| Row::with_labels(metric, labels.clone(), DataPoint::new(2 + i, i as f64)))
+            .collect();
+        storage.insert_rows(&rows).unwrap();
+
+        assert_eq!(
+            storage.lane_validation_probes() - before,
+            1,
+            "one distinct (series, lane) pair in the batch must trigger exactly one three-probe lane validation"
+        );
+    }
+
+    #[test]
+    fn mixed_lane_batch_against_existing_series_is_rejected_in_both_orders() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_lane_mixed_existing";
+        let labels = vec![Label::new("host", "a")];
+
+        // Commit the series on the numeric lane first.
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        // Conflicting blob lane first: rejected before anything lands.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(2, Value::Bytes(vec![2])),
+                ),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(3, 3.0)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+
+        // Conflicting blob lane last: the batch must still be rejected
+        // wholesale; dedup must not skip probing the later conflicting point.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(4, 4.0)),
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(5, Value::Bytes(vec![5])),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+    }
+
+    #[test]
+    fn mixed_family_batch_against_existing_series_is_rejected_in_both_orders() {
+        // int/float share the numeric lane, so this pins the family-validation
+        // rejection path (which per-batch lane dedup must not weaken): any
+        // single off-family point rejects the whole batch.
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_family_mixed_existing";
+        let labels = vec![Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        // Off-family int first.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(2, 2_i64)),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(3, 3.0)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        // Off-family int last.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(4, 4.0)),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(5, 5_i64)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+    }
 
     #[test]
     fn per_new_partition_head_estimate_charges_first_snapshot_block_not_full_chunk() {

@@ -31,6 +31,8 @@ pub(in crate::engine::storage_engine) struct WriteSeriesValidationContext<'a> {
     pub(in crate::engine::storage_engine) chunks: ChunkContext<'a>,
     pub(in crate::engine::storage_engine) registry: &'a RwLock<SeriesRegistry>,
     pub(in crate::engine::storage_engine) persisted_index: &'a RwLock<PersistedIndexState>,
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) lane_validation_probes: &'a AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +111,14 @@ impl ChunkStorage {
             chunks: self.chunk_context(),
             registry: &self.catalog.registry,
             persisted_index: &self.persisted.persisted_index,
+            #[cfg(test)]
+            lane_validation_probes: &self.lane_validation_probes,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lane_validation_probes(&self) -> usize {
+        self.lane_validation_probes.load(Ordering::Acquire)
     }
 
     pub(in crate::engine::storage_engine) fn registry_memory_context(

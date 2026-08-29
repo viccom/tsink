@@ -8,7 +8,7 @@ use super::encoder::Encoder;
 use super::series::SeriesId;
 use super::series::SeriesValueFamily;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ValueLane {
     Numeric = 0,
