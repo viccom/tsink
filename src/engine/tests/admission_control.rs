@@ -660,6 +660,63 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
 }
 
 #[test]
+fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chunk() {
+    // 2026-08-29 load-test root cause: the per-new-head estimate charged a full
+    // chunk capacity (chunk_point_cap * sizeof(ChunkPoint) ~= 80.2KiB/head), so a
+    // 16384-row batch of brand-new series estimated ~1.34GB and any 64MB-class
+    // budget rejected it. ChunkBuilder actually grows in 64-point snapshot blocks
+    // (ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS), so the batch should estimate ~45MB and
+    // a 64MB budget must admit it. Post-commit incremental accounting plus the
+    // post-commit budget enforcement backstop any real growth beyond the estimate.
+    let rows: Vec<Row> = (0..16_384)
+        .map(|i| {
+            Row::with_labels(
+                "admission_first_block_estimate",
+                vec![Label::new("device", format!("{i:05}"))],
+                DataPoint::new(1, i as f64),
+            )
+        })
+        .collect();
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        crate::storage::DEFAULT_CHUNK_POINTS,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 1,
+            write_timeout: Duration::ZERO,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            cardinality_limit: usize::MAX,
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            #[cfg(test)]
+            current_time_override: None,
+        },
+    )
+    .unwrap();
+    storage
+        .insert_rows(&rows)
+        .expect("a 64MB budget must admit a 16384-new-series batch estimated at its real first block cost");
+}
+
+#[test]
 fn close_blocks_until_in_flight_writer_releases_permit() {
     use std::sync::mpsc;
     use std::sync::Arc;

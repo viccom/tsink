@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use crate::engine::chunk::ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS;
+
 use super::super::super::{
     partition_id_for_timestamp, state, value_heap_bytes, ActiveSeriesState, ChunkPoint, FramedWal,
     Result, SeriesDefinitionFrame, SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily,
@@ -551,11 +553,13 @@ impl<'a> WritePreparer<'a> {
             acc.saturating_add(value_heap_bytes(&point.value))
         });
 
+        // Bill each new partition head at its real first snapshot block (64 points,
+        // matching ChunkBuilder's block growth), not the full chunk capacity;
+        // growth beyond the estimate is backstopped by post-commit incremental
+        // accounting plus the post-commit budget enforcement pass in ingest_pipeline.
         let per_new_partition_head = std::mem::size_of::<state::ActivePartitionHead>()
             .saturating_add(
-                self.engine
-                    .config
-                    .chunk_point_cap
+                ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS
                     .saturating_mul(std::mem::size_of::<ChunkPoint>()),
             );
         let mut new_active_series = 0usize;
@@ -594,5 +598,62 @@ impl<'a> WritePreparer<'a> {
             .saturating_add(partition_head_bytes)
             .saturating_add(value_family_bytes)
             .saturating_add(metadata_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::resolve::WriteResolver;
+    use super::*;
+    use crate::engine::storage_engine::ChunkStorage;
+    use crate::{DataPoint, Label, Row};
+
+    #[test]
+    fn per_new_partition_head_estimate_charges_first_snapshot_block_not_full_chunk() {
+        // ChunkBuilder grows active heads in 64-point snapshot blocks
+        // (ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS), so admission must bill each new
+        // head at its first block, not at the full chunk_point_cap. Bloating
+        // beyond the estimate is backstopped by post-commit incremental
+        // accounting and the post-commit budget enforcement pass.
+        const FIRST_SNAPSHOT_BLOCK_POINTS: usize = 64;
+        let series_count = 128usize;
+        let rows: Vec<Row> = (0..series_count)
+            .map(|i| {
+                Row::with_labels(
+                    "estimate_first_block_unit",
+                    vec![Label::new("device", format!("{i:03}"))],
+                    DataPoint::new(1, i as f64),
+                )
+            })
+            .collect();
+
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let resolver = WriteResolver::new(storage.write_resolve_context());
+        let resolved = resolver.resolve_write_rows(&rows).unwrap();
+        let grouped = WriteApplier::group_pending_point_indexes_by_series(&resolved.pending_points)
+            .unwrap();
+        let pending_series_families = BTreeMap::new();
+        let preparer = WritePreparer::new(storage.write_prepare_context());
+        let estimate = preparer.estimate_write_memory_growth_bytes(
+            &resolved.pending_points,
+            &grouped,
+            &resolved.created_series,
+            &pending_series_families,
+        );
+
+        let per_point_bytes = std::mem::size_of::<ChunkPoint>();
+        let first_block_charge =
+            series_count * FIRST_SNAPSHOT_BLOCK_POINTS * per_point_bytes;
+        let full_capacity_charge =
+            series_count * crate::storage::DEFAULT_CHUNK_POINTS * per_point_bytes;
+
+        assert!(
+            estimate > first_block_charge,
+            "per-new-head estimate must include the {FIRST_SNAPSHOT_BLOCK_POINTS}-point first snapshot block charge: estimate={estimate}",
+        );
+        assert!(
+            estimate < full_capacity_charge / 4,
+            "per-new-head estimate must not bill the full chunk capacity: estimate={estimate}, full-capacity chunk charge alone would be {full_capacity_charge}",
+        );
     }
 }

@@ -52,7 +52,7 @@ pub struct ChunkPoint {
     pub value: Value,
 }
 
-const ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS: usize = 64;
+pub(crate) const ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS: usize = 64;
 
 #[derive(Debug)]
 pub struct Chunk {
