@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use super::super::super::{
     lane_for_value, validate_labels, validate_metric, Label, Result, Row, SeriesDefinitionFrame,
-    SeriesId, SeriesRegistry, SeriesResolution, TsinkError, WalHighWatermark, WriteResolveContext,
+    SeriesRegistry, SeriesResolution, TsinkError, WalHighWatermark, WriteResolveContext,
 };
 use super::phases::{PendingPoint, ResolvedWrite};
 use crate::engine::series::SeriesKey;
@@ -29,51 +29,6 @@ impl RawSeriesKey {
             metric: metric.to_string(),
             labels: normalized_labels,
         }
-    }
-}
-
-/// Batch-local memo for already-existing series: rows repeated within one
-/// insert batch (same canonical identity) resolve through the dictionary
-/// exactly once. Keyed by the 64-bit series identity hash with full-key
-/// verification on lookup, so hash collisions can only cost a fallback to
-/// the dictionary path, never a wrong series id.
-#[derive(Debug)]
-struct BatchResolvedSeries {
-    identity_hash: u64,
-    metric: String,
-    labels: Vec<Label>,
-    series_id: SeriesId,
-}
-
-#[derive(Debug, Default)]
-struct BatchSeriesMemo {
-    by_identity_hash: HashMap<u64, Vec<BatchResolvedSeries>>,
-}
-
-impl BatchSeriesMemo {
-    fn resolve(&self, identity_hash: u64, metric: &str, labels: &[Label]) -> Option<SeriesId> {
-        self.by_identity_hash
-            .get(&identity_hash)?
-            .iter()
-            .find(|entry| {
-                entry.identity_hash == identity_hash
-                    && entry.metric == metric
-                    && crate::label::labels_equal_canonical(&entry.labels, labels)
-            })
-            .map(|entry| entry.series_id)
-    }
-
-    fn record(&mut self, identity_hash: u64, metric: &str, labels: &[Label], series_id: SeriesId) {
-        let key = RawSeriesKey::new(metric, labels);
-        self.by_identity_hash
-            .entry(identity_hash)
-            .or_default()
-            .push(BatchResolvedSeries {
-                identity_hash,
-                metric: key.metric,
-                labels: key.labels,
-                series_id,
-            });
     }
 }
 
@@ -164,7 +119,6 @@ impl<'a> WriteResolver<'a> {
         let mut pending_new_series = HashMap::<RawSeriesKey, usize>::new();
         let mut pending_new_series_plans = Vec::<PendingNewSeriesPlan>::new();
         let mut pending_new_point_refs = Vec::<(usize, usize)>::new();
-        let mut resolved_series_memo = BatchSeriesMemo::default();
 
         self.engine.with_registry(|registry| {
             for row in rows {
@@ -174,28 +128,10 @@ impl<'a> WriteResolver<'a> {
                 let data_point = row.data_point();
                 let lane = lane_for_value(&data_point.value);
 
-                let identity_hash =
-                    crate::label::stable_series_identity_hash(row.metric(), row.labels());
-                if let Some(series_id) =
-                    resolved_series_memo.resolve(identity_hash, row.metric(), row.labels())
-                {
-                    pending_points.push(PendingPoint {
-                        series_id,
-                        lane,
-                        ts: data_point.timestamp,
-                        value: data_point.value.clone(),
-                        wal_highwater: WalHighWatermark::default(),
-                    });
-                    continue;
-                }
-
+                // resolve_existing serves repeat identities (within this
+                // batch and across batches) from the registry identity
+                // cache; only the first occurrence pays the dictionary walk.
                 if let Some(resolution) = registry.resolve_existing(row.metric(), row.labels()) {
-                    resolved_series_memo.record(
-                        identity_hash,
-                        row.metric(),
-                        row.labels(),
-                        resolution.series_id,
-                    );
                     pending_points.push(PendingPoint {
                         series_id: resolution.series_id,
                         lane,
@@ -400,5 +336,58 @@ mod tests {
         assert_eq!(distinct_ids.len(), 1);
         assert!(resolved.created_series.is_empty());
         assert!(resolved.new_series_defs.is_empty());
+    }
+
+    #[test]
+    fn cross_batch_resolves_are_served_by_identity_cache() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "cross_batch_cache_metric";
+        let labels = vec![crate::Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let resolver = WriteResolver::new(storage.write_resolve_context());
+        let rows: Vec<Row> = (0..4)
+            .map(|i| Row::with_labels(metric, labels.clone(), DataPoint::new(10 + i, i as f64)))
+            .collect();
+
+        // Cold batch: the first resolve walks the dictionaries once and
+        // warms the identity cache for the series.
+        let cold = resolver.resolve_write_rows(&rows).unwrap();
+        assert_eq!(cold.pending_points.len(), 4);
+        let after_cold = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+
+        // Warm batch: identical rows must resolve with zero dictionary walks.
+        let warm = resolver.resolve_write_rows(&rows).unwrap();
+        let after_warm = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+        assert_eq!(
+            after_warm, after_cold,
+            "warm cross-batch resolve must be served by the identity cache"
+        );
+
+        let distinct_ids = warm
+            .pending_points
+            .iter()
+            .map(|point| point.series_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct_ids.len(), 1);
+        assert_eq!(
+            distinct_ids.iter().copied().next(),
+            cold.pending_points.first().map(|point| point.series_id)
+        );
     }
 }

@@ -255,6 +255,7 @@ impl SeriesRegistry {
                 RwLock::new(LabelPostingsShard::default())
             }),
             series_count: AtomicUsize::new(definitions.len()),
+            identity_cache: RwLock::new(super::identity_cache::SeriesIdentityCache::default()),
             #[cfg(test)]
             resolve_existing_dictionary_walks: AtomicUsize::new(0),
         };
