@@ -387,6 +387,10 @@ impl Storage for ChunkStorage {
         self.list_metrics_with_wal_api()
     }
 
+    fn series_count(&self) -> u64 {
+        self.series_count_api()
+    }
+
     fn list_metrics_in_shards(
         &self,
         scope: &crate::storage::MetadataShardScope,

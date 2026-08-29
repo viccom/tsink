@@ -63,6 +63,17 @@ impl ChunkStorage {
         let scope = scope.normalized()?;
         context.live_metric_series_for_scope(&scope, "list_metrics_in_shards")
     }
+
+    /// O(1) series count straight from the registry's atomic counter.
+    ///
+    /// Registry scope (approximate) vs the materialized scope of
+    /// [`Self::list_metrics_api`]: may include internal rollup series or dead
+    /// series not yet pruned, and is not fenced by WAL-committed visibility.
+    /// Intentionally not gated on `ensure_open`: the counter stays readable
+    /// (frozen) after close for telemetry-style callers.
+    pub(in crate::engine::storage_engine) fn series_count_api(&self) -> u64 {
+        self.catalog.registry.read().series_count() as u64
+    }
     pub(in crate::engine::storage_engine) fn select_series_api(
         &self,
         selection: &SeriesSelection,

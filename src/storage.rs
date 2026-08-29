@@ -658,6 +658,22 @@ pub trait Storage: Send + Sync {
         self.list_metrics()
     }
 
+    /// Returns the number of series currently registered in the engine's series
+    /// registry.
+    ///
+    /// This is an O(1) registry-scope read backed by an atomic counter: unlike
+    /// [`Storage::list_metrics`] it does not materialize `MetricSeries` entries,
+    /// so it stays cheap at high cardinality. The registry scope is approximate
+    /// relative to the materialized scope of `list_metrics`: it may include
+    /// internal rollup series or dead series that have not been pruned yet, and
+    /// it is not fenced by the WAL-committed visibility rules. The counter keeps
+    /// reporting its frozen value after [`Storage::close`].
+    ///
+    /// Backends that do not track a registry counter conservatively report `0`.
+    fn series_count(&self) -> u64 {
+        0
+    }
+
     /// Lists known metric series within a shard scope.
     ///
     /// Backends must override this to provide a bounded shard-scoped implementation.
