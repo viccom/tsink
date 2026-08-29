@@ -630,8 +630,8 @@ mod tests {
         let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
         let resolver = WriteResolver::new(storage.write_resolve_context());
         let resolved = resolver.resolve_write_rows(&rows).unwrap();
-        let grouped = WriteApplier::group_pending_point_indexes_by_series(&resolved.pending_points)
-            .unwrap();
+        let grouped =
+            WriteApplier::group_pending_point_indexes_by_series(&resolved.pending_points).unwrap();
         let pending_series_families = BTreeMap::new();
         let preparer = WritePreparer::new(storage.write_prepare_context());
         let estimate = preparer.estimate_write_memory_growth_bytes(
@@ -642,8 +642,7 @@ mod tests {
         );
 
         let per_point_bytes = std::mem::size_of::<ChunkPoint>();
-        let first_block_charge =
-            series_count * FIRST_SNAPSHOT_BLOCK_POINTS * per_point_bytes;
+        let first_block_charge = series_count * FIRST_SNAPSHOT_BLOCK_POINTS * per_point_bytes;
         let full_capacity_charge =
             series_count * crate::storage::DEFAULT_CHUNK_POINTS * per_point_bytes;
 

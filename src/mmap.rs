@@ -62,9 +62,9 @@ impl PlatformMmap {
                 ));
             }
 
-            return Ok(PlatformMmap {
+            Ok(PlatformMmap {
                 bytes: bytes.into_boxed_slice(),
-            });
+            })
         }
 
         #[cfg(not(windows))]

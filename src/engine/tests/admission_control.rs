@@ -711,9 +711,9 @@ fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chun
         },
     )
     .unwrap();
-    storage
-        .insert_rows(&rows)
-        .expect("a 64MB budget must admit a 16384-new-series batch estimated at its real first block cost");
+    storage.insert_rows(&rows).expect(
+        "a 64MB budget must admit a 16384-new-series batch estimated at its real first block cost",
+    );
 }
 
 #[test]
