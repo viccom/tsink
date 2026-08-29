@@ -37,6 +37,7 @@ pub(in crate::engine::storage_engine) struct WriteSeriesValidationContext<'a> {
 pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) catalog: CatalogContext<'a>,
     pub(in crate::engine::storage_engine) support: WriteResolveSupportContext<'a>,
+    pub(in crate::engine::storage_engine) observability: &'a StorageObservabilityCounters,
     pub(in crate::engine::storage_engine) cardinality_limit: usize,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
@@ -273,6 +274,7 @@ impl ChunkStorage {
             support: WriteResolveSupportContext {
                 registry_memory: self.registry_memory_context(),
             },
+            observability: self.observability.as_ref(),
             cardinality_limit: self.runtime.cardinality_limit,
             used_bytes: &self.memory.used_bytes,
             budget_bytes: &self.memory.budget_bytes,

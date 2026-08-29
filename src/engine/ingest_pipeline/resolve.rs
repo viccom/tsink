@@ -89,6 +89,11 @@ impl<'a> WriteResolveContext<'a> {
             .min(usize::MAX as u64) as usize;
         let required = used.saturating_add(estimated_registry_growth);
         if required > budget {
+            self.observability.record_admission_memory_rejection(
+                estimated_registry_growth,
+                budget,
+                required,
+            );
             return Err(TsinkError::MemoryBudgetExceeded { budget, required });
         }
 

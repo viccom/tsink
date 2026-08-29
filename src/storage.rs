@@ -406,6 +406,16 @@ pub struct FlushObservabilitySnapshot {
     pub admission_pressure_relief_requests_total: u64,
     #[serde(default)]
     pub admission_pressure_relief_observed_total: u64,
+    /// Total writes rejected by the memory-budget admission check.
+    #[serde(default)]
+    pub admission_memory_rejections_total: u64,
+    /// Estimated memory growth of the most recently rejected write batch
+    /// (used + estimate = the `required` value carried by the rejection).
+    #[serde(default)]
+    pub admission_memory_last_estimate_bytes: u64,
+    /// Shortfall (required - budget) of the most recently rejected write batch.
+    #[serde(default)]
+    pub admission_memory_last_shortfall_bytes: u64,
     pub active_flush_runs_total: u64,
     pub active_flush_errors_total: u64,
     pub active_flushed_series_total: u64,

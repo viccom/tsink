@@ -38,6 +38,24 @@ impl StorageObservabilityCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn record_admission_memory_rejection(
+        &self,
+        estimate_bytes: usize,
+        budget_bytes: usize,
+        required_bytes: usize,
+    ) {
+        self.flush
+            .admission_memory_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.flush
+            .admission_memory_last_estimate_bytes
+            .store(saturating_u64_from_usize(estimate_bytes), Ordering::Relaxed);
+        self.flush.admission_memory_last_shortfall_bytes.store(
+            saturating_u64_from_usize(required_bytes.saturating_sub(budget_bytes)),
+            Ordering::Relaxed,
+        );
+    }
+
     pub(super) fn record_compaction_result(&self, stats: CompactionRunStats, duration_nanos: u64) {
         self.compaction.runs_total.fetch_add(1, Ordering::Relaxed);
         self.compaction
@@ -197,6 +215,9 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) admission_backpressure_delay_nanos_total: AtomicU64,
     pub(super) admission_pressure_relief_requests_total: AtomicU64,
     pub(super) admission_pressure_relief_observed_total: AtomicU64,
+    pub(super) admission_memory_rejections_total: AtomicU64,
+    pub(super) admission_memory_last_estimate_bytes: AtomicU64,
+    pub(super) admission_memory_last_shortfall_bytes: AtomicU64,
     pub(super) active_flush_runs_total: AtomicU64,
     pub(super) active_flush_errors_total: AtomicU64,
     pub(super) active_flushed_series_total: AtomicU64,

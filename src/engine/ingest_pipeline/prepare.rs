@@ -342,6 +342,11 @@ impl<'a> WriteAdmissionControlContext<'a> {
                     memory_budget.shortfall(estimated_memory_growth_bytes)
                 {
                     if Instant::now() >= deadline {
+                        self.observability.record_admission_memory_rejection(
+                            estimated_memory_growth_bytes,
+                            post_budget,
+                            post_required,
+                        );
                         return Err(TsinkError::MemoryBudgetExceeded {
                             budget: post_budget,
                             required: post_required,

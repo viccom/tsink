@@ -717,6 +717,85 @@ fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chun
 }
 
 #[test]
+fn admission_memory_rejection_exports_estimate_and_shortfall_snapshot() {
+    // 2026-08-29 load-test follow-up: "required at least 2.16GB" rejections were
+    // only visible inside error strings, so an operator could not tell an
+    // inflated batch estimate apart from a genuinely full budget from metrics
+    // alone. The last memory-budget rejection must export its batch estimate
+    // and shortfall through the `dyn Storage` observability face.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 1,
+            write_timeout: Duration::ZERO,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            cardinality_limit: usize::MAX,
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            #[cfg(test)]
+            current_time_override: None,
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("admission_gap_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+    let used_before_rejection = storage.memory_used();
+    assert!(used_before_rejection > 0);
+
+    storage
+        .memory
+        .budget_bytes
+        .store(1, std::sync::atomic::Ordering::Release);
+    let err = storage
+        .insert_rows(&[Row::new("admission_gap_metric", DataPoint::new(2, 2.0))])
+        .unwrap_err();
+    let TsinkError::MemoryBudgetExceeded { budget, required } = err else {
+        panic!("expected memory budget rejection, got {err:?}");
+    };
+    assert_eq!(budget, 1);
+    assert!(
+        required > used_before_rejection,
+        "required must be used({used_before_rejection}) plus the batch estimate, got {required}"
+    );
+
+    // rs-iot consumes the snapshot through the `dyn Storage` trait face.
+    let dyn_storage: &dyn Storage = &storage;
+    let snapshot = dyn_storage.observability_snapshot();
+    assert_eq!(snapshot.flush.admission_memory_rejections_total, 1);
+    assert_eq!(
+        snapshot.flush.admission_memory_last_estimate_bytes as usize,
+        required - used_before_rejection,
+        "the exported estimate is the rejected batch's estimated growth (used + estimate = required)",
+    );
+    assert_eq!(
+        snapshot.flush.admission_memory_last_shortfall_bytes as usize,
+        required - budget
+    );
+}
+
+#[test]
 fn close_blocks_until_in_flight_writer_releases_permit() {
     use std::sync::mpsc;
     use std::sync::Arc;

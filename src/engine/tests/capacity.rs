@@ -188,6 +188,91 @@ fn memory_budget_stats_reflect_builder_configuration() {
 }
 
 #[test]
+fn observability_memory_component_snapshot_is_readable_from_storage_trait_face() {
+    // 2026-08-29 load-test follow-up: two aggregate gauges (used/budget) could
+    // not attribute admission mis-rejections. Pin the per-component memory
+    // breakdown fields and their availability through the `dyn Storage` face
+    // (the rs-iot consumption shape), plus the current budgeting scope where
+    // every component is included in `budgeted_bytes`.
+    let storage: Arc<dyn Storage> = StorageBuilder::new()
+        .with_wal_enabled(false)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    for i in 0..4 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "component_snapshot_metric",
+                vec![Label::new("host", format!("h{i}"))],
+                DataPoint::new(1, i as f64),
+            )])
+            .unwrap();
+    }
+
+    let memory = &storage.observability_snapshot().memory;
+    assert!(
+        memory.registry_bytes > 0,
+        "registered series must show up in the registry component"
+    );
+    assert!(
+        memory.active_and_sealed_bytes > 0,
+        "hot chunk state must show up in the active+sealed component"
+    );
+    assert_eq!(memory.budgeted_bytes, storage.memory_used());
+    assert_eq!(memory.excluded_bytes, 0);
+    assert!(
+        memory.budgeted_bytes
+            >= memory
+                .active_and_sealed_bytes
+                .saturating_add(memory.registry_bytes)
+                .saturating_add(memory.metadata_cache_bytes)
+                .saturating_add(memory.persisted_index_bytes)
+                .saturating_add(memory.persisted_mmap_bytes)
+                .saturating_add(memory.tombstone_bytes),
+        "under the current budgeting scope every component is included in budgeted_bytes"
+    );
+}
+
+#[test]
+fn registry_heavy_admission_rejection_exports_estimate_and_shortfall() {
+    // Registry-heavy new-series rejections take the resolve-path admission
+    // check; they must feed the same exported estimate/shortfall snapshot as
+    // batch-estimate rejections so scrapers cannot tell the paths apart.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 2_048);
+
+    let large_label_value = "x".repeat(4_096);
+    let rows = vec![Row::with_labels(
+        "registry_admission_gap_metric",
+        vec![Label::new("host", large_label_value)],
+        DataPoint::new(1, 1.0),
+    )];
+    let estimated_registry_growth = registry_growth_estimate_for_rows(&storage, &rows);
+    assert!(
+        estimated_registry_growth > 2_048,
+        "4KiB label value must overflow the 2KiB budget by registry growth alone"
+    );
+
+    let err = storage.insert_rows(&rows).unwrap_err();
+    let TsinkError::MemoryBudgetExceeded { budget, required } = err else {
+        panic!("expected registry-heavy memory budget rejection, got {err:?}");
+    };
+    assert_eq!(budget, 2_048);
+
+    let dyn_storage: &dyn Storage = &storage;
+    let snapshot = dyn_storage.observability_snapshot();
+    assert_eq!(snapshot.flush.admission_memory_rejections_total, 1);
+    assert_eq!(
+        snapshot.flush.admission_memory_last_estimate_bytes as usize,
+        estimated_registry_growth
+    );
+    assert_eq!(
+        snapshot.flush.admission_memory_last_shortfall_bytes as usize,
+        required - budget
+    );
+}
+
+#[test]
 fn memory_budget_guard_rejects_writes_when_in_memory_budget_cannot_be_relaxed() {
     let storage = StorageBuilder::new()
         .with_wal_enabled(false)
