@@ -184,7 +184,17 @@ fn memory_budget_stats_reflect_builder_configuration() {
 
     assert_eq!(storage.memory_budget(), 1234);
     assert_eq!(storage.memory_used(), snapshot.memory.budgeted_bytes);
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
+    assert_eq!(
+        snapshot.memory.excluded_bytes,
+        snapshot
+            .memory
+            .registry_bytes
+            .saturating_add(snapshot.memory.metadata_cache_bytes)
+            .saturating_add(snapshot.memory.persisted_index_bytes)
+            .saturating_add(snapshot.memory.persisted_mmap_bytes)
+            .saturating_add(snapshot.memory.tombstone_bytes),
+        "excluded_bytes must always aggregate the non-budgeted components"
+    );
 }
 
 #[test]
@@ -192,8 +202,9 @@ fn observability_memory_component_snapshot_is_readable_from_storage_trait_face()
     // 2026-08-29 load-test follow-up: two aggregate gauges (used/budget) could
     // not attribute admission mis-rejections. Pin the per-component memory
     // breakdown fields and their availability through the `dyn Storage` face
-    // (the rs-iot consumption shape), plus the current budgeting scope where
-    // every component is included in `budgeted_bytes`.
+    // (the rs-iot consumption shape), plus the budgeting scope where the
+    // criterion covers only active+sealed state and the other components are
+    // excluded from `budgeted_bytes` but aggregated in `excluded_bytes`.
     let storage: Arc<dyn Storage> = StorageBuilder::new()
         .with_wal_enabled(false)
         .with_current_time_override_for_tests(0)
@@ -219,18 +230,101 @@ fn observability_memory_component_snapshot_is_readable_from_storage_trait_face()
         "hot chunk state must show up in the active+sealed component"
     );
     assert_eq!(memory.budgeted_bytes, storage.memory_used());
-    assert_eq!(memory.excluded_bytes, 0);
-    assert!(
-        memory.budgeted_bytes
-            >= memory
-                .active_and_sealed_bytes
-                .saturating_add(memory.registry_bytes)
-                .saturating_add(memory.metadata_cache_bytes)
-                .saturating_add(memory.persisted_index_bytes)
-                .saturating_add(memory.persisted_mmap_bytes)
-                .saturating_add(memory.tombstone_bytes),
-        "under the current budgeting scope every component is included in budgeted_bytes"
+    assert_eq!(
+        memory.budgeted_bytes, memory.active_and_sealed_bytes,
+        "the budget criterion must cover only evictable active+sealed state"
     );
+    assert_eq!(
+        memory.excluded_bytes,
+        memory
+            .registry_bytes
+            .saturating_add(memory.metadata_cache_bytes)
+            .saturating_add(memory.persisted_index_bytes)
+            .saturating_add(memory.persisted_mmap_bytes)
+            .saturating_add(memory.tombstone_bytes),
+        "excluded_bytes must aggregate the non-budgeted components"
+    );
+}
+
+#[test]
+fn used_bytes_criterion_covers_only_active_and_sealed_state() {
+    // Task 7 (2026-08-29 load-test follow-up): `memory_used`/`used_bytes` is the
+    // admission criterion, so it must track only what the budget can evict —
+    // active partition heads plus sealed chunks pending flush. Registry
+    // dictionaries, metadata caches, the persisted index and mmap-backed
+    // segments are process-RSS facts: they stay visible through the
+    // observability component fields instead of raising the budget criterion
+    // (the monotonically growing persisted-footprint floor that wedged
+    // admission after restart in the 100k-series load test).
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
+            .with_wal_enabled(false)
+            .with_current_time_override_for_tests(0)
+            .build()
+            .unwrap();
+        for series_idx in 0..64 {
+            storage
+                .insert_rows(&[Row::with_labels(
+                    "used_scope_metric",
+                    vec![
+                        Label::new("host", format!("host-{series_idx}")),
+                        Label::new("rack", format!("rack-{}", series_idx % 8)),
+                    ],
+                    DataPoint::new(1, series_idx as f64),
+                )])
+                .unwrap();
+        }
+        let live_snapshot = storage.observability_snapshot();
+        assert!(
+            live_snapshot.memory.registry_bytes > 0,
+            "registered series must show up in the registry component"
+        );
+        assert!(
+            live_snapshot.memory.active_and_sealed_bytes > 0,
+            "sealed chunks pending flush must show up in the active+sealed component"
+        );
+        assert_eq!(
+            live_snapshot.memory.budgeted_bytes, live_snapshot.memory.active_and_sealed_bytes,
+            "while writing, the budget criterion must cover only evictable active+sealed state"
+        );
+        storage.close().unwrap();
+    }
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .with_memory_limit(1_000_000)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    let snapshot = reopened.observability_snapshot();
+    assert!(
+        snapshot.memory.registry_bytes > 0,
+        "reopened storage should account for persisted registry state"
+    );
+    assert!(
+        snapshot.memory.persisted_index_bytes > 0,
+        "reopened storage should account for persisted chunk refs and timestamp indexes"
+    );
+    assert!(
+        snapshot.memory.persisted_mmap_bytes > 0,
+        "reopened storage should account for mmap-backed segment state"
+    );
+    assert_eq!(
+        reopened.memory_used(),
+        0,
+        "reopening loads registry/index/mmap but no in-memory chunks: the persisted footprint must not raise the budget criterion"
+    );
+    assert_eq!(
+        snapshot.memory.budgeted_bytes, snapshot.memory.active_and_sealed_bytes,
+        "the budget criterion must stay scoped to active+sealed after restart"
+    );
+
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -504,10 +598,16 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
     );
     assert!(
         snapshot.memory.persisted_mmap_bytes > 0,
-        "reopened storage should budget persisted mmap-backed segment state"
+        "reopened storage should account for persisted mmap-backed segment state"
     );
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
-    assert_eq!(snapshot.memory.excluded_persisted_mmap_bytes, 0);
+    assert!(
+        snapshot.memory.excluded_bytes > 0,
+        "reopened persisted registry/index/mmap state must surface in the excluded aggregate"
+    );
+    assert_eq!(
+        snapshot.memory.excluded_persisted_mmap_bytes, snapshot.memory.persisted_mmap_bytes,
+        "all persisted mmap bytes are excluded from the budget criterion"
+    );
 
     let tightened_budget = 1;
     reopened.close().unwrap();
@@ -519,9 +619,17 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
         .with_current_time_override_for_tests(0)
         .build()
         .unwrap();
+    let over_snapshot = over_budget.observability_snapshot();
     assert!(
-        over_budget.memory_used() > over_budget.memory_budget(),
-        "restart reconciliation should expose the full persisted footprint even under a tiny budget"
+        over_snapshot.memory.registry_bytes > 0
+            && over_snapshot.memory.persisted_index_bytes > 0
+            && over_snapshot.memory.persisted_mmap_bytes > 0,
+        "restart reconciliation should expose the full persisted footprint through excluded components even under a tiny budget"
+    );
+    assert_eq!(
+        over_budget.memory_used(),
+        over_snapshot.memory.active_and_sealed_bytes,
+        "the persisted footprint must not raise the budget criterion after restart"
     );
     over_budget.close().unwrap();
 }
@@ -568,7 +676,12 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
     let baseline_snapshot = baseline.observability_snapshot();
     assert!(
         baseline_snapshot.memory.persisted_mmap_bytes > 0,
-        "reopened storage should include persisted mmap bytes in the budgeted footprint"
+        "reopened storage should surface persisted mmap bytes in the excluded footprint"
+    );
+    assert_eq!(
+        baseline_snapshot.memory.excluded_persisted_mmap_bytes,
+        baseline_snapshot.memory.persisted_mmap_bytes,
+        "persisted mmap bytes are excluded from the budget criterion"
     );
     let tightened_budget = baseline.memory_used().saturating_sub(1).max(1);
     baseline.close().unwrap();
@@ -581,10 +694,16 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
         .with_current_time_override_for_tests(0)
         .build()
         .unwrap();
+    let reopened_snapshot = reopened.observability_snapshot();
 
     assert!(
-        reopened.memory_used() > reopened.memory_budget(),
-        "persisted mmap bytes should keep the reopened storage over its tightened budget"
+        reopened_snapshot.memory.persisted_mmap_bytes > 0,
+        "persisted mmap bytes should stay visible after reopening under a tightened budget"
+    );
+    assert_eq!(
+        reopened.memory_used(),
+        reopened_snapshot.memory.active_and_sealed_bytes,
+        "persisted mmap bytes must not raise the budget criterion after restart"
     );
     assert_eq!(
         reopened
@@ -670,14 +789,20 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
     let snapshot = storage.observability_snapshot();
     assert!(
         snapshot.memory.persisted_index_bytes > 0,
-        "runtime persisted refresh should update budgeted persisted-index bytes"
+        "runtime persisted refresh should update the persisted-index component"
     );
     assert!(
         snapshot.memory.persisted_mmap_bytes > 0,
-        "runtime persisted refresh should budget mmap-backed bytes"
+        "runtime persisted refresh should account for mmap-backed bytes"
     );
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
-    assert_eq!(snapshot.memory.excluded_persisted_mmap_bytes, 0);
+    assert!(
+        snapshot.memory.excluded_bytes > 0,
+        "runtime adopted persisted state must surface in the excluded aggregate"
+    );
+    assert_eq!(
+        snapshot.memory.excluded_persisted_mmap_bytes, snapshot.memory.persisted_mmap_bytes,
+        "runtime adopted mmap bytes are excluded from the budget criterion"
+    );
 
     let tightened_budget = storage.memory_used().saturating_sub(1).max(1);
     storage.memory.budget_bytes.store(
@@ -686,9 +811,16 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
     );
     storage.enforce_memory_budget_if_needed().unwrap();
     assert_engine_memory_usage_reconciled(&storage);
+    let post_tighten_snapshot = storage.observability_snapshot();
     assert!(
-        storage.memory_used() > storage.memory_budget(),
+        post_tighten_snapshot.memory.persisted_index_bytes > 0
+            && post_tighten_snapshot.memory.persisted_mmap_bytes > 0,
         "persisted-index accounting should remain visible after runtime segment adoption"
+    );
+    assert_eq!(
+        storage.memory_used(),
+        post_tighten_snapshot.memory.active_and_sealed_bytes,
+        "runtime adopted persisted state must not raise the budget criterion"
     );
 
     storage.close().unwrap();

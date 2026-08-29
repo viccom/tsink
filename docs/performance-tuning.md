@@ -89,7 +89,11 @@ The budget covers active chunk builders and sealed chunks pending flush. Several
 | mmap-mapped segment payloads | `tsink_memory_persisted_mmap_bytes` |
 | Tombstone state | `tsink_memory_tombstone_bytes` |
 
+The budget criterion (`tsink_memory_used_bytes`) follows this scope exactly: it counts only evictable state — active partition heads plus sealed chunks pending flush. The excluded categories above are facts of process RSS rather than objects the budget can manage: they stay visible through the component gauges and the `excluded` aggregate (`tsink_memory_used_bytes` minus budgeted components) instead of raising the admission floor.
+
 Add a proportional allowance for these when calculating total process memory.
+
+> **Upgrade note (2026-08-29 accounting fix):** earlier releases counted registry, metadata, persisted-index, mmap and tombstone bytes inside the budget criterion, so a restart with a large persisted footprint raised `used` monotonically and could wedge admission even with no hot data in memory. If you enlarged your budget to work around that behavior, the criterion now binds looser after upgrading: re-tune the budget against `tsink_memory_used_bytes` (active + sealed only) and size total process memory from the component gauges instead.
 
 ### Backpressure behaviour
 

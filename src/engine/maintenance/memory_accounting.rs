@@ -15,6 +15,12 @@ impl ChunkStorage {
         self.memory_accounting_context().used_value()
     }
 
+    // Budget-scope note (2026-08-29 load-test follow-up): these component
+    // helpers track memory categories that are EXCLUDED from the budget
+    // criterion (`used_bytes` covers only evictable active heads plus sealed
+    // chunks pending flush). They maintain the per-component observability
+    // counters and the `shared_used_bytes` aggregate (surfaced as
+    // `excluded_bytes`), but never touch the budget criterion itself.
     pub(in super::super) fn add_included_memory_component_bytes(
         &self,
         component: &AtomicU64,
@@ -28,9 +34,6 @@ impl ChunkStorage {
         component.fetch_add(increment, Ordering::AcqRel);
         self.memory
             .shared_used_bytes
-            .fetch_add(increment, Ordering::AcqRel);
-        self.memory
-            .used_bytes
             .fetch_add(increment, Ordering::AcqRel);
     }
 
@@ -47,9 +50,6 @@ impl ChunkStorage {
         component.fetch_sub(decrement, Ordering::AcqRel);
         self.memory
             .shared_used_bytes
-            .fetch_sub(decrement, Ordering::AcqRel);
-        self.memory
-            .used_bytes
             .fetch_sub(decrement, Ordering::AcqRel);
     }
 
@@ -202,7 +202,9 @@ impl ChunkStorage {
 
         crate::MemoryObservabilitySnapshot {
             budgeted_bytes: memory_accounting.used_value(),
-            excluded_bytes: 0,
+            excluded_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.shared_used_bytes,
+            ),
             active_and_sealed_bytes: memory_accounting.active_and_sealed_used_value(),
             registry_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.registry_used_bytes,
@@ -219,7 +221,9 @@ impl ChunkStorage {
             tombstone_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.tombstone_used_bytes,
             ),
-            excluded_persisted_mmap_bytes: 0,
+            excluded_persisted_mmap_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.persisted_mmap_used_bytes,
+            ),
         }
     }
 

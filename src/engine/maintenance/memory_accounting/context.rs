@@ -184,12 +184,20 @@ impl<'a> MemoryAccountingContext<'a> {
         let persisted_mmap_used = self.lifecycle.measured_persisted_mmap_memory_usage_bytes();
         let tombstone_used = self.tombstones.tombstone_memory_usage_bytes();
 
+        // Budget scope (2026-08-29 load-test follow-up, aligned with
+        // docs/performance-tuning.md §2): the budget criterion `used_bytes`
+        // covers only evictable state — active partition heads plus sealed
+        // chunks pending flush. Registry, metadata, persisted-index, mmap and
+        // tombstone footprints are process-RSS facts: they stay tracked in
+        // their observability components and the `shared_used_bytes`
+        // aggregate (surfaced as `excluded_bytes`) but no longer raise the
+        // admission floor.
         let shared_used = registry_used
             .saturating_add(metadata_used)
             .saturating_add(persisted_index_used)
             .saturating_add(persisted_mmap_used)
             .saturating_add(tombstone_used);
-        let used = active_and_sealed_used.saturating_add(shared_used);
+        let used = active_and_sealed_used;
 
         Self::store_tracked_bytes(self.registry_used_bytes, registry_used);
         Self::store_tracked_bytes(self.metadata_used_bytes, metadata_used);

@@ -11,7 +11,6 @@ pub(super) struct RegistryPersistenceContext<'a> {
     registry_used_bytes: &'a AtomicU64,
     metadata_used_bytes: &'a AtomicU64,
     shared_used_bytes: &'a AtomicU64,
-    used_bytes: &'a AtomicU64,
 }
 
 impl<'a> RegistryPersistenceContext<'a> {
@@ -24,7 +23,6 @@ impl<'a> RegistryPersistenceContext<'a> {
         component.fetch_add(increment, Ordering::AcqRel);
         self.shared_used_bytes
             .fetch_add(increment, Ordering::AcqRel);
-        self.used_bytes.fetch_add(increment, Ordering::AcqRel);
     }
 
     fn sub_included_memory_component_bytes(self, component: &AtomicU64, bytes: usize) {
@@ -36,7 +34,6 @@ impl<'a> RegistryPersistenceContext<'a> {
         component.fetch_sub(decrement, Ordering::AcqRel);
         self.shared_used_bytes
             .fetch_sub(decrement, Ordering::AcqRel);
-        self.used_bytes.fetch_sub(decrement, Ordering::AcqRel);
     }
 
     fn with_included_memory_delta<T, R>(
@@ -266,7 +263,6 @@ impl ChunkStorage {
             registry_used_bytes: &self.memory.registry_used_bytes,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 }

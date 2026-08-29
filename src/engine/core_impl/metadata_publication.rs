@@ -17,7 +17,6 @@ pub(in crate::engine::storage_engine) struct RuntimeMetadataDeltaWriteContext<'a
     pub(in crate::engine::storage_engine) persisted_index: &'a RwLock<PersistedIndexState>,
     pub(in crate::engine::storage_engine) persisted_index_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> RuntimeMetadataDeltaWriteContext<'a> {
@@ -35,7 +34,6 @@ impl<'a> RuntimeMetadataDeltaWriteContext<'a> {
             self.accounting_enabled,
             self.persisted_index_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             &mut persisted_index,
             |persisted_index| {
                 ChunkStorage::bitmap_memory_usage_bytes(
@@ -91,7 +89,6 @@ pub(in crate::engine::storage_engine) struct MetadataShardPublicationContext<'a>
     pub(in crate::engine::storage_engine) registry: &'a RwLock<SeriesRegistry>,
     pub(in crate::engine::storage_engine) metadata_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> MetadataShardPublicationContext<'a> {
@@ -126,7 +123,6 @@ impl<'a> MetadataShardPublicationContext<'a> {
             self.accounting_enabled,
             self.metadata_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             inserted_bucket_entries.saturating_mul(std::mem::size_of::<SeriesId>()),
         );
     }
@@ -168,7 +164,6 @@ impl<'a> MetadataShardPublicationContext<'a> {
             self.accounting_enabled,
             self.metadata_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             removed_bucket_entries.saturating_mul(std::mem::size_of::<SeriesId>()),
         );
     }
@@ -184,7 +179,6 @@ impl<'a> LifecyclePublicationContext<'a> {
             self.accounting_enabled,
             self.registry_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             &mut registry,
             |registry| registry.memory_usage_bytes(),
             |registry| mutate(&mut *registry),
@@ -202,7 +196,6 @@ impl ChunkStorage {
             persisted_index: &self.persisted.persisted_index,
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -215,7 +208,6 @@ impl ChunkStorage {
             registry: &self.catalog.registry,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 }

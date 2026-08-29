@@ -110,7 +110,6 @@ pub(in crate::engine::storage_engine) struct SeriesTimestampWriteContext<'a> {
     pub(in crate::engine::storage_engine) accounting_enabled: bool,
     pub(in crate::engine::storage_engine) metadata_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> SeriesTimestampWriteContext<'a> {
@@ -145,7 +144,6 @@ impl<'a> SeriesTimestampWriteContext<'a> {
                 true,
                 self.metadata_used_bytes,
                 self.shared_used_bytes,
-                self.used_bytes,
                 after.saturating_sub(before),
             );
         } else {
@@ -153,7 +151,6 @@ impl<'a> SeriesTimestampWriteContext<'a> {
                 true,
                 self.metadata_used_bytes,
                 self.shared_used_bytes,
-                self.used_bytes,
                 before.saturating_sub(after),
             );
         }
@@ -348,7 +345,6 @@ pub(in crate::engine::storage_engine) struct MaterializedSeriesWriteContext<'a> 
     pub(in crate::engine::storage_engine) live_series_pruning_generation: &'a AtomicU64,
     pub(in crate::engine::storage_engine) metadata_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> MaterializedSeriesWriteContext<'a> {
@@ -369,7 +365,6 @@ impl<'a> MaterializedSeriesWriteContext<'a> {
             self.accounting_enabled,
             self.metadata_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             &mut materialized_series,
             |materialized_series| {
                 ChunkStorage::btree_set_series_id_memory_usage_bytes(materialized_series)
@@ -408,7 +403,6 @@ impl<'a> MaterializedSeriesWriteContext<'a> {
             self.accounting_enabled,
             self.metadata_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             &mut materialized_series,
             |materialized_series| {
                 ChunkStorage::btree_set_series_id_memory_usage_bytes(materialized_series)

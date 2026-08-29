@@ -219,7 +219,6 @@ pub(in crate::engine::storage_engine) struct LifecyclePublicationContext<'a> {
     pub(in crate::engine::storage_engine) persisted_index_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) persisted_mmap_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) registry_bookkeeping: RegistryBookkeepingContext<'a>,
     pub(in crate::engine::storage_engine) materialized_series: MaterializedSeriesWriteContext<'a>,
     pub(in crate::engine::storage_engine) runtime_metadata_delta:

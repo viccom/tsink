@@ -120,7 +120,6 @@ impl ChunkStorage {
             registry: &self.catalog.registry,
             registry_used_bytes: &self.memory.registry_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -169,7 +168,6 @@ impl ChunkStorage {
             pending_series_ids: &self.catalog.pending_series_ids,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -217,7 +215,6 @@ impl ChunkStorage {
             accounting_enabled: self.memory.accounting_enabled,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -230,7 +227,6 @@ impl ChunkStorage {
             live_series_pruning_generation: &self.visibility.live_series_pruning_generation,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -396,7 +392,6 @@ impl ChunkStorage {
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,
             persisted_mmap_used_bytes: &self.memory.persisted_mmap_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
             registry_bookkeeping: self.registry_bookkeeping_context(),
             materialized_series: self.materialized_series_write_context(),
             runtime_metadata_delta: self.runtime_metadata_delta_write_context(),
