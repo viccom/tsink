@@ -68,52 +68,96 @@ pub fn canonical_series_identity_key(metric: &str, labels: &[Label]) -> String {
     encoded
 }
 
-/// Marshals a metric name and labels into a unique binary identifier.
-pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> Vec<u8> {
-    let mut sorted_labels = labels.to_vec();
-    sorted_labels.sort();
+/// Runs `f` with the canonical (sorted) view of `labels`. Already-sorted
+/// inputs — the common case on the write path — are passed through as a
+/// borrow with no allocation; unsorted inputs fall back to a one-shot
+/// clone-and-sort, matching the previous always-sort behavior.
+fn with_canonical_labels<R>(labels: &[Label], f: impl FnOnce(&[Label]) -> R) -> R {
+    if labels.is_sorted() {
+        f(labels)
+    } else {
+        let mut sorted = labels.to_vec();
+        sorted.sort();
+        f(&sorted)
+    }
+}
 
+/// Streams the canonical series-identity bytes: metric length prefix +
+/// metric bytes, then per valid label (in sorted order) the length-prefixed
+/// name and value. Both `marshal_metric_name_into` and
+/// `stable_series_identity_hash` are defined over this single emitter, so
+/// the marshaled form and the hashed byte stream can never drift apart.
+fn emit_series_identity(metric: &str, sorted_labels: &[Label], mut sink: impl FnMut(&[u8])) {
     let metric_bytes = metric.as_bytes();
     let metric_len = metric_bytes.len().min(MAX_METRIC_NAME_LEN);
+    sink(&(metric_len as u16).to_le_bytes());
+    sink(&metric_bytes[..metric_len]);
+
+    for label in sorted_labels {
+        if !label.is_valid() {
+            continue;
+        }
+
+        let name_bytes = label.name.as_bytes();
+        let name_len = name_bytes.len().min(u16::MAX as usize);
+        sink(&(name_len as u16).to_le_bytes());
+        sink(&name_bytes[..name_len]);
+
+        let value_bytes = label.value.as_bytes();
+        let value_len = value_bytes.len().min(u16::MAX as usize);
+        sink(&(value_len as u16).to_le_bytes());
+        sink(&value_bytes[..value_len]);
+    }
+}
+
+fn series_identity_size_hint(metric: &str, sorted_labels: &[Label]) -> usize {
+    let metric_len = metric.len().min(MAX_METRIC_NAME_LEN);
     let mut size = metric_len + 2;
-    for label in &sorted_labels {
+    for label in sorted_labels {
         if label.is_valid() {
             size += label.name.len().min(u16::MAX as usize);
             size += label.value.len().min(u16::MAX as usize);
             size += 4;
         }
     }
+    size
+}
 
-    let mut out = Vec::with_capacity(size);
+/// Marshals a metric name and labels into a unique binary identifier,
+/// reusing `out`'s allocation across calls. Byte-identical to
+/// `marshal_metric_name`.
+pub fn marshal_metric_name_into(metric: &str, labels: &[Label], out: &mut Vec<u8>) {
+    out.clear();
+    with_canonical_labels(labels, |sorted| {
+        out.reserve(series_identity_size_hint(metric, sorted));
+        emit_series_identity(metric, sorted, |chunk| out.extend_from_slice(chunk));
+    });
+}
 
-    out.extend_from_slice(&(metric_len as u16).to_le_bytes());
-    out.extend_from_slice(&metric_bytes[..metric_len]);
-
-    for label in &sorted_labels {
-        if label.is_valid() {
-            let name_bytes = label.name.as_bytes();
-            let name_len = name_bytes.len().min(u16::MAX as usize);
-            out.extend_from_slice(&(name_len as u16).to_le_bytes());
-            out.extend_from_slice(&name_bytes[..name_len]);
-
-            let value_bytes = label.value.as_bytes();
-            let value_len = value_bytes.len().min(u16::MAX as usize);
-            out.extend_from_slice(&(value_len as u16).to_le_bytes());
-            out.extend_from_slice(&value_bytes[..value_len]);
-        }
-    }
-
+/// Marshals a metric name and labels into a unique binary identifier.
+pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> Vec<u8> {
+    let mut out = Vec::new();
+    marshal_metric_name_into(metric, labels, &mut out);
     out
 }
 
 /// Computes a stable 64-bit hash for a metric series identity.
+///
+/// Hashes the exact byte stream emitted by `marshal_metric_name` without
+/// materializing it: already-sorted label sets hash with zero allocations.
 pub fn stable_series_identity_hash(metric: &str, labels: &[Label]) -> u64 {
-    let canonical = canonical_series_identity(metric, labels);
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in canonical {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    with_canonical_labels(labels, |sorted| {
+        emit_series_identity(metric, sorted, |chunk| {
+            for &byte in chunk {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        });
+    });
     hash
 }
 
@@ -318,6 +362,86 @@ mod tests {
 
         assert!(label1 < label2);
         assert!(label2 < label3);
+    }
+
+    fn identity_encoding_cases() -> Vec<(&'static str, Vec<Label>)> {
+        vec![
+            ("cpu_usage", vec![]),
+            (
+                "cpu_usage",
+                vec![
+                    Label::new("host", "server1"),
+                    Label::new("region", "us-west"),
+                ],
+            ),
+            // Same labels in non-sorted order: encoding must stay canonical.
+            (
+                "cpu_usage",
+                vec![
+                    Label::new("region", "us-west"),
+                    Label::new("host", "server1"),
+                ],
+            ),
+            ("metric", vec![Label::new("optional", "")]),
+            // Invalid (empty-name) labels are skipped by the encoding.
+            (
+                "metric",
+                vec![Label::new("", "invalid"), Label::new("k", "v")],
+            ),
+        ]
+    }
+
+    #[test]
+    fn marshal_metric_name_into_is_byte_identical_and_buffer_reusable() {
+        let mut buffer = Vec::new();
+        for (metric, labels) in identity_encoding_cases() {
+            marshal_metric_name_into(metric, &labels, &mut buffer);
+            assert_eq!(
+                buffer,
+                marshal_metric_name(metric, &labels),
+                "buffered marshal must be byte-identical for metric {metric}"
+            );
+            // Re-run on the same buffer to pin that reuse does not leak
+            // trailing bytes from the previous call.
+            marshal_metric_name_into(metric, &labels, &mut buffer);
+            assert_eq!(buffer, marshal_metric_name(metric, &labels));
+        }
+    }
+
+    #[test]
+    fn stable_series_identity_hash_equals_fnv_over_marshaled_bytes() {
+        // Independent FNV-1a oracle: the hash must stay byte-exact over the
+        // marshaled identity regardless of internal allocation strategy.
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut hash = 0xcbf29ce484222325u64;
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
+
+        for (metric, labels) in identity_encoding_cases() {
+            let marshaled = marshal_metric_name(metric, &labels);
+            assert_eq!(
+                stable_series_identity_hash(metric, &labels),
+                fnv1a(&marshaled),
+                "identity hash must equal FNV-1a over marshaled bytes for metric {metric}"
+            );
+        }
+    }
+
+    #[test]
+    fn marshal_metric_name_into_handles_oversized_metric_and_labels() {
+        let metric = "m".repeat(MAX_METRIC_NAME_LEN + 10);
+        let labels = vec![Label::new("k".repeat(MAX_LABEL_NAME_LEN + 5), "v")];
+
+        let mut buffer = Vec::new();
+        marshal_metric_name_into(&metric, &labels, &mut buffer);
+        assert_eq!(buffer, marshal_metric_name(&metric, &labels));
+
+        let encoded_len = u16::from_le_bytes([buffer[0], buffer[1]]) as usize;
+        assert_eq!(encoded_len, MAX_METRIC_NAME_LEN);
     }
 
     #[test]
