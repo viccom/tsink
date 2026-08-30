@@ -39,6 +39,7 @@ pub(in crate::engine) use logical::LogicalWalWrite;
 #[cfg(test)]
 use replay::{replay_from_path, replay_from_path_with_mode};
 pub use replay::{CommittedWalReplayStream, WalReplayStream};
+pub(in crate::engine) use segments::WalPrefixReclaim;
 #[cfg(test)]
 use segments::{collect_wal_segment_files, scan_last_seq, segment_path};
 use series_index::{CachedSeriesDefinitionFrame, CachedSeriesDefinitionIndex};

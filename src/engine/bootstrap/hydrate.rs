@@ -52,6 +52,12 @@ impl StartupHydrationPhase {
             registry.reconcile_registry_with_persisted,
         )?;
         storage.replay_from_wal(replay_highwater, builder.wal_replay_mode())?;
+        // Frames at or before the replay floor are already durable in persisted
+        // segments, so the whole WAL segments they live in are dead weight after
+        // replay. Drop them now: without this, a large legacy WAL (T21b) keeps
+        // its pre-crash size and keeps growing because sustained writes stop the
+        // all-or-nothing WAL reset from ever firing.
+        storage.reclaim_wal_prefix_covered_by_persisted_state(replay_highwater);
         storage.load_rollup_runtime_state()?;
         storage.refresh_segment_catalog_and_observability_from_persisted_state(&[])?;
         if storage.persisted.tiered_storage.is_some() {

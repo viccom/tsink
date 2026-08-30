@@ -491,9 +491,67 @@ impl ChunkStorage {
                 .wal
                 .resets_total
                 .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Sustained ingestion appends past every flush snapshot, so the
+            // all-or-nothing reset above almost never fires under load (T21:
+            // the WAL grew to its size limit while persists kept succeeding).
+            // Reclaim the prefix this flush just made durable instead. A
+            // reclaim failure only leaves disk usage higher, so it must not
+            // fail the persist pipeline.
+            self.record_wal_prefix_reclaim(wal.reclaim_covered_prefix(wal_highwater), "flush");
         }
 
         Ok(())
+    }
+
+    fn record_wal_prefix_reclaim(
+        &self,
+        reclaim: Result<crate::engine::wal::WalPrefixReclaim>,
+        trigger: &str,
+    ) {
+        match reclaim {
+            Ok(reclaim) if reclaim.deleted_segments > 0 => {
+                self.observability
+                    .wal
+                    .prefix_reclaims_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .prefix_reclaimed_bytes_total
+                    .fetch_add(reclaim.reclaimed_bytes, Ordering::Relaxed);
+                tracing::info!(
+                    trigger = trigger,
+                    segments = reclaim.deleted_segments,
+                    bytes = reclaim.reclaimed_bytes,
+                    "Reclaimed WAL prefix segments covered by persisted data"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.observability
+                    .wal
+                    .prefix_reclaim_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    trigger = trigger,
+                    error = %err,
+                    "Failed to reclaim WAL prefix segments covered by persisted data"
+                );
+            }
+        }
+    }
+
+    /// Drops whole WAL segments whose frames the persisted replay floor already
+    /// covers. Called right after startup replay so a large legacy WAL (T21b)
+    /// shrinks immediately instead of regrowing past its old size.
+    pub(in super::super) fn reclaim_wal_prefix_covered_by_persisted_state(
+        &self,
+        checkpoint: WalHighWatermark,
+    ) {
+        let Some(wal) = self.persisted.wal.as_ref() else {
+            return;
+        };
+        self.record_wal_prefix_reclaim(wal.reclaim_covered_prefix(checkpoint), "startup_replay");
     }
 
     pub(in super::super) fn persist_segment_with_outcome(&self) -> Result<PersistSegmentOutcome> {

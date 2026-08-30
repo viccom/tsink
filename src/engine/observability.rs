@@ -114,6 +114,15 @@ impl From<WalSnapshotView<'_>> for WalObservabilitySnapshot {
             append_errors_total: value.counters.append_errors_total.load(Ordering::Relaxed),
             resets_total: value.counters.resets_total.load(Ordering::Relaxed),
             reset_errors_total: value.counters.reset_errors_total.load(Ordering::Relaxed),
+            prefix_reclaims_total: value.counters.prefix_reclaims_total.load(Ordering::Relaxed),
+            prefix_reclaimed_bytes_total: value
+                .counters
+                .prefix_reclaimed_bytes_total
+                .load(Ordering::Relaxed),
+            prefix_reclaim_errors_total: value
+                .counters
+                .prefix_reclaim_errors_total
+                .load(Ordering::Relaxed),
         }
     }
 }

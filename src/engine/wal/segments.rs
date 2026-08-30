@@ -52,6 +52,14 @@ struct RecoverableSegmentScan {
     encountered_corruption: bool,
 }
 
+/// Outcome of a WAL prefix reclaim pass: whole segments deleted because every
+/// frame they hold sits at or before the caller's checkpoint highwater.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::engine) struct WalPrefixReclaim {
+    pub(in crate::engine) deleted_segments: u64,
+    pub(in crate::engine) reclaimed_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WalOpenRecoveryState {
     last_highwater: WalHighWatermark,
@@ -321,6 +329,85 @@ impl FramedWal {
             frame: min_next_seq.saturating_sub(1),
         };
         self.advance_highwater_floor(floor);
+    }
+
+    /// Deletes whole WAL segments whose every frame sits at or before
+    /// `checkpoint`.
+    ///
+    /// WAL appends are globally monotonic in `(segment, frame)` — rotation
+    /// always moves to a fresh, higher segment id and restarts frame seqs at 1
+    /// — so any segment with `id < checkpoint.segment` holds only frames that
+    /// the caller's checkpoint already covers. The checkpoint segment itself is
+    /// kept: its tail beyond `checkpoint.frame` is still needed and a file
+    /// prefix cannot be truncated in place. Reclaims never touch the active
+    /// segment. Crash-safe by construction: the caller only passes checkpoints
+    /// whose data is already durable in persisted segments, and any frames from
+    /// a deleted segment that reappear after a torn delete are at or before the
+    /// replay floor and therefore skipped during replay.
+    pub(in crate::engine) fn reclaim_covered_prefix(
+        &self,
+        checkpoint: WalHighWatermark,
+    ) -> Result<WalPrefixReclaim> {
+        let _writer = self.writer.lock();
+        if checkpoint.segment == 0 {
+            // Segment 0 is never strictly below the checkpoint segment.
+            return Ok(WalPrefixReclaim::default());
+        }
+
+        let active_segment = self.active_segment.load(Ordering::SeqCst);
+        let mut reclaim = WalPrefixReclaim::default();
+        for segment in collect_wal_segment_files(&self.dir)? {
+            if segment.id >= checkpoint.segment || segment.id == active_segment {
+                continue;
+            }
+
+            let len = match fs::metadata(&segment.path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: segment.path.clone(),
+                        source: e,
+                    })
+                }
+            };
+            match fs::remove_file(&segment.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Another process can hold a non-sharing handle (e.g. a
+                // scanner on Windows, os error 32). The segment is covered, so
+                // leave it for the next reclaim pass instead of failing this
+                // one.
+                Err(e) if e.raw_os_error() == Some(32) => {
+                    warn!(
+                        segment = segment.id,
+                        path = %segment.path.display(),
+                        "Skipped reclaim of a WAL segment held by another process"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: segment.path.clone(),
+                        source: e,
+                    })
+                }
+            }
+            reclaim.deleted_segments += 1;
+            reclaim.reclaimed_bytes = reclaim.reclaimed_bytes.saturating_add(len);
+        }
+
+        if reclaim.deleted_segments > 0 {
+            // Update accounting before the directory sync: if the sync fails the
+            // files are already gone, so the counters must already reflect that.
+            self.total_size_bytes
+                .fetch_sub(reclaim.reclaimed_bytes, Ordering::AcqRel);
+            self.segment_count
+                .fetch_sub(reclaim.deleted_segments, Ordering::AcqRel);
+            sync_dir_path(&self.dir)?;
+        }
+
+        Ok(reclaim)
     }
 
     pub fn ensure_min_highwater(&self, min_highwater: WalHighWatermark) -> Result<()> {

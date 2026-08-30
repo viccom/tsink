@@ -380,6 +380,13 @@ pub struct WalObservabilitySnapshot {
     pub append_errors_total: u64,
     pub resets_total: u64,
     pub reset_errors_total: u64,
+    /// Whole-segment WAL prefix reclaims triggered by flushes or startup replay.
+    #[serde(default)]
+    pub prefix_reclaims_total: u64,
+    #[serde(default)]
+    pub prefix_reclaimed_bytes_total: u64,
+    #[serde(default)]
+    pub prefix_reclaim_errors_total: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

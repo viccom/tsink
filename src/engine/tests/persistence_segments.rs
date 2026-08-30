@@ -504,3 +504,136 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
     let active = storage.chunks.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
     assert_eq!(active.get(&series_id).unwrap().point_count(), 1);
 }
+
+#[test]
+fn persist_reclaims_covered_wal_prefix_when_active_writes_block_full_reset() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let metric = "wal_prefix_reclaim";
+    let labels = vec![Label::new("host", "a")];
+
+    // Tiny segments (~one frame each) roll multiple WAL files quickly; a fresh
+    // engine also starts without any registry catalog sidecar, so the reclaim
+    // below must not depend on catalog validation succeeding.
+    let wal = FramedWal::open_with_options(&wal_dir, WalSyncMode::PerAppend, 128, 88).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut ts = 1i64;
+    for _ in 0..4 {
+        storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(ts, ts as f64)),
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(ts + 1, (ts + 1) as f64),
+                ),
+            ])
+            .unwrap();
+        ts += 2;
+    }
+    storage.flush_all_active().unwrap();
+    // Sustained-write model (T21): a frame lands after the would-be flush
+    // snapshot, so the WAL keeps an uncovered active tail and the all-or-nothing
+    // full reset can never fire while ingestion continues.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(ts, ts as f64),
+        )])
+        .unwrap();
+
+    let before = wal_segment_ids_and_size(&wal_dir);
+    assert!(
+        before.len() >= 3,
+        "fixture must roll multiple WAL segments, got {before:?}"
+    );
+
+    storage.persist_segment().unwrap();
+
+    let after = wal_segment_ids_and_size(&wal_dir);
+    assert!(
+        after.first().map(|(id, _)| *id).unwrap_or(0)
+            > before.first().map(|(id, _)| *id).unwrap_or(0),
+        "covered WAL prefix segments must be reclaimed after persist even when \
+         active writes block a full reset: before={before:?} after={after:?}"
+    );
+
+    let points = storage.select(metric, &labels, 0, 100).unwrap();
+    assert_eq!(points.len(), 9, "reclaim must not lose data");
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn wal_disk_usage_stays_bounded_under_sustained_write_persist_cycles() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let metric = "wal_bounded_reclaim";
+    let labels = vec![Label::new("host", "a")];
+
+    let wal = FramedWal::open_with_options(&wal_dir, WalSyncMode::PerAppend, 128, 88).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut ts = 1i64;
+    let rounds = 12;
+    for round in 0..rounds {
+        // Sustained-ingestion shape from the T21 incident: chunks seal
+        // eagerly at the cap while the latest single-point write stays in an
+        // unsealed head, so every persist snapshot lags the appended WAL and
+        // the all-or-nothing full reset can never fire. Round 0 primes the
+        // residue head (3 points -> one sealed chunk + one active point);
+        // later rounds keep it (2 points -> one sealed chunk + residue).
+        let inserts = if round == 0 { 3 } else { 2 };
+        for _ in 0..inserts {
+            storage
+                .insert_rows(&[Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(ts, ts as f64),
+                )])
+                .unwrap();
+            ts += 1;
+        }
+        storage.persist_segment().unwrap();
+    }
+
+    let after = wal_segment_ids_and_size(&wal_dir);
+    assert!(
+        after.len() <= 8,
+        "WAL disk usage must stay bounded under sustained write+persist cycles, got {rounds} \
+         rounds and {after:?} segments still on disk"
+    );
+
+    let points = storage.select(metric, &labels, 0, 1000).unwrap();
+    assert_eq!(points.len() as i64, 3 + 2 * (rounds - 1));
+
+    storage.close().unwrap();
+}
