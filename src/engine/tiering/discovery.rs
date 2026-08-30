@@ -137,5 +137,11 @@ fn scan_startup_segment_roots_recoverable(
 }
 
 fn is_not_found_error(err: &TsinkError) -> bool {
-    matches!(err, TsinkError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+    // Mirror segment::validation::is_not_found_error: IoWithPath carries the
+    // same NotFound source kind for concurrently removed segment roots.
+    match err {
+        TsinkError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        TsinkError::IoWithPath { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }

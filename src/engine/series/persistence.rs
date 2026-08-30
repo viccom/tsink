@@ -82,10 +82,18 @@ impl SeriesRegistry {
                 false
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(&dir_path)?;
+                fs::create_dir_all(&dir_path).map_err(|source| TsinkError::IoWithPath {
+                    path: dir_path.clone(),
+                    source,
+                })?;
                 true
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: dir_path.clone(),
+                    source: err,
+                })
+            }
         };
         if created_dir {
             sync_parent_dir(&dir_path)?;
@@ -97,7 +105,10 @@ impl SeriesRegistry {
 
     pub fn persist_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|source| TsinkError::IoWithPath {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
 
         let metric_dict = self.metric_dict.read();
@@ -150,7 +161,10 @@ impl SeriesRegistry {
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {
-        let raw_bytes = fs::read(path)?;
+        let raw_bytes = fs::read(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let bytes = decode_optional_zstd_framed_file(
             &raw_bytes,
             REGISTRY_INDEX_MAGIC,
@@ -293,6 +307,11 @@ impl SeriesRegistry {
         match Self::load_from_path(path) {
             Ok(registry) => Ok(Some(registry)),
             Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(TsinkError::IoWithPath { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
             Err(err) => Err(err),
         }
     }
@@ -340,13 +359,27 @@ impl SeriesRegistry {
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: dir_path.clone(),
+                    source: err,
+                })
+            }
         }
 
         let mut paths = Vec::new();
-        for entry in fs::read_dir(&dir_path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
+        for entry in fs::read_dir(&dir_path).map_err(|source| TsinkError::IoWithPath {
+            path: dir_path.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| TsinkError::IoWithPath {
+                path: dir_path.clone(),
+                source,
+            })?;
+            let file_type = entry.file_type().map_err(|source| TsinkError::IoWithPath {
+                path: entry.path(),
+                source,
+            })?;
             if !file_type.is_file() {
                 continue;
             }

@@ -111,11 +111,19 @@ impl ChunkStorage {
         let mut entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: path.to_path_buf(),
+                    source: err,
+                })
+            }
         };
 
         if let Some(entry) = entries.next() {
-            entry?;
+            entry.map_err(|err| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source: err,
+            })?;
             return Ok(true);
         }
 

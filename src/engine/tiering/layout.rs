@@ -205,7 +205,10 @@ fn ensure_destination_matches_or_copy(source_root: &Path, destination_root: &Pat
             destination_root.display()
         )));
     };
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(|source| TsinkError::IoWithPath {
+        path: parent.to_path_buf(),
+        source,
+    })?;
 
     let staging = stage_dir_path(destination_root, TIER_DESTINATION_COPY_PURPOSE)?;
     copy_dir_recursive(source_root, &staging)?;

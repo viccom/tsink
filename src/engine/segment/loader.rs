@@ -566,7 +566,10 @@ fn map_required_segment_file_error(
     err: std::io::Error,
 ) -> TsinkError {
     if err.kind() != std::io::ErrorKind::NotFound {
-        return err.into();
+        return TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: err,
+        };
     }
 
     match fs::symlink_metadata(segment_root) {
@@ -581,8 +584,20 @@ fn map_required_segment_file_error(
             "segment root is not a directory: {}",
             segment_root.display()
         )),
-        Err(root_err) if root_err.kind() == std::io::ErrorKind::NotFound => err.into(),
-        Err(root_err) => root_err.into(),
+        // The segment root itself (or one of its parents) is gone: on Windows
+        // this surfaces as os error 3 (path not found). Carry the root path so
+        // forensics can tell a concurrently-removed segment apart from a
+        // broken parent directory chain.
+        Err(root_err) if root_err.kind() == std::io::ErrorKind::NotFound => {
+            TsinkError::IoWithPath {
+                path: segment_root.to_path_buf(),
+                source: err,
+            }
+        }
+        Err(root_err) => TsinkError::IoWithPath {
+            path: segment_root.to_path_buf(),
+            source: root_err,
+        },
     }
 }
 

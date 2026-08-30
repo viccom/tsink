@@ -29,7 +29,12 @@ impl WalRuntimeAccounting {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: segment.path.clone(),
+                        source: e,
+                    })
+                }
             }
         }
 
@@ -74,12 +79,18 @@ impl FramedWal {
         segment_max_bytes: u64,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.clone(),
+            source,
+        })?;
 
         let mut segments = collect_wal_segment_files(&dir)?;
         if segments.is_empty() {
             let path = segment_path(&dir, 0);
-            File::create(&path)?;
+            File::create(&path).map_err(|source| TsinkError::IoWithPath {
+                path: path.clone(),
+                source,
+            })?;
             sync_dir_path(&dir)?;
             segments.push(WalSegmentFile { id: 0, path });
         }
@@ -399,7 +410,10 @@ fn read_published_highwater(path: &Path) -> Result<Option<WalHighWatermark>> {
     match fs::read(path) {
         Ok(bytes) => decode_published_highwater(&bytes).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: err,
+        }),
     }
 }
 
@@ -422,15 +436,33 @@ fn discard_unpublished_suffixes(
         let current_len = match fs::metadata(&segment.path) {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: segment.path.clone(),
+                    source: err,
+                })
+            }
         };
         if current_len <= truncate_len {
             continue;
         }
 
-        let file = OpenOptions::new().write(true).open(&segment.path)?;
-        file.set_len(truncate_len)?;
-        file.sync_data()?;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&segment.path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: segment.path.clone(),
+                source,
+            })?;
+        file.set_len(truncate_len)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: segment.path.clone(),
+                source,
+            })?;
+        file.sync_data().map_err(|source| TsinkError::IoWithPath {
+            path: segment.path.clone(),
+            source,
+        })?;
         warn!(
             segment = segment.id,
             path = %segment.path.display(),
@@ -451,7 +483,14 @@ fn discard_unpublished_suffixes(
 /// that crashed before publication. An empty file is valid because WAL reset removes
 /// checkpointed frames while retaining their monotonic high-watermark.
 fn published_prefix_len(path: &Path, published_frame: u64) -> Result<Option<u64>> {
-    let file = OpenOptions::new().read(true).open(path)?;
+    let file =
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?;
     let mut reader = BufReader::new(file);
     let mut prefix_len = 0u64;
     let mut saw_frame_at_or_before_boundary = false;
@@ -519,10 +558,21 @@ pub(super) fn write_published_highwater_marker(
             .create(true)
             .write(true)
             .truncate(true)
-            .open(tmp_path)?;
-        file.write_all(&bytes)?;
+            .open(tmp_path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: tmp_path.to_path_buf(),
+                source,
+            })?;
+        file.write_all(&bytes)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: tmp_path.to_path_buf(),
+                source,
+            })?;
         if sync {
-            file.sync_data()?;
+            file.sync_data().map_err(|source| TsinkError::IoWithPath {
+                path: tmp_path.to_path_buf(),
+                source,
+            })?;
         }
         drop(file);
         crate::engine::fs_utils::rename_tmp(tmp_path, path)?;
@@ -563,8 +613,18 @@ pub(super) fn collect_wal_segment_files(dir: &Path) -> Result<Vec<WalSegmentFile
         path: dir.to_path_buf(),
         source,
     })? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: entry.path(),
+                source,
+            })?
+            .is_file()
+        {
             continue;
         }
 
@@ -614,10 +674,28 @@ pub(super) fn open_segment_for_append(path: &Path) -> Result<(File, bool, u64)> 
     let segment_created = match fs::metadata(path) {
         Ok(_) => false,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source: e,
+            })
+        }
     };
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let initial_len = file.metadata()?.len();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let initial_len = file
+        .metadata()
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
     Ok((file, segment_created, initial_len))
 }
 
@@ -675,7 +753,14 @@ pub(super) fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {
 }
 
 fn scan_recoverable_segment(path: &Path) -> Result<RecoverableSegmentScan> {
-    let file = OpenOptions::new().read(true).open(path)?;
+    let file =
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?;
     let mut reader = BufReader::new(file);
     let mut max_seq = 0u64;
     let mut encountered_corruption = false;

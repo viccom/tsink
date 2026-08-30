@@ -65,7 +65,10 @@ pub(super) fn write_compaction_replacement_marker(
     };
 
     let marker_dir = compaction_replacement_dir(data_path);
-    fs::create_dir_all(&marker_dir)?;
+    fs::create_dir_all(&marker_dir).map_err(|source| TsinkError::IoWithPath {
+        path: marker_dir.clone(),
+        source,
+    })?;
     let marker_path = replacement_marker_path(data_path);
     let payload = serde_json::to_vec(&marker)?;
     write_file_atomically_and_sync_parent(&marker_path, &payload)?;
@@ -73,7 +76,10 @@ pub(super) fn write_compaction_replacement_marker(
 }
 
 fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacementMarker> {
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let marker: CompactionReplacementMarker = serde_json::from_slice(&bytes)?;
     if marker.version != COMPACTION_REPLACEMENT_VERSION {
         return Err(TsinkError::DataCorruption(format!(
@@ -174,7 +180,14 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Pa
                 });
             }
         };
-        if !entry.file_type()?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: entry.path(),
+                source,
+            })?
+            .is_file()
+        {
             continue;
         }
         marker_paths.push(entry.path());

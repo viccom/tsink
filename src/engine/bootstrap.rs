@@ -90,10 +90,16 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
             data_path.display()
         )));
     };
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(|err| TsinkError::IoWithPath {
+        path: parent.to_path_buf(),
+        source: err,
+    })?;
 
     let staging = stage_dir_path(data_path, "restore-staging")?;
-    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&staging).map_err(|err| TsinkError::IoWithPath {
+        path: staging.clone(),
+        source: err,
+    })?;
     if let Err(err) = copy_dir_contents(snapshot_path, &staging) {
         let _ = remove_path_if_exists_and_sync_parent(&staging);
         return Err(err);
