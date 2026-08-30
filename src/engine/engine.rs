@@ -86,12 +86,12 @@ pub(in crate::engine::storage_engine) use core_impl::{
     current_unix_millis_u64, duration_to_timestamp_units, elapsed_nanos_u64, lane_for_value,
     partition_id_for_timestamp, persisted_chunk_payload, saturating_u64_from_usize,
     value_heap_bytes, CatalogContext, ChunkContext, LifecyclePublicationContext, MemoryDeltaBytes,
-    PersistedRefreshContext, WriteAdmissionControlContext, WriteApplyContext,
-    WriteApplyMemoryAccountingContext, WriteApplyPublicationContext, WriteApplyRegistryContext,
-    WriteApplyShardMutationContext, WriteApplyWalContext, WriteCommitContext,
-    WriteCommitStageContext, WriteCommitWalCompletionContext, WritePrepareContext,
-    WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext, WritePrepareWalContext,
-    WriteResolveContext, WriteSeriesValidationContext,
+    PersistedRefreshContext, VisibilityStateMemoryBaseline, WriteAdmissionControlContext,
+    WriteApplyContext, WriteApplyMemoryAccountingContext, WriteApplyPublicationContext,
+    WriteApplyRegistryContext, WriteApplyShardMutationContext, WriteApplyWalContext,
+    WriteCommitContext, WriteCommitStageContext, WriteCommitWalCompletionContext,
+    WritePrepareContext, WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext,
+    WritePrepareWalContext, WriteResolveContext, WriteSeriesValidationContext,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
@@ -271,6 +271,14 @@ pub struct ChunkStorage {
     /// by ingest tests to pin per-batch (series, lane) dedup.
     #[cfg(test)]
     lane_validation_probes: AtomicUsize,
+    /// Test-only instrumentation: counts full O(cached-series) executions of
+    /// `series_visibility_state_memory_usage_bytes`. The mutation paths
+    /// (merge/replace/clear) must keep this at zero per batch — incremental
+    /// capacity baselines own the accounting — while the reconciliation face
+    /// (`refresh_memory_usage`) still runs the full recompute and must move
+    /// the probe.
+    #[cfg(test)]
+    visibility_full_estimation_probes: AtomicUsize,
 }
 
 struct MetadataShardIndex {

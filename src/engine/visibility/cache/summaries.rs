@@ -240,10 +240,13 @@ impl ChunkStorage {
             .visibility
             .series_visible_bounded_max_timestamps
             .write();
+        let ranges_touched: Vec<SeriesId> =
+            updates.iter().map(|(series_id, _)| *series_id).collect();
         self.with_visibility_state_memory_delta(
             &mut summaries,
             &mut cache,
             &mut bounded_cache,
+            &ranges_touched,
             |summaries, cache, bounded_cache| {
                 for (series_id, summary) in updates {
                     let latest = summary.latest_visible_timestamp;
@@ -282,6 +285,10 @@ impl ChunkStorage {
     where
         I: IntoIterator<Item = SeriesId>,
     {
+        let mut series_ids = series_ids.into_iter().collect::<Vec<_>>();
+        series_ids.sort_unstable();
+        series_ids.dedup();
+
         let _recency_guard = self.visibility.recency_state_lock.lock();
         let current_bounded = self
             .visibility
@@ -298,11 +305,12 @@ impl ChunkStorage {
             &mut summaries,
             &mut cache,
             &mut bounded_cache,
+            &series_ids,
             |summaries, cache, bounded_cache| {
-                for series_id in series_ids {
-                    summaries.remove(&series_id);
-                    cache.remove(&series_id);
-                    if bounded_cache.remove(&series_id).flatten() == Some(current_bounded) {
+                for series_id in &series_ids {
+                    summaries.remove(series_id);
+                    cache.remove(series_id);
+                    if bounded_cache.remove(series_id).flatten() == Some(current_bounded) {
                         repair_needed = true;
                     }
                 }

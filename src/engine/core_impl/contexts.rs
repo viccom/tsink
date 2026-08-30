@@ -121,6 +121,12 @@ impl ChunkStorage {
         self.lane_validation_probes.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn visibility_full_estimation_probes(&self) -> usize {
+        self.visibility_full_estimation_probes
+            .load(Ordering::Acquire)
+    }
+
     pub(in crate::engine::storage_engine) fn registry_memory_context(
         &self,
     ) -> RegistryMemoryContext<'_> {

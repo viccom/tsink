@@ -867,6 +867,145 @@ fn delete_series_tombstone_accounting_reconciles_with_full_refresh() {
 }
 
 #[test]
+fn visibility_state_batch_writes_perform_no_full_memory_estimation() {
+    // Task 13 (2026-08-29 load-test follow-up): the three global visibility
+    // caches used to be fully re-measured (an O(cached-series) scan over
+    // every summary's ranges Vec) before AND after each per-shard cache
+    // merge on the write path — roughly 390 entry accesses per row at 100k
+    // series, executed under the recency mutex and all three cache write
+    // locks. Steady-state batch writes must keep the full-estimation probe
+    // at exactly zero; the full recompute stays reserved for the
+    // reconciliation face (`refresh_memory_usage`).
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 1_000_000);
+    let labels = vec![Label::new("host", "a")];
+
+    // First batch creates the series; the probe baseline starts after
+    // creation so series-creation work cannot mask the steady-state check.
+    storage
+        .insert_rows(&[Row::with_labels(
+            "visibility_probe_metric",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    let before = storage.visibility_full_estimation_probes();
+    storage
+        .insert_rows(&[Row::with_labels(
+            "visibility_probe_metric",
+            labels.clone(),
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+    assert_eq!(
+        storage.visibility_full_estimation_probes() - before,
+        0,
+        "steady-state batch writes must not fully re-measure the visibility caches",
+    );
+
+    // Instrumentation liveness: the reconciliation face still runs the full
+    // recompute, so the probe must advance once it executes.
+    assert_engine_memory_usage_reconciled(&storage);
+    assert!(
+        storage.visibility_full_estimation_probes() > before,
+        "the probe must count the full estimation performed by the reconciliation face",
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn visibility_state_incremental_accounting_matches_full_recompute_across_lifecycle() {
+    // Task 13 safety net: incremental visibility-state memory accounting
+    // (capacity baselines captured at the three cache mutation sites) must
+    // stay byte-identical to the full recompute across series creation,
+    // ranges-Vec growth/normalization/truncation, summary rebuilds, and
+    // deletes. Any drift here poisons the admission criterion silently.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 4_000_000);
+    let metric = "visibility_parity_metric";
+    let labels = |host: &str| vec![Label::new("host", host)];
+
+    // Stage A — create three series (summary/timestamp map inserts and the
+    // first HashMap capacity growth).
+    for host in ["a", "b", "c"] {
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels(host),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+    }
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage B — 40 disjoint ranges on series "a" across several batches:
+    // ranges-Vec growth, normalization Vec replacement, and the
+    // >SERIES_VISIBILITY_SUMMARY_MAX_RANGES truncation/drain path.
+    for batch in 0..4u32 {
+        let rows: Vec<Row> = (0..10u32)
+            .map(|i| {
+                let step = batch * 10 + i;
+                Row::with_labels(
+                    metric,
+                    labels("a"),
+                    DataPoint::new(2 + step as i64 * 2, step as f64),
+                )
+            })
+            .collect();
+        storage.insert_rows(&rows).unwrap();
+        assert_engine_memory_usage_reconciled(&storage);
+    }
+
+    // Stage C — a contiguous run collapses into a single merged range
+    // (normalize replaces the Vec with a differently sized allocation).
+    let rows: Vec<Row> = (0..12i64)
+        .map(|i| Row::with_labels(metric, labels("a"), DataPoint::new(100 + i, i as f64)))
+        .collect();
+    storage.insert_rows(&rows).unwrap();
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage D — summary rebuild (replace path) for all live series.
+    storage
+        .refresh_series_visible_timestamp_cache(
+            storage
+                .visibility
+                .materialized_series
+                .read()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage E — delete (clear path removes cache entries and their ranges).
+    let deleted = storage
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric(metric)
+                .with_matcher(SeriesMatcher::equal("host", "a")),
+        )
+        .unwrap();
+    assert_eq!(deleted.matched_series, 1);
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage F — writes after deletion re-grow cache entries on top of the
+    // cleared maps.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels("b"),
+            DataPoint::new(500, 5.0),
+        )])
+        .unwrap();
+    assert_engine_memory_usage_reconciled(&storage);
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn cardinality_limit_rejects_new_series_beyond_limit() {
     let storage = StorageBuilder::new()
         .with_cardinality_limit(1)

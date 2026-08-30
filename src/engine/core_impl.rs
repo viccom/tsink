@@ -22,7 +22,7 @@ pub(super) use self::metadata_publication::*;
 pub(super) use self::utilities::{
     current_unix_millis_u64, current_unix_timestamp_units, duration_to_timestamp_units,
     elapsed_nanos_u64, lane_for_value, partition_id_for_timestamp, persisted_chunk_payload,
-    saturating_u64_from_usize, value_heap_bytes, MemoryDeltaBytes,
+    saturating_u64_from_usize, value_heap_bytes, MemoryDeltaBytes, VisibilityStateMemoryBaseline,
 };
 pub(super) use self::write_capabilities::*;
 pub(super) use self::write_memory::*;

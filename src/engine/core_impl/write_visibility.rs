@@ -118,6 +118,7 @@ impl<'a> SeriesTimestampWriteContext<'a> {
         summaries: &mut HashMap<SeriesId, SeriesVisibilitySummary>,
         cache: &mut HashMap<SeriesId, Option<i64>>,
         bounded_cache: &mut HashMap<SeriesId, Option<i64>>,
+        ranges_touched: &[SeriesId],
         mutate: impl FnOnce(
             &mut HashMap<SeriesId, SeriesVisibilitySummary>,
             &mut HashMap<SeriesId, Option<i64>>,
@@ -128,30 +129,35 @@ impl<'a> SeriesTimestampWriteContext<'a> {
             return mutate(summaries, cache, bounded_cache);
         }
 
-        let before = ChunkStorage::series_visibility_state_memory_usage_bytes(
+        // Incremental accounting (plan Task 13): capture an O(touched)
+        // capacity baseline instead of re-measuring every cached series
+        // before and after the mutation. Only `ranges_touched` summaries can
+        // change their ranges Vec; map shells are covered by capacity reads.
+        let baseline =
+            VisibilityStateMemoryBaseline::capture(ranges_touched, summaries, cache, bounded_cache);
+        #[cfg(test)]
+        let full_before = ChunkStorage::series_visibility_state_memory_usage_bytes(
             summaries,
             cache,
             bounded_cache,
         );
         let result = mutate(summaries, cache, bounded_cache);
-        let after = ChunkStorage::series_visibility_state_memory_usage_bytes(
-            summaries,
-            cache,
-            bounded_cache,
-        );
-        if after >= before {
+        let delta = baseline.memory_delta_bytes(summaries, cache, bounded_cache);
+        #[cfg(test)]
+        baseline.assert_matches_full_estimate(delta, full_before, summaries, cache, bounded_cache);
+        if delta.added_bytes >= delta.removed_bytes {
             add_included_memory_component_bytes(
                 true,
                 self.metadata_used_bytes,
                 self.shared_used_bytes,
-                after.saturating_sub(before),
+                delta.added_bytes.saturating_sub(delta.removed_bytes),
             );
         } else {
             sub_included_memory_component_bytes(
                 true,
                 self.metadata_used_bytes,
                 self.shared_used_bytes,
-                before.saturating_sub(after),
+                delta.removed_bytes.saturating_sub(delta.added_bytes),
             );
         }
         result
@@ -239,10 +245,12 @@ impl<'a> SeriesTimestampWriteContext<'a> {
         let mut summaries = self.series_visibility_summaries.write();
         let mut cache = self.series_visible_max_timestamps.write();
         let mut bounded_cache = self.series_visible_bounded_max_timestamps.write();
+        let ranges_touched: Vec<SeriesId> = summary_ranges.keys().copied().collect();
         let bounded_max = self.with_visibility_state_memory_delta(
             &mut summaries,
             &mut cache,
             &mut bounded_cache,
+            &ranges_touched,
             |summaries, cache, bounded_cache| {
                 for (series_id, timestamp) in visible_timestamps {
                     let summary = summaries.entry(series_id).or_default();

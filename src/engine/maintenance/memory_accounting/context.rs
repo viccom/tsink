@@ -9,10 +9,15 @@ use super::super::super::*;
 struct VisibilityMemoryMeasurementContext<'a> {
     materialized_series: MaterializedSeriesReadContext<'a>,
     visibility_cache: VisibilityCacheReadContext<'a>,
+    #[cfg(test)]
+    full_estimation_probes: &'a AtomicUsize,
 }
 
 impl<'a> VisibilityMemoryMeasurementContext<'a> {
     fn metadata_visibility_memory_usage_bytes(self) -> usize {
+        #[cfg(test)]
+        self.full_estimation_probes.fetch_add(1, Ordering::AcqRel);
+
         let materialized_series = self.materialized_series.materialized_series.read();
         let summaries = self.visibility_cache.series_visibility_summaries.read();
         let visible_cache = self.visibility_cache.series_visible_max_timestamps.read();
@@ -228,6 +233,8 @@ impl ChunkStorage {
             visibility: VisibilityMemoryMeasurementContext {
                 materialized_series: self.materialized_series_read_context(),
                 visibility_cache: self.visibility_cache_read_context(),
+                #[cfg(test)]
+                full_estimation_probes: &self.visibility_full_estimation_probes,
             },
             metadata_shards: self.metadata_shard_publication_context(),
             persisted_sealed: self.persisted_sealed_budget_context(),
