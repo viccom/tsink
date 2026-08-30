@@ -188,6 +188,9 @@ pub(super) struct WalObservabilityCounters {
     pub(super) append_errors_total: AtomicU64,
     pub(super) resets_total: AtomicU64,
     pub(super) reset_errors_total: AtomicU64,
+    pub(super) prefix_reclaims_total: AtomicU64,
+    pub(super) prefix_reclaimed_bytes_total: AtomicU64,
+    pub(super) prefix_reclaim_errors_total: AtomicU64,
 }
 
 pub(super) struct RetentionObservabilityCounters {

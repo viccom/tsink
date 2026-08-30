@@ -2114,3 +2114,130 @@ fn query_prefers_compacted_generation_when_generations_cover_same_window_with_di
 
     reopened.close().unwrap();
 }
+
+#[test]
+fn startup_replay_reclaims_wal_prefix_covered_by_persisted_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let wal_dir = data_path.join(WAL_DIR_NAME);
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let metric = "wal_replay_reclaim";
+    let labels = vec![Label::new("host", "a")];
+
+    // Legacy-engine model (T21b): WAL frames accumulated across several
+    // segments while the persisted state only covers a prefix of them.
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert(metric, &labels)
+        .unwrap()
+        .series_id;
+    let definition = SeriesDefinitionFrame {
+        series_id,
+        metric: metric.to_string(),
+        labels: labels.clone(),
+    };
+    let wal = FramedWal::open_with_options(&wal_dir, WalSyncMode::PerAppend, 128, 88).unwrap();
+    wal.append_series_definition(&definition).unwrap();
+    for frame_idx in 0..4i64 {
+        let batch = SamplesBatchFrame::from_points(
+            series_id,
+            ValueLane::Numeric,
+            &[
+                ChunkPoint {
+                    ts: frame_idx * 2 + 1,
+                    value: Value::F64((frame_idx * 2 + 1) as f64),
+                },
+                ChunkPoint {
+                    ts: frame_idx * 2 + 2,
+                    value: Value::F64((frame_idx * 2 + 2) as f64),
+                },
+            ],
+        )
+        .unwrap();
+        wal.append_samples(std::slice::from_ref(&batch)).unwrap();
+    }
+    let writes = wal.replay_committed_writes().unwrap();
+    assert_eq!(writes.len(), 4);
+    // The persisted state covers the definition plus the first three sample
+    // frames (ts 1..=6); the last frame (ts 7..=8) stays WAL-only.
+    let covered_highwater = writes[2].highwater;
+    drop(writes);
+    drop(wal);
+
+    let mut chunks_by_series = HashMap::new();
+    chunks_by_series.insert(
+        series_id,
+        vec![make_persisted_numeric_chunk(
+            series_id,
+            &[(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0), (5, 5.0), (6, 6.0)],
+        )],
+    );
+    SegmentWriter::new(&lane_path, 0, 1)
+        .unwrap()
+        .write_segment_with_wal_highwater(&registry, &chunks_by_series, covered_highwater)
+        .unwrap();
+
+    // A real flush publishes both lanes together; the replay floor is only
+    // non-zero when every enabled lane has persisted segments, so seed the
+    // blob lane with a covered segment as well.
+    let blob_lane_path = data_path.join(BLOB_LANE_ROOT);
+    let blob_labels = vec![Label::new("host", "blob")];
+    let blob_series_id = registry
+        .resolve_or_insert(metric, &blob_labels)
+        .unwrap()
+        .series_id;
+    let blob_points = vec![ChunkPoint {
+        ts: 1,
+        value: Value::from("covered".to_string()),
+    }];
+    let blob_encoded = Encoder::encode_chunk_points(&blob_points, ValueLane::Blob).unwrap();
+    let blob_chunk = Chunk {
+        header: ChunkHeader {
+            series_id: blob_series_id,
+            lane: ValueLane::Blob,
+            value_family: Some(SeriesValueFamily::Blob),
+            point_count: blob_points.len() as u16,
+            min_ts: 1,
+            max_ts: 1,
+            ts_codec: blob_encoded.ts_codec,
+            value_codec: blob_encoded.value_codec,
+        },
+        points: blob_points,
+        encoded_payload: blob_encoded.payload,
+        wal_highwater: WalHighWatermark::default(),
+    };
+    let mut blob_chunks_by_series = HashMap::new();
+    blob_chunks_by_series.insert(blob_series_id, vec![blob_chunk]);
+    SegmentWriter::new(&blob_lane_path, 0, 1)
+        .unwrap()
+        .write_segment_with_wal_highwater(&registry, &blob_chunks_by_series, covered_highwater)
+        .unwrap();
+
+    let before = wal_segment_ids_and_size(&wal_dir);
+    assert!(
+        before.len() >= 3,
+        "fixture must roll multiple WAL segments, got {before:?}"
+    );
+
+    // Simulate a kill -9 restart: bootstrap replays the uncovered WAL tail and
+    // must also reclaim the prefix that the persisted segments already cover.
+    let storage = StorageBuilder::new()
+        .with_data_path(data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .build()
+        .unwrap();
+
+    let after = wal_segment_ids_and_size(&wal_dir);
+    assert!(
+        after.first().map(|(id, _)| *id).unwrap_or(0)
+            > before.first().map(|(id, _)| *id).unwrap_or(0),
+        "startup replay must reclaim WAL prefix segments covered by persisted \
+         segments: before={before:?} after={after:?}"
+    );
+
+    let points = storage.select(metric, &labels, 0, 100).unwrap();
+    assert_eq!(points.len(), 8, "replay reclamation must not lose data");
+
+    storage.close().unwrap();
+}

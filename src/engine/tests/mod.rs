@@ -73,6 +73,31 @@ mod retention_policy;
 mod rollups;
 mod series_selection;
 
+/// Lists on-disk WAL segments as `(segment_id, size_bytes)`, sorted by id.
+///
+/// Mirrors the engine's `wal.log` / `wal-<16-hex>.log` naming so WAL
+/// checkpoint/reclaim tests can observe which prefix segments survive.
+pub(super) fn wal_segment_ids_and_size(wal_dir: &Path) -> Vec<(u64, u64)> {
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(wal_dir).unwrap() {
+        let entry = entry.unwrap();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy().into_owned();
+        let hex = file_name
+            .strip_prefix("wal-")
+            .and_then(|stem| stem.strip_suffix(".log"))
+            .filter(|hex| hex.len() == 16);
+        let segment_id = match hex {
+            Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+            None if file_name == "wal.log" => 0,
+            None => continue,
+        };
+        segments.push((segment_id, entry.metadata().unwrap().len()));
+    }
+    segments.sort_unstable();
+    segments
+}
+
 pub(crate) fn assert_engine_memory_usage_reconciled(storage: &ChunkStorage) {
     if !storage.memory.accounting_enabled {
         return;
