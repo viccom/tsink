@@ -8,7 +8,7 @@ use super::encoder::Encoder;
 use super::series::SeriesId;
 use super::series::SeriesValueFamily;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ValueLane {
     Numeric = 0,
@@ -52,7 +52,7 @@ pub struct ChunkPoint {
     pub value: Value,
 }
 
-const ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS: usize = 64;
+pub(crate) const ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS: usize = 64;
 
 #[derive(Debug)]
 pub struct Chunk {

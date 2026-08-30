@@ -160,6 +160,15 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             admission_pressure_relief_observed_total: counters
                 .admission_pressure_relief_observed_total
                 .load(Ordering::Relaxed),
+            admission_memory_rejections_total: counters
+                .admission_memory_rejections_total
+                .load(Ordering::Relaxed),
+            admission_memory_last_estimate_bytes: counters
+                .admission_memory_last_estimate_bytes
+                .load(Ordering::Relaxed),
+            admission_memory_last_shortfall_bytes: counters
+                .admission_memory_last_shortfall_bytes
+                .load(Ordering::Relaxed),
             active_flush_runs_total: counters.active_flush_runs_total.load(Ordering::Relaxed),
             active_flush_errors_total: counters.active_flush_errors_total.load(Ordering::Relaxed),
             active_flushed_series_total: counters

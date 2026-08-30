@@ -116,6 +116,28 @@ fn segment_publish_returns_error_and_rolls_back_when_parent_sync_fails() {
 }
 
 #[test]
+fn segment_writer_prepare_staging_dir_reports_blocked_parent_path() {
+    let tmp = TempDir::new().unwrap();
+    let level_dir = tmp.path().join("segments").join("L0");
+    fs::create_dir_all(level_dir.parent().unwrap()).unwrap();
+    fs::write(&level_dir, b"not-a-directory").unwrap();
+
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("write_segment must fail when staging parent is blocked");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&format!("{:?}", level_dir)),
+        "error must carry the blocked level directory path, got: {rendered}"
+    );
+    assert!(matches!(err, TsinkError::IoWithPath { .. }));
+}
+
+#[test]
 fn runtime_strict_load_rejects_invalid_segment_that_skip_policy_ignores() {
     let tmp = TempDir::new().unwrap();
     let (registry, chunks_by_series) = sample_segment_input();

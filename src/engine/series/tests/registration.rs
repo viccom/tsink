@@ -79,6 +79,97 @@ fn resolve_rows_returns_series_ids_for_batch_inserts() {
 }
 
 #[test]
+fn identity_cache_serves_repeat_resolves_without_dictionary_walks() {
+    let registry = SeriesRegistry::new();
+    let labels = [Label::new("host", "a"), Label::new("region", "use1")];
+    let created = registry.resolve_or_insert("cpu", &labels).unwrap();
+    assert!(created.created);
+
+    // First resolve populates the identity cache via one dictionary walk.
+    let first = registry.resolve_existing("cpu", &labels).unwrap();
+    assert_eq!(first.series_id, created.series_id);
+    let walks_after_cold = registry.resolve_existing_dictionary_walks();
+
+    // Repeat resolves — sorted and unsorted label order alike — must be
+    // served by the identity cache: no further dictionary walks, identical
+    // resolutions.
+    for _ in 0..3 {
+        let repeat = registry.resolve_existing("cpu", &labels).unwrap();
+        assert_eq!(repeat.series_id, created.series_id);
+        assert_eq!(repeat.metric_id, created.metric_id);
+        assert_eq!(repeat.label_pairs, created.label_pairs);
+        assert!(!repeat.created);
+    }
+    let flipped = [Label::new("region", "use1"), Label::new("host", "a")];
+    let repeat = registry.resolve_existing("cpu", &flipped).unwrap();
+    assert_eq!(repeat.series_id, created.series_id);
+
+    assert_eq!(
+        registry.resolve_existing_dictionary_walks(),
+        walks_after_cold,
+        "repeat resolves must not walk the dictionaries again"
+    );
+}
+
+#[test]
+fn identity_cache_never_serves_series_pruned_from_registry() {
+    let registry = SeriesRegistry::new();
+    let a = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap();
+    let b = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "b")])
+        .unwrap();
+
+    // Warm the identity cache for both series.
+    assert!(registry
+        .resolve_existing("cpu", &[Label::new("host", "a")])
+        .is_some());
+    assert!(registry
+        .resolve_existing("cpu", &[Label::new("host", "b")])
+        .is_some());
+
+    registry.retain_series_ids(&BTreeSet::from([a.series_id]));
+
+    assert!(registry
+        .resolve_existing("cpu", &[Label::new("host", "a")])
+        .is_some());
+    assert_eq!(
+        registry
+            .resolve_existing("cpu", &[Label::new("host", "b")])
+            .map(|resolution| resolution.series_id),
+        None,
+        "series pruned from the registry must not be served from the identity cache"
+    );
+    assert_eq!(registry.series_count(), 1);
+    assert_ne!(a.series_id, b.series_id);
+}
+
+#[test]
+fn identity_cache_does_not_surface_rolled_back_created_series() {
+    let registry = SeriesRegistry::new();
+    let labels = [Label::new("host", "rolled-back")];
+    let created = registry.resolve_or_insert("cpu", &labels).unwrap();
+    assert!(created.created);
+
+    // A neighboring commit warms the cache for an unrelated series; the
+    // rolled-back series must never be resolvable afterwards.
+    registry
+        .resolve_or_insert("cpu", &[Label::new("host", "kept")])
+        .unwrap();
+    assert!(registry
+        .resolve_existing("cpu", &[Label::new("host", "kept")])
+        .is_some());
+
+    registry.rollback_created_series(std::slice::from_ref(&created));
+
+    assert!(
+        registry.resolve_existing("cpu", &labels).is_none(),
+        "series created by a rolled-back batch must not surface via the identity cache"
+    );
+}
+
+#[test]
 fn resolve_existing_and_series_ids_for_metric_work() {
     let registry = SeriesRegistry::new();
     let labels_a = vec![Label::new("host", "a")];

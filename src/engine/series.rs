@@ -9,6 +9,7 @@ use crate::Label;
 
 mod dictionary;
 mod identity;
+mod identity_cache;
 mod persistence;
 mod postings;
 #[cfg(test)]
@@ -144,6 +145,14 @@ pub struct SeriesRegistry {
     metric_postings_shards: [RwLock<MetricPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
     label_postings_shards: [RwLock<LabelPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
     series_count: AtomicUsize,
+    /// Bounded cache from series identity to resolution for repeat resolves.
+    /// See `identity_cache` module docs for the correctness contract.
+    identity_cache: RwLock<identity_cache::SeriesIdentityCache>,
+    /// Test-only instrumentation: counts dictionary-walk resolve_existing
+    /// executions (i.e. every lookup that was not served by the identity
+    /// cache). Used by ingest-pipeline tests to pin batch/cross-batch dedup.
+    #[cfg(test)]
+    resolve_existing_dictionary_walks: AtomicUsize,
 }
 
 impl Default for SeriesRegistry {
@@ -174,6 +183,9 @@ impl SeriesRegistry {
                 RwLock::new(LabelPostingsShard::default())
             }),
             series_count: AtomicUsize::new(0),
+            identity_cache: RwLock::new(identity_cache::SeriesIdentityCache::default()),
+            #[cfg(test)]
+            resolve_existing_dictionary_walks: AtomicUsize::new(0),
         }
     }
 
@@ -266,6 +278,8 @@ impl SeriesRegistry {
     }
 
     fn recompute_memory_usage_bytes(&self) -> usize {
+        // The identity cache is intentionally excluded: it is bounded,
+        // advisory, and not series state (see identity_cache module docs).
         self.metric_dict
             .read()
             .memory_usage_bytes()

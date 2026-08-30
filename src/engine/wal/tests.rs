@@ -1817,3 +1817,18 @@ fn rollback_partial_append_clears_buffered_bytes_and_preserves_next_frame() {
     assert_eq!(first.series_id, 1);
     assert_eq!(second.series_id, 2);
 }
+
+#[test]
+fn collect_wal_segment_files_reports_missing_directory_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let missing_dir = temp_dir.path().join("wal-gone");
+
+    let err = collect_wal_segment_files(&missing_dir).expect_err("scan must fail");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&format!("{:?}", missing_dir)),
+        "error must carry the missing WAL directory path, got: {rendered}"
+    );
+    assert!(matches!(err, TsinkError::IoWithPath { .. }));
+}

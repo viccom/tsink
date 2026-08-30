@@ -33,6 +33,10 @@ impl ChunkStorage {
             0
         };
         let result = mutate(&mut persisted_index);
+        // Budget scope (2026-08-29 load-test follow-up): persisted index and
+        // mmap bytes are EXCLUDED from the budget criterion; they only feed
+        // their observability components and the `shared_used_bytes`
+        // aggregate surfaced as `excluded_bytes`.
         let account = |component: &std::sync::atomic::AtomicU64, before: usize, after: usize| {
             if !publication.accounting_enabled || before == after {
                 return;
@@ -43,13 +47,11 @@ impl ChunkStorage {
                 publication
                     .shared_used_bytes
                     .fetch_add(delta, Ordering::AcqRel);
-                publication.used_bytes.fetch_add(delta, Ordering::AcqRel);
             } else {
                 component.fetch_sub(delta, Ordering::AcqRel);
                 publication
                     .shared_used_bytes
                     .fetch_sub(delta, Ordering::AcqRel);
-                publication.used_bytes.fetch_sub(delta, Ordering::AcqRel);
             }
         };
         account(

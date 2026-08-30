@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,12 +84,12 @@ pub(in crate::engine::storage_engine) use core_impl::{
     current_unix_millis_u64, duration_to_timestamp_units, elapsed_nanos_u64, lane_for_value,
     partition_id_for_timestamp, persisted_chunk_payload, saturating_u64_from_usize,
     value_heap_bytes, CatalogContext, ChunkContext, LifecyclePublicationContext, MemoryDeltaBytes,
-    PersistedRefreshContext, WriteAdmissionControlContext, WriteApplyContext,
-    WriteApplyMemoryAccountingContext, WriteApplyPublicationContext, WriteApplyRegistryContext,
-    WriteApplyShardMutationContext, WriteApplyWalContext, WriteCommitContext,
-    WriteCommitStageContext, WriteCommitWalCompletionContext, WritePrepareContext,
-    WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext, WritePrepareWalContext,
-    WriteResolveContext, WriteSeriesValidationContext,
+    PersistedRefreshContext, VisibilityStateMemoryBaseline, WriteAdmissionControlContext,
+    WriteApplyContext, WriteApplyMemoryAccountingContext, WriteApplyPublicationContext,
+    WriteApplyRegistryContext, WriteApplyShardMutationContext, WriteApplyWalContext,
+    WriteCommitContext, WriteCommitStageContext, WriteCommitWalCompletionContext,
+    WritePrepareContext, WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext,
+    WritePrepareWalContext, WriteResolveContext, WriteSeriesValidationContext,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
@@ -189,7 +189,13 @@ struct PersistedStorageState {
     persisted_refresh_in_progress: AtomicBool,
 }
 
-/// Runtime configuration that is fixed for the life of one storage instance.
+/// Runtime configuration for one storage instance.
+///
+/// Most fields are fixed for the life of the instance. `cardinality_limit` is
+/// the exception: it is hot-adjustable through [`Storage::set_cardinality_limit`]
+/// and write paths snapshot the current value when building their per-batch
+/// context, so an update takes effect for subsequent new-series admission
+/// decisions without recreating the storage.
 struct RuntimeConfigState {
     timestamp_precision: TimestampPrecision,
     retention_window: i64,
@@ -200,7 +206,7 @@ struct RuntimeConfigState {
     max_active_partition_heads_per_series: usize,
     write_limiter: Semaphore,
     write_timeout: Duration,
-    cardinality_limit: usize,
+    cardinality_limit: AtomicUsize,
     wal_size_limit_bytes: u64,
     admission_poll_interval: Duration,
 }
@@ -236,6 +242,7 @@ struct BackgroundWorkerSupervisorState {
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread_wakeup_requested: AtomicBool,
+    flush_thread_pressure_relief_requested: AtomicBool,
     persisted_refresh_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     rollup_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     fail_fast_enabled: bool,
@@ -263,6 +270,19 @@ pub struct ChunkStorage {
     current_time_override: AtomicI64,
     #[cfg(test)]
     persist_test_hooks: PersistTestHooks,
+    /// Test-only instrumentation: counts three-probe lane validations
+    /// (active + sealed + persisted) executed by the ingest pipeline. Used
+    /// by ingest tests to pin per-batch (series, lane) dedup.
+    #[cfg(test)]
+    lane_validation_probes: AtomicUsize,
+    /// Test-only instrumentation: counts full O(cached-series) executions of
+    /// `series_visibility_state_memory_usage_bytes`. The mutation paths
+    /// (merge/replace/clear) must keep this at zero per batch — incremental
+    /// capacity baselines own the accounting — while the reconciliation face
+    /// (`refresh_memory_usage`) still runs the full recompute and must move
+    /// the probe.
+    #[cfg(test)]
+    visibility_full_estimation_probes: AtomicUsize,
 }
 
 struct MetadataShardIndex {
@@ -385,6 +405,16 @@ impl Storage for ChunkStorage {
 
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
         self.list_metrics_with_wal_api()
+    }
+
+    fn series_count(&self) -> u64 {
+        self.series_count_api()
+    }
+
+    fn set_cardinality_limit(&self, limit: usize) {
+        self.runtime
+            .cardinality_limit
+            .store(limit, Ordering::Release);
     }
 
     fn list_metrics_in_shards(

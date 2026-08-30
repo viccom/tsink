@@ -9,10 +9,15 @@ use super::super::super::*;
 struct VisibilityMemoryMeasurementContext<'a> {
     materialized_series: MaterializedSeriesReadContext<'a>,
     visibility_cache: VisibilityCacheReadContext<'a>,
+    #[cfg(test)]
+    full_estimation_probes: &'a AtomicUsize,
 }
 
 impl<'a> VisibilityMemoryMeasurementContext<'a> {
     fn metadata_visibility_memory_usage_bytes(self) -> usize {
+        #[cfg(test)]
+        self.full_estimation_probes.fetch_add(1, Ordering::AcqRel);
+
         let materialized_series = self.materialized_series.materialized_series.read();
         let summaries = self.visibility_cache.series_visibility_summaries.read();
         let visible_cache = self.visibility_cache.series_visible_max_timestamps.read();
@@ -184,12 +189,20 @@ impl<'a> MemoryAccountingContext<'a> {
         let persisted_mmap_used = self.lifecycle.measured_persisted_mmap_memory_usage_bytes();
         let tombstone_used = self.tombstones.tombstone_memory_usage_bytes();
 
+        // Budget scope (2026-08-29 load-test follow-up, aligned with
+        // docs/performance-tuning.md §2): the budget criterion `used_bytes`
+        // covers only evictable state — active partition heads plus sealed
+        // chunks pending flush. Registry, metadata, persisted-index, mmap and
+        // tombstone footprints are process-RSS facts: they stay tracked in
+        // their observability components and the `shared_used_bytes`
+        // aggregate (surfaced as `excluded_bytes`) but no longer raise the
+        // admission floor.
         let shared_used = registry_used
             .saturating_add(metadata_used)
             .saturating_add(persisted_index_used)
             .saturating_add(persisted_mmap_used)
             .saturating_add(tombstone_used);
-        let used = active_and_sealed_used.saturating_add(shared_used);
+        let used = active_and_sealed_used;
 
         Self::store_tracked_bytes(self.registry_used_bytes, registry_used);
         Self::store_tracked_bytes(self.metadata_used_bytes, metadata_used);
@@ -220,6 +233,8 @@ impl ChunkStorage {
             visibility: VisibilityMemoryMeasurementContext {
                 materialized_series: self.materialized_series_read_context(),
                 visibility_cache: self.visibility_cache_read_context(),
+                #[cfg(test)]
+                full_estimation_probes: &self.visibility_full_estimation_probes,
             },
             metadata_shards: self.metadata_shard_publication_context(),
             persisted_sealed: self.persisted_sealed_budget_context(),

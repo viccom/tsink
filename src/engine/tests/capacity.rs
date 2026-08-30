@@ -184,7 +184,186 @@ fn memory_budget_stats_reflect_builder_configuration() {
 
     assert_eq!(storage.memory_budget(), 1234);
     assert_eq!(storage.memory_used(), snapshot.memory.budgeted_bytes);
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
+    assert_eq!(
+        snapshot.memory.excluded_bytes,
+        snapshot
+            .memory
+            .registry_bytes
+            .saturating_add(snapshot.memory.metadata_cache_bytes)
+            .saturating_add(snapshot.memory.persisted_index_bytes)
+            .saturating_add(snapshot.memory.persisted_mmap_bytes)
+            .saturating_add(snapshot.memory.tombstone_bytes),
+        "excluded_bytes must always aggregate the non-budgeted components"
+    );
+}
+
+#[test]
+fn observability_memory_component_snapshot_is_readable_from_storage_trait_face() {
+    // 2026-08-29 load-test follow-up: two aggregate gauges (used/budget) could
+    // not attribute admission mis-rejections. Pin the per-component memory
+    // breakdown fields and their availability through the `dyn Storage` face
+    // (the rs-iot consumption shape), plus the budgeting scope where the
+    // criterion covers only active+sealed state and the other components are
+    // excluded from `budgeted_bytes` but aggregated in `excluded_bytes`.
+    let storage: Arc<dyn Storage> = StorageBuilder::new()
+        .with_wal_enabled(false)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    for i in 0..4 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "component_snapshot_metric",
+                vec![Label::new("host", format!("h{i}"))],
+                DataPoint::new(1, i as f64),
+            )])
+            .unwrap();
+    }
+
+    let memory = &storage.observability_snapshot().memory;
+    assert!(
+        memory.registry_bytes > 0,
+        "registered series must show up in the registry component"
+    );
+    assert!(
+        memory.active_and_sealed_bytes > 0,
+        "hot chunk state must show up in the active+sealed component"
+    );
+    assert_eq!(memory.budgeted_bytes, storage.memory_used());
+    assert_eq!(
+        memory.budgeted_bytes, memory.active_and_sealed_bytes,
+        "the budget criterion must cover only evictable active+sealed state"
+    );
+    assert_eq!(
+        memory.excluded_bytes,
+        memory
+            .registry_bytes
+            .saturating_add(memory.metadata_cache_bytes)
+            .saturating_add(memory.persisted_index_bytes)
+            .saturating_add(memory.persisted_mmap_bytes)
+            .saturating_add(memory.tombstone_bytes),
+        "excluded_bytes must aggregate the non-budgeted components"
+    );
+}
+
+#[test]
+fn used_bytes_criterion_covers_only_active_and_sealed_state() {
+    // Task 7 (2026-08-29 load-test follow-up): `memory_used`/`used_bytes` is the
+    // admission criterion, so it must track only what the budget can evict —
+    // active partition heads plus sealed chunks pending flush. Registry
+    // dictionaries, metadata caches, the persisted index and mmap-backed
+    // segments are process-RSS facts: they stay visible through the
+    // observability component fields instead of raising the budget criterion
+    // (the monotonically growing persisted-footprint floor that wedged
+    // admission after restart in the 100k-series load test).
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
+            .with_wal_enabled(false)
+            .with_current_time_override_for_tests(0)
+            .build()
+            .unwrap();
+        for series_idx in 0..64 {
+            storage
+                .insert_rows(&[Row::with_labels(
+                    "used_scope_metric",
+                    vec![
+                        Label::new("host", format!("host-{series_idx}")),
+                        Label::new("rack", format!("rack-{}", series_idx % 8)),
+                    ],
+                    DataPoint::new(1, series_idx as f64),
+                )])
+                .unwrap();
+        }
+        let live_snapshot = storage.observability_snapshot();
+        assert!(
+            live_snapshot.memory.registry_bytes > 0,
+            "registered series must show up in the registry component"
+        );
+        assert!(
+            live_snapshot.memory.active_and_sealed_bytes > 0,
+            "sealed chunks pending flush must show up in the active+sealed component"
+        );
+        assert_eq!(
+            live_snapshot.memory.budgeted_bytes, live_snapshot.memory.active_and_sealed_bytes,
+            "while writing, the budget criterion must cover only evictable active+sealed state"
+        );
+        storage.close().unwrap();
+    }
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .with_memory_limit(1_000_000)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    let snapshot = reopened.observability_snapshot();
+    assert!(
+        snapshot.memory.registry_bytes > 0,
+        "reopened storage should account for persisted registry state"
+    );
+    assert!(
+        snapshot.memory.persisted_index_bytes > 0,
+        "reopened storage should account for persisted chunk refs and timestamp indexes"
+    );
+    assert!(
+        snapshot.memory.persisted_mmap_bytes > 0,
+        "reopened storage should account for mmap-backed segment state"
+    );
+    assert_eq!(
+        reopened.memory_used(),
+        0,
+        "reopening loads registry/index/mmap but no in-memory chunks: the persisted footprint must not raise the budget criterion"
+    );
+    assert_eq!(
+        snapshot.memory.budgeted_bytes, snapshot.memory.active_and_sealed_bytes,
+        "the budget criterion must stay scoped to active+sealed after restart"
+    );
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn registry_heavy_admission_rejection_exports_estimate_and_shortfall() {
+    // Registry-heavy new-series rejections take the resolve-path admission
+    // check; they must feed the same exported estimate/shortfall snapshot as
+    // batch-estimate rejections so scrapers cannot tell the paths apart.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 2_048);
+
+    let large_label_value = "x".repeat(4_096);
+    let rows = vec![Row::with_labels(
+        "registry_admission_gap_metric",
+        vec![Label::new("host", large_label_value)],
+        DataPoint::new(1, 1.0),
+    )];
+    let estimated_registry_growth = registry_growth_estimate_for_rows(&storage, &rows);
+    assert!(
+        estimated_registry_growth > 2_048,
+        "4KiB label value must overflow the 2KiB budget by registry growth alone"
+    );
+
+    let err = storage.insert_rows(&rows).unwrap_err();
+    let TsinkError::MemoryBudgetExceeded { budget, required } = err else {
+        panic!("expected registry-heavy memory budget rejection, got {err:?}");
+    };
+    assert_eq!(budget, 2_048);
+
+    let dyn_storage: &dyn Storage = &storage;
+    let snapshot = dyn_storage.observability_snapshot();
+    assert_eq!(snapshot.flush.admission_memory_rejections_total, 1);
+    assert_eq!(
+        snapshot.flush.admission_memory_last_estimate_bytes as usize,
+        estimated_registry_growth
+    );
+    assert_eq!(
+        snapshot.flush.admission_memory_last_shortfall_bytes as usize,
+        required - budget
+    );
 }
 
 #[test]
@@ -419,10 +598,16 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
     );
     assert!(
         snapshot.memory.persisted_mmap_bytes > 0,
-        "reopened storage should budget persisted mmap-backed segment state"
+        "reopened storage should account for persisted mmap-backed segment state"
     );
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
-    assert_eq!(snapshot.memory.excluded_persisted_mmap_bytes, 0);
+    assert!(
+        snapshot.memory.excluded_bytes > 0,
+        "reopened persisted registry/index/mmap state must surface in the excluded aggregate"
+    );
+    assert_eq!(
+        snapshot.memory.excluded_persisted_mmap_bytes, snapshot.memory.persisted_mmap_bytes,
+        "all persisted mmap bytes are excluded from the budget criterion"
+    );
 
     let tightened_budget = 1;
     reopened.close().unwrap();
@@ -434,9 +619,17 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
         .with_current_time_override_for_tests(0)
         .build()
         .unwrap();
+    let over_snapshot = over_budget.observability_snapshot();
     assert!(
-        over_budget.memory_used() > over_budget.memory_budget(),
-        "restart reconciliation should expose the full persisted footprint even under a tiny budget"
+        over_snapshot.memory.registry_bytes > 0
+            && over_snapshot.memory.persisted_index_bytes > 0
+            && over_snapshot.memory.persisted_mmap_bytes > 0,
+        "restart reconciliation should expose the full persisted footprint through excluded components even under a tiny budget"
+    );
+    assert_eq!(
+        over_budget.memory_used(),
+        over_snapshot.memory.active_and_sealed_bytes,
+        "the persisted footprint must not raise the budget criterion after restart"
     );
     over_budget.close().unwrap();
 }
@@ -483,7 +676,12 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
     let baseline_snapshot = baseline.observability_snapshot();
     assert!(
         baseline_snapshot.memory.persisted_mmap_bytes > 0,
-        "reopened storage should include persisted mmap bytes in the budgeted footprint"
+        "reopened storage should surface persisted mmap bytes in the excluded footprint"
+    );
+    assert_eq!(
+        baseline_snapshot.memory.excluded_persisted_mmap_bytes,
+        baseline_snapshot.memory.persisted_mmap_bytes,
+        "persisted mmap bytes are excluded from the budget criterion"
     );
     let tightened_budget = baseline.memory_used().saturating_sub(1).max(1);
     baseline.close().unwrap();
@@ -496,10 +694,16 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
         .with_current_time_override_for_tests(0)
         .build()
         .unwrap();
+    let reopened_snapshot = reopened.observability_snapshot();
 
     assert!(
-        reopened.memory_used() > reopened.memory_budget(),
-        "persisted mmap bytes should keep the reopened storage over its tightened budget"
+        reopened_snapshot.memory.persisted_mmap_bytes > 0,
+        "persisted mmap bytes should stay visible after reopening under a tightened budget"
+    );
+    assert_eq!(
+        reopened.memory_used(),
+        reopened_snapshot.memory.active_and_sealed_bytes,
+        "persisted mmap bytes must not raise the budget criterion after restart"
     );
     assert_eq!(
         reopened
@@ -585,14 +789,20 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
     let snapshot = storage.observability_snapshot();
     assert!(
         snapshot.memory.persisted_index_bytes > 0,
-        "runtime persisted refresh should update budgeted persisted-index bytes"
+        "runtime persisted refresh should update the persisted-index component"
     );
     assert!(
         snapshot.memory.persisted_mmap_bytes > 0,
-        "runtime persisted refresh should budget mmap-backed bytes"
+        "runtime persisted refresh should account for mmap-backed bytes"
     );
-    assert_eq!(snapshot.memory.excluded_bytes, 0);
-    assert_eq!(snapshot.memory.excluded_persisted_mmap_bytes, 0);
+    assert!(
+        snapshot.memory.excluded_bytes > 0,
+        "runtime adopted persisted state must surface in the excluded aggregate"
+    );
+    assert_eq!(
+        snapshot.memory.excluded_persisted_mmap_bytes, snapshot.memory.persisted_mmap_bytes,
+        "runtime adopted mmap bytes are excluded from the budget criterion"
+    );
 
     let tightened_budget = storage.memory_used().saturating_sub(1).max(1);
     storage.memory.budget_bytes.store(
@@ -601,9 +811,16 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
     );
     storage.enforce_memory_budget_if_needed().unwrap();
     assert_engine_memory_usage_reconciled(&storage);
+    let post_tighten_snapshot = storage.observability_snapshot();
     assert!(
-        storage.memory_used() > storage.memory_budget(),
+        post_tighten_snapshot.memory.persisted_index_bytes > 0
+            && post_tighten_snapshot.memory.persisted_mmap_bytes > 0,
         "persisted-index accounting should remain visible after runtime segment adoption"
+    );
+    assert_eq!(
+        storage.memory_used(),
+        post_tighten_snapshot.memory.active_and_sealed_bytes,
+        "runtime adopted persisted state must not raise the budget criterion"
     );
 
     storage.close().unwrap();
@@ -644,6 +861,145 @@ fn delete_series_tombstone_accounting_reconciles_with_full_refresh() {
         storage.observability_snapshot().memory.tombstone_bytes > 0,
         "delete should budget the persisted tombstone footprint",
     );
+    assert_engine_memory_usage_reconciled(&storage);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn visibility_state_batch_writes_perform_no_full_memory_estimation() {
+    // Task 13 (2026-08-29 load-test follow-up): the three global visibility
+    // caches used to be fully re-measured (an O(cached-series) scan over
+    // every summary's ranges Vec) before AND after each per-shard cache
+    // merge on the write path — roughly 390 entry accesses per row at 100k
+    // series, executed under the recency mutex and all three cache write
+    // locks. Steady-state batch writes must keep the full-estimation probe
+    // at exactly zero; the full recompute stays reserved for the
+    // reconciliation face (`refresh_memory_usage`).
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 1_000_000);
+    let labels = vec![Label::new("host", "a")];
+
+    // First batch creates the series; the probe baseline starts after
+    // creation so series-creation work cannot mask the steady-state check.
+    storage
+        .insert_rows(&[Row::with_labels(
+            "visibility_probe_metric",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    let before = storage.visibility_full_estimation_probes();
+    storage
+        .insert_rows(&[Row::with_labels(
+            "visibility_probe_metric",
+            labels.clone(),
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+    assert_eq!(
+        storage.visibility_full_estimation_probes() - before,
+        0,
+        "steady-state batch writes must not fully re-measure the visibility caches",
+    );
+
+    // Instrumentation liveness: the reconciliation face still runs the full
+    // recompute, so the probe must advance once it executes.
+    assert_engine_memory_usage_reconciled(&storage);
+    assert!(
+        storage.visibility_full_estimation_probes() > before,
+        "the probe must count the full estimation performed by the reconciliation face",
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn visibility_state_incremental_accounting_matches_full_recompute_across_lifecycle() {
+    // Task 13 safety net: incremental visibility-state memory accounting
+    // (capacity baselines captured at the three cache mutation sites) must
+    // stay byte-identical to the full recompute across series creation,
+    // ranges-Vec growth/normalization/truncation, summary rebuilds, and
+    // deletes. Any drift here poisons the admission criterion silently.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 4_000_000);
+    let metric = "visibility_parity_metric";
+    let labels = |host: &str| vec![Label::new("host", host)];
+
+    // Stage A — create three series (summary/timestamp map inserts and the
+    // first HashMap capacity growth).
+    for host in ["a", "b", "c"] {
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels(host),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+    }
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage B — 40 disjoint ranges on series "a" across several batches:
+    // ranges-Vec growth, normalization Vec replacement, and the
+    // >SERIES_VISIBILITY_SUMMARY_MAX_RANGES truncation/drain path.
+    for batch in 0..4u32 {
+        let rows: Vec<Row> = (0..10u32)
+            .map(|i| {
+                let step = batch * 10 + i;
+                Row::with_labels(
+                    metric,
+                    labels("a"),
+                    DataPoint::new(2 + step as i64 * 2, step as f64),
+                )
+            })
+            .collect();
+        storage.insert_rows(&rows).unwrap();
+        assert_engine_memory_usage_reconciled(&storage);
+    }
+
+    // Stage C — a contiguous run collapses into a single merged range
+    // (normalize replaces the Vec with a differently sized allocation).
+    let rows: Vec<Row> = (0..12i64)
+        .map(|i| Row::with_labels(metric, labels("a"), DataPoint::new(100 + i, i as f64)))
+        .collect();
+    storage.insert_rows(&rows).unwrap();
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage D — summary rebuild (replace path) for all live series.
+    storage
+        .refresh_series_visible_timestamp_cache(
+            storage
+                .visibility
+                .materialized_series
+                .read()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage E — delete (clear path removes cache entries and their ranges).
+    let deleted = storage
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric(metric)
+                .with_matcher(SeriesMatcher::equal("host", "a")),
+        )
+        .unwrap();
+    assert_eq!(deleted.matched_series, 1);
+    assert_engine_memory_usage_reconciled(&storage);
+
+    // Stage F — writes after deletion re-grow cache entries on top of the
+    // cleared maps.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels("b"),
+            DataPoint::new(500, 5.0),
+        )])
+        .unwrap();
     assert_engine_memory_usage_reconciled(&storage);
 
     storage.close().unwrap();
@@ -694,6 +1050,99 @@ fn cardinality_limit_rejects_new_series_beyond_limit() {
         .select("cardinality_guard_metric", &labels_b, 0, 10)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn cardinality_limit_hot_update_takes_effect_for_subsequent_batches() {
+    let storage = StorageBuilder::new()
+        .with_cardinality_limit(2)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    let write = |series: &str, timestamp: i64, value: f64| {
+        storage.insert_rows(&[Row::with_labels(
+            "cardinality_hot_update_metric",
+            vec![Label::new("series", series)],
+            DataPoint::new(timestamp, value),
+        )])
+    };
+
+    write("a", 1, 1.0).unwrap();
+    write("b", 1, 1.0).unwrap();
+
+    // Third series is rejected while the initial limit of 2 is in effect.
+    let err = write("c", 1, 1.0).unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::CardinalityLimitExceeded { limit: 2, .. }
+    ));
+
+    // Raising the limit at runtime admits new series up to the new bound.
+    storage.set_cardinality_limit(10);
+    for idx in 0..8u32 {
+        write(&format!("hot_{idx}"), 1, f64::from(idx)).unwrap();
+    }
+    assert_eq!(storage.series_count(), 10);
+
+    // Shrinking never deletes existing series but blocks new ones at the
+    // lowered bound; existing series keep accepting writes.
+    storage.set_cardinality_limit(2);
+    let err = write("d", 1, 1.0).unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::CardinalityLimitExceeded { limit: 2, .. }
+    ));
+    write("a", 2, 2.0).unwrap();
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn cardinality_limit_hot_update_is_safe_under_concurrent_writes() {
+    use std::thread;
+
+    let storage = StorageBuilder::new()
+        .with_cardinality_limit(16)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+
+    let writer_storage = Arc::clone(&storage);
+    let writer = thread::spawn(move || {
+        for idx in 0..64u32 {
+            let row = Row::with_labels(
+                "cardinality_hot_concurrent_metric",
+                vec![Label::new("series", format!("s{idx}"))],
+                DataPoint::new(1, f64::from(idx)),
+            );
+            // A batch either observes the raised limit (admitted) or still
+            // snapshots the smaller limit (CardinalityLimitExceeded). Any
+            // other error under a concurrent hot update is a bug.
+            if let Err(err) = writer_storage.insert_rows(&[row]) {
+                assert!(
+                    matches!(err, TsinkError::CardinalityLimitExceeded { .. }),
+                    "unexpected error: {err:?}"
+                );
+            }
+        }
+    });
+
+    storage.set_cardinality_limit(64);
+    writer.join().unwrap();
+
+    // Once the update is published every series up to the new limit is
+    // admissible: rewriting all 64 succeeds and registers exactly 64 series.
+    for idx in 0..64u32 {
+        let row = Row::with_labels(
+            "cardinality_hot_concurrent_metric",
+            vec![Label::new("series", format!("s{idx}"))],
+            DataPoint::new(2, f64::from(idx)),
+        );
+        storage.insert_rows(&[row]).unwrap();
+    }
+    assert_eq!(storage.series_count(), 64);
+
+    storage.close().unwrap();
 }
 
 #[test]

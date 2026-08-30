@@ -4,6 +4,7 @@ mod context;
 use roaring::RoaringTreemap;
 
 use super::super::MemoryDeltaBytes;
+use super::super::VisibilityStateMemoryBaseline;
 use super::super::*;
 
 impl ChunkStorage {
@@ -15,6 +16,12 @@ impl ChunkStorage {
         self.memory_accounting_context().used_value()
     }
 
+    // Budget-scope note (2026-08-29 load-test follow-up): these component
+    // helpers track memory categories that are EXCLUDED from the budget
+    // criterion (`used_bytes` covers only evictable active heads plus sealed
+    // chunks pending flush). They maintain the per-component observability
+    // counters and the `shared_used_bytes` aggregate (surfaced as
+    // `excluded_bytes`), but never touch the budget criterion itself.
     pub(in super::super) fn add_included_memory_component_bytes(
         &self,
         component: &AtomicU64,
@@ -28,9 +35,6 @@ impl ChunkStorage {
         component.fetch_add(increment, Ordering::AcqRel);
         self.memory
             .shared_used_bytes
-            .fetch_add(increment, Ordering::AcqRel);
-        self.memory
-            .used_bytes
             .fetch_add(increment, Ordering::AcqRel);
     }
 
@@ -47,9 +51,6 @@ impl ChunkStorage {
         component.fetch_sub(decrement, Ordering::AcqRel);
         self.memory
             .shared_used_bytes
-            .fetch_sub(decrement, Ordering::AcqRel);
-        self.memory
-            .used_bytes
             .fetch_sub(decrement, Ordering::AcqRel);
     }
 
@@ -114,6 +115,7 @@ impl ChunkStorage {
         summaries: &mut HashMap<SeriesId, SeriesVisibilitySummary>,
         cache: &mut HashMap<SeriesId, Option<i64>>,
         bounded_cache: &mut HashMap<SeriesId, Option<i64>>,
+        ranges_touched: &[SeriesId],
         mutate: impl FnOnce(
             &mut HashMap<SeriesId, SeriesVisibilitySummary>,
             &mut HashMap<SeriesId, Option<i64>>,
@@ -124,16 +126,20 @@ impl ChunkStorage {
             return mutate(summaries, cache, bounded_cache);
         }
 
-        let before =
+        // Incremental accounting (plan Task 13): O(touched) capacity
+        // baseline instead of full before/after re-measurement of every
+        // cached series. See `VisibilityStateMemoryBaseline` for why the
+        // reduction is exact.
+        let baseline =
+            VisibilityStateMemoryBaseline::capture(ranges_touched, summaries, cache, bounded_cache);
+        #[cfg(test)]
+        let full_before =
             Self::series_visibility_state_memory_usage_bytes(summaries, cache, bounded_cache);
         let result = mutate(summaries, cache, bounded_cache);
-        let after =
-            Self::series_visibility_state_memory_usage_bytes(summaries, cache, bounded_cache);
-        self.account_included_memory_component_delta_bytes(
-            &self.memory.metadata_used_bytes,
-            before,
-            after,
-        );
+        let delta = baseline.memory_delta_bytes(summaries, cache, bounded_cache);
+        #[cfg(test)]
+        baseline.assert_matches_full_estimate(delta, full_before, summaries, cache, bounded_cache);
+        self.account_included_memory_component_delta(&self.memory.metadata_used_bytes, delta);
         result
     }
 
@@ -202,7 +208,9 @@ impl ChunkStorage {
 
         crate::MemoryObservabilitySnapshot {
             budgeted_bytes: memory_accounting.used_value(),
-            excluded_bytes: 0,
+            excluded_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.shared_used_bytes,
+            ),
             active_and_sealed_bytes: memory_accounting.active_and_sealed_used_value(),
             registry_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.registry_used_bytes,
@@ -219,7 +227,9 @@ impl ChunkStorage {
             tombstone_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.tombstone_used_bytes,
             ),
-            excluded_persisted_mmap_bytes: 0,
+            excluded_persisted_mmap_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.persisted_mmap_used_bytes,
+            ),
         }
     }
 

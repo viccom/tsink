@@ -261,6 +261,9 @@ impl SeriesRegistry {
 
     pub fn resolve_or_insert(&self, metric: &str, labels: &[Label]) -> Result<SeriesResolution> {
         validate_metric(metric)?;
+        if let Some(cached) = self.identity_cache.read().resolve(metric, labels) {
+            return Ok(cached);
+        }
         let normalized_labels = canonicalize_labels(labels)?;
 
         let metric_id = self.intern_metric_id(metric)?;
@@ -273,12 +276,19 @@ impl SeriesRegistry {
         let mut shard = self.series_shards[shard_idx].write();
 
         if let Some(existing) = shard.by_key.get(&key) {
-            return Ok(SeriesResolution {
+            let resolution = SeriesResolution {
                 series_id: *existing,
                 metric_id,
-                label_pairs,
+                label_pairs: label_pairs.clone(),
                 created: false,
-            });
+            };
+            // Keep the identity-cache lock leaf-most: record after dropping
+            // the shard write lock. Only pre-existing series are recorded.
+            drop(shard);
+            self.identity_cache
+                .write()
+                .record(metric, &normalized_labels, &resolution);
+            return Ok(resolution);
         }
 
         let series_id = self.alloc_series_id()?;
@@ -312,8 +322,22 @@ impl SeriesRegistry {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_existing_dictionary_walks(&self) -> usize {
+        self.resolve_existing_dictionary_walks
+            .load(Ordering::Acquire)
+    }
+
     pub fn resolve_existing(&self, metric: &str, labels: &[Label]) -> Option<SeriesResolution> {
         validate_metric(metric).ok()?;
+        if let Some(cached) = self.identity_cache.read().resolve(metric, labels) {
+            return Some(cached);
+        }
+
+        #[cfg(test)]
+        self.resolve_existing_dictionary_walks
+            .fetch_add(1, Ordering::AcqRel);
+
         let metric_id = self.metric_dict.read().get_id(metric)?;
         let normalized_labels = canonicalize_labels(labels).ok()?;
         let label_pairs = self.lookup_label_pairs(&normalized_labels)?;
@@ -323,12 +347,16 @@ impl SeriesRegistry {
         };
         let shard_idx = Self::key_shard_idx_for_key(&key);
         let series_id = *self.series_shards[shard_idx].read().by_key.get(&key)?;
-        Some(SeriesResolution {
+        let resolution = SeriesResolution {
             series_id,
             metric_id,
             label_pairs,
             created: false,
-        })
+        };
+        self.identity_cache
+            .write()
+            .record(metric, &normalized_labels, &resolution);
+        Some(resolution)
     }
 
     pub fn resolve_rows(&self, rows: &[Row]) -> Result<Vec<SeriesResolution>> {
@@ -386,6 +414,13 @@ impl SeriesRegistry {
         if created.is_empty() {
             return;
         }
+
+        // A resolve_existing that ran without this batch's txn-shard locks
+        // may have cached one of the series being removed; evict those ids
+        // so the identity cache never serves them again.
+        self.identity_cache
+            .write()
+            .remove_series_ids(&created.iter().map(|r| r.series_id).collect::<Vec<_>>());
 
         let mut removed_any = false;
         for resolution in created {
@@ -552,6 +587,9 @@ impl SeriesRegistry {
     }
 
     pub fn retain_series_ids(&self, keep: &BTreeSet<SeriesId>) {
+        // Pruned series must never surface again through the identity cache.
+        self.identity_cache.write().clear();
+
         let mut retained_max = 0u64;
         let mut retained_count = 0usize;
         for shard in &self.series_shards {

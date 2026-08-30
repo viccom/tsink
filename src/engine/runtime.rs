@@ -10,10 +10,15 @@ mod supervision;
 
 use self::supervision::BackgroundThreadKind;
 
+/// Flush pipeline aggressiveness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlushPipelinePolicy {
     Foreground,
+    /// Explicit background wakeups that must not fragment the live head (e.g.
+    /// the post-commit flush poke from `insert_rows`).
     BackgroundEligibleOnly,
+    /// Deadline-driven or admission pressure-relief flushes; may also seal the
+    /// current head so its memory becomes evictable for budget enforcement.
     BackgroundBounded,
 }
 
@@ -127,9 +132,20 @@ impl FlushWorkerSchedule {
         }
     }
 
-    fn next_policy(&mut self, now: Instant, explicit_wakeup: bool) -> Option<FlushPipelinePolicy> {
+    fn next_policy(
+        &mut self,
+        now: Instant,
+        pressure_relief: bool,
+        explicit_wakeup: bool,
+    ) -> Option<FlushPipelinePolicy> {
         if now >= self.next_bounded_flush_at {
             self.next_bounded_flush_at = now + self.interval;
+            Some(FlushPipelinePolicy::BackgroundBounded)
+        } else if pressure_relief {
+            // Admission pressure relief must run bounded: an eligible-only pass
+            // never seals the current head, which is the only memory a writer
+            // idling on a single live head can get back. Relief does not defer
+            // the periodic bounded deadline.
             Some(FlushPipelinePolicy::BackgroundBounded)
         } else if explicit_wakeup {
             Some(FlushPipelinePolicy::BackgroundEligibleOnly)
@@ -310,8 +326,11 @@ impl ChunkStorage {
                         break;
                     };
 
+                    let pressure_relief = storage.background.take_flush_pressure_relief_request();
                     let explicit_wakeup = storage.background.take_flush_wakeup_request();
-                    let Some(policy) = schedule.next_policy(Instant::now(), explicit_wakeup) else {
+                    let Some(policy) =
+                        schedule.next_policy(Instant::now(), pressure_relief, explicit_wakeup)
+                    else {
                         continue;
                     };
 
@@ -455,7 +474,10 @@ impl ChunkStorage {
         tracing::error!(
             worker = worker,
             fail_fast_enabled,
-            error = %error,
+            // Debug rendering carries the full error chain (e.g. an
+            // IoWithPath variant embeds the io::Error source with its OS
+            // code), unlike Display which only shows the top-level message.
+            error = ?error,
             "Background worker execution failed"
         );
     }
@@ -593,19 +615,32 @@ mod tests {
 
         schedule.next_bounded_flush_at = now + interval;
         assert_eq!(
-            schedule.next_policy(now, true),
+            schedule.next_policy(now, false, true),
             Some(FlushPipelinePolicy::BackgroundEligibleOnly)
+        );
+        assert_eq!(schedule.next_bounded_flush_at, now + interval);
+
+        // Admission pressure relief runs bounded even before the periodic
+        // deadline, without deferring that deadline, and outranks a plain
+        // explicit wakeup.
+        assert_eq!(
+            schedule.next_policy(now, true, false),
+            Some(FlushPipelinePolicy::BackgroundBounded)
+        );
+        assert_eq!(
+            schedule.next_policy(now, true, true),
+            Some(FlushPipelinePolicy::BackgroundBounded)
         );
         assert_eq!(schedule.next_bounded_flush_at, now + interval);
 
         let bounded_at = now + interval;
         assert_eq!(
-            schedule.next_policy(bounded_at, false),
+            schedule.next_policy(bounded_at, false, false),
             Some(FlushPipelinePolicy::BackgroundBounded)
         );
         assert_eq!(schedule.next_bounded_flush_at, bounded_at + interval);
 
         let before_deadline = bounded_at + Duration::from_millis(1);
-        assert_eq!(schedule.next_policy(before_deadline, false), None);
+        assert_eq!(schedule.next_policy(before_deadline, false, false), None);
     }
 }

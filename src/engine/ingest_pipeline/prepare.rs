@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+use crate::engine::chunk::ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS;
 
 use super::super::super::{
     partition_id_for_timestamp, state, value_heap_bytes, ActiveSeriesState, ChunkPoint, FramedWal,
@@ -297,7 +299,11 @@ impl<'a> WriteAdmissionControlContext<'a> {
 
         self.observability
             .record_admission_pressure_relief_request();
-        self.workers.notify_flush_thread();
+        // Relief must be able to release the current head's memory: with all
+        // buffered data in the live head (the steady-state shape), an
+        // eligible-only wakeup seals nothing and the writer idles until
+        // write_timeout with nothing reclaimable.
+        self.workers.notify_flush_thread_pressure_relief();
         self.workers.notify_persisted_refresh_thread();
         true
     }
@@ -340,6 +346,11 @@ impl<'a> WriteAdmissionControlContext<'a> {
                     memory_budget.shortfall(estimated_memory_growth_bytes)
                 {
                     if Instant::now() >= deadline {
+                        self.observability.record_admission_memory_rejection(
+                            estimated_memory_growth_bytes,
+                            post_budget,
+                            post_required,
+                        );
                         return Err(TsinkError::MemoryBudgetExceeded {
                             budget: post_budget,
                             required: post_required,
@@ -447,7 +458,19 @@ impl<'a> WritePreparer<'a> {
         &self,
         resolved: ResolvedWrite,
     ) -> std::result::Result<PreparedWrite, PrepareResolvedWriteError> {
+        // Lane validation probes three lock-guarded indexes (active, sealed,
+        // persisted) per invocation, and batches repeat series constantly, so
+        // probe once per distinct (series, lane) pair. Dedup granularity is
+        // the pair, not the series: same-series points on different lanes
+        // must each be checked against the series' lane state. First-seen
+        // order keeps the first failing pair — and thus the error — identical
+        // to the previous per-point scan.
+        let mut lane_validated_pairs =
+            HashSet::<(SeriesId, ValueLane)>::with_capacity(resolved.pending_points.len());
         for point in &resolved.pending_points {
+            if !lane_validated_pairs.insert((point.series_id, point.lane)) {
+                continue;
+            }
             if let Err(err) = WriteApplier::validate_series_lane_compatible(
                 self.engine.series_validation,
                 point.series_id,
@@ -551,11 +574,13 @@ impl<'a> WritePreparer<'a> {
             acc.saturating_add(value_heap_bytes(&point.value))
         });
 
+        // Bill each new partition head at its real first snapshot block (64 points,
+        // matching ChunkBuilder's block growth), not the full chunk capacity;
+        // growth beyond the estimate is backstopped by post-commit incremental
+        // accounting plus the post-commit budget enforcement pass in ingest_pipeline.
         let per_new_partition_head = std::mem::size_of::<state::ActivePartitionHead>()
             .saturating_add(
-                self.engine
-                    .config
-                    .chunk_point_cap
+                ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS
                     .saturating_mul(std::mem::size_of::<ChunkPoint>()),
             );
         let mut new_active_series = 0usize;
@@ -594,5 +619,181 @@ impl<'a> WritePreparer<'a> {
             .saturating_add(partition_head_bytes)
             .saturating_add(value_family_bytes)
             .saturating_add(metadata_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::resolve::WriteResolver;
+    use super::*;
+    use crate::engine::storage_engine::ChunkStorage;
+    use crate::storage::Storage;
+    use crate::{DataPoint, Label, Row, Value};
+
+    #[test]
+    fn batch_lane_validation_probes_once_per_distinct_series_lane_pair() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_lane_dedup_metric";
+        let labels = vec![Label::new("host", "a")];
+
+        // First batch commits the series so the next batch validates against
+        // real lane state.
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let before = storage.lane_validation_probes();
+
+        // Same series repeated within one batch: every point shares one
+        // (series, lane) pair, so the three lock-guarded probes (active,
+        // sealed, persisted) must run exactly once for the batch.
+        let rows: Vec<Row> = (0..8)
+            .map(|i| Row::with_labels(metric, labels.clone(), DataPoint::new(2 + i, i as f64)))
+            .collect();
+        storage.insert_rows(&rows).unwrap();
+
+        assert_eq!(
+            storage.lane_validation_probes() - before,
+            1,
+            "one distinct (series, lane) pair in the batch must trigger exactly one three-probe lane validation"
+        );
+    }
+
+    #[test]
+    fn mixed_lane_batch_against_existing_series_is_rejected_in_both_orders() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_lane_mixed_existing";
+        let labels = vec![Label::new("host", "a")];
+
+        // Commit the series on the numeric lane first.
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        // Conflicting blob lane first: rejected before anything lands.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(2, Value::Bytes(vec![2])),
+                ),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(3, 3.0)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+
+        // Conflicting blob lane last: the batch must still be rejected
+        // wholesale; dedup must not skip probing the later conflicting point.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(4, 4.0)),
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new(5, Value::Bytes(vec![5])),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+    }
+
+    #[test]
+    fn mixed_family_batch_against_existing_series_is_rejected_in_both_orders() {
+        // int/float share the numeric lane, so this pins the family-validation
+        // rejection path (which per-batch lane dedup must not weaken): any
+        // single off-family point rejects the whole batch.
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_family_mixed_existing";
+        let labels = vec![Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        // Off-family int first.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(2, 2_i64)),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(3, 3.0)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        // Off-family int last.
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), DataPoint::new(4, 4.0)),
+                Row::with_labels(metric, labels.clone(), DataPoint::new(5, 5_i64)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        let points = storage.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
+    }
+
+    #[test]
+    fn per_new_partition_head_estimate_charges_first_snapshot_block_not_full_chunk() {
+        // ChunkBuilder grows active heads in 64-point snapshot blocks
+        // (ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS), so admission must bill each new
+        // head at its first block, not at the full chunk_point_cap. Bloating
+        // beyond the estimate is backstopped by post-commit incremental
+        // accounting and the post-commit budget enforcement pass.
+        const FIRST_SNAPSHOT_BLOCK_POINTS: usize = 64;
+        let series_count = 128usize;
+        let rows: Vec<Row> = (0..series_count)
+            .map(|i| {
+                Row::with_labels(
+                    "estimate_first_block_unit",
+                    vec![Label::new("device", format!("{i:03}"))],
+                    DataPoint::new(1, i as f64),
+                )
+            })
+            .collect();
+
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let resolver = WriteResolver::new(storage.write_resolve_context());
+        let resolved = resolver.resolve_write_rows(&rows).unwrap();
+        let grouped =
+            WriteApplier::group_pending_point_indexes_by_series(&resolved.pending_points).unwrap();
+        let pending_series_families = BTreeMap::new();
+        let preparer = WritePreparer::new(storage.write_prepare_context());
+        let estimate = preparer.estimate_write_memory_growth_bytes(
+            &resolved.pending_points,
+            &grouped,
+            &resolved.created_series,
+            &pending_series_families,
+        );
+
+        let per_point_bytes = std::mem::size_of::<ChunkPoint>();
+        let first_block_charge = series_count * FIRST_SNAPSHOT_BLOCK_POINTS * per_point_bytes;
+        let full_capacity_charge =
+            series_count * crate::storage::DEFAULT_CHUNK_POINTS * per_point_bytes;
+
+        assert!(
+            estimate > first_block_charge,
+            "per-new-head estimate must include the {FIRST_SNAPSHOT_BLOCK_POINTS}-point first snapshot block charge: estimate={estimate}",
+        );
+        assert!(
+            estimate < full_capacity_charge / 4,
+            "per-new-head estimate must not bill the full chunk capacity: estimate={estimate}, full-capacity chunk charge alone would be {full_capacity_charge}",
+        );
     }
 }

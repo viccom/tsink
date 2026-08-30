@@ -322,7 +322,10 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
             path.display()
         )));
     };
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(|source| TsinkError::IoWithPath {
+        path: parent.to_path_buf(),
+        source,
+    })?;
 
     for _ in 0..256 {
         let tmp_path = tmp_path_for(path)?;
@@ -333,12 +336,31 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: tmp_path.clone(),
+                    source: err,
+                })
+            }
         };
         let mut writer = BufWriter::new(file);
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        writer
+            .write_all(bytes)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        writer.flush().map_err(|source| TsinkError::IoWithPath {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: tmp_path.clone(),
+                source,
+            })?;
         return Ok(tmp_path);
     }
 
@@ -482,6 +504,23 @@ mod tests {
             std::fs::read(&path).expect("payload should exist"),
             b"payload"
         );
+    }
+
+    #[test]
+    fn write_tmp_and_sync_reports_parent_path_when_directory_creation_fails() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let blocked_parent = temp_dir.path().join("blocked");
+        std::fs::write(&blocked_parent, b"not-a-directory").expect("blocker file should write");
+        let target = blocked_parent.join("state.bin");
+
+        let err = write_tmp_and_sync(&target, b"payload").expect_err("write must fail");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&format!("{:?}", blocked_parent)),
+            "error must carry the blocked parent directory path, got: {rendered}"
+        );
+        assert!(matches!(err, TsinkError::IoWithPath { .. }));
     }
 
     #[test]

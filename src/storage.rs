@@ -406,6 +406,16 @@ pub struct FlushObservabilitySnapshot {
     pub admission_pressure_relief_requests_total: u64,
     #[serde(default)]
     pub admission_pressure_relief_observed_total: u64,
+    /// Total writes rejected by the memory-budget admission check.
+    #[serde(default)]
+    pub admission_memory_rejections_total: u64,
+    /// Estimated memory growth of the most recently rejected write batch
+    /// (used + estimate = the `required` value carried by the rejection).
+    #[serde(default)]
+    pub admission_memory_last_estimate_bytes: u64,
+    /// Shortfall (required - budget) of the most recently rejected write batch.
+    #[serde(default)]
+    pub admission_memory_last_shortfall_bytes: u64,
     pub active_flush_runs_total: u64,
     pub active_flush_errors_total: u64,
     pub active_flushed_series_total: u64,
@@ -657,6 +667,35 @@ pub trait Storage: Send + Sync {
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
         self.list_metrics()
     }
+
+    /// Returns the number of series currently registered in the engine's series
+    /// registry.
+    ///
+    /// This is an O(1) registry-scope read backed by an atomic counter: unlike
+    /// [`Storage::list_metrics`] it does not materialize `MetricSeries` entries,
+    /// so it stays cheap at high cardinality. The registry scope is approximate
+    /// relative to the materialized scope of `list_metrics`: it may include
+    /// internal rollup series or dead series that have not been pruned yet, and
+    /// it is not fenced by the WAL-committed visibility rules. The counter keeps
+    /// reporting its frozen value after [`Storage::close`].
+    ///
+    /// Backends that do not track a registry counter conservatively report `0`.
+    fn series_count(&self) -> u64 {
+        0
+    }
+
+    /// Hot-updates the total series cardinality limit.
+    ///
+    /// The new limit takes effect immediately for subsequent new-series
+    /// admission decisions: write paths snapshot the limit when building their
+    /// per-batch context, so batches already in flight may still be judged
+    /// against the previous value. The change never deletes existing series —
+    /// lowering the limit only blocks creation of series beyond the new bound,
+    /// and raising it re-admits new series up to the raised bound.
+    ///
+    /// Backends that do not support runtime adjustment silently keep their
+    /// configured limit.
+    fn set_cardinality_limit(&self, _limit: usize) {}
 
     /// Lists known metric series within a shard scope.
     ///

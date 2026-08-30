@@ -782,6 +782,48 @@ fn test_list_metrics_deduplicates_across_disk_memory_and_wal() {
 }
 
 #[test]
+fn test_series_count_tracks_registered_series() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .build()
+        .unwrap();
+
+    // Empty registry reports zero.
+    assert_eq!(storage.series_count(), 0);
+
+    storage
+        .insert_rows(&[
+            Row::new("cpu", DataPoint::new(10, 1.0)),
+            Row::with_labels(
+                "http_requests",
+                vec![Label::new("status", "200"), Label::new("method", "GET")],
+                DataPoint::new(11, 2.0),
+            ),
+            Row::with_labels(
+                "queue_depth",
+                vec![Label::new("queue", "critical")],
+                DataPoint::new(12, 4.0),
+            ),
+        ])
+        .unwrap();
+
+    // Three distinct metric+labels identities are registered.
+    assert_eq!(storage.series_count(), 3);
+
+    // Re-inserting an existing identity must not create a new series.
+    storage
+        .insert_rows(&[Row::new("cpu", DataPoint::new(13, 5.0))])
+        .unwrap();
+    assert_eq!(storage.series_count(), 3);
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn test_list_metrics_ignores_runtime_wal_only_series() {
     let temp_dir = TempDir::new().unwrap();
     let wal_only_metric = "wal_only_metric";
@@ -1120,7 +1162,13 @@ fn test_close_failure_can_be_retried_on_same_handle() {
     fs::write(&numeric_lane_root, b"conflict").unwrap();
 
     let first_close_err = storage.close().unwrap_err();
-    assert!(matches!(first_close_err, TsinkError::Io(_)));
+    // The staging-directory instrumentation enriches pathless IO failures
+    // with the offending path, so close failures may surface as either
+    // IO-class variant.
+    assert!(matches!(
+        first_close_err,
+        TsinkError::Io(_) | TsinkError::IoWithPath { .. }
+    ));
 
     fs::remove_file(&numeric_lane_root).unwrap();
     storage.close().unwrap();

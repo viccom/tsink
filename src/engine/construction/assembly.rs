@@ -134,7 +134,7 @@ impl StorageStateAssembly {
                 .max(1),
             write_limiter: Semaphore::new(options.max_writers.max(1)),
             write_timeout: options.write_timeout,
-            cardinality_limit: options.cardinality_limit,
+            cardinality_limit: AtomicUsize::new(options.cardinality_limit),
             wal_size_limit_bytes: options.wal_size_limit_bytes,
             admission_poll_interval: options.admission_poll_interval,
         }
@@ -179,6 +179,7 @@ impl StorageStateAssembly {
             compaction_thread: Mutex::new(compaction_thread),
             flush_thread: Mutex::new(None),
             flush_thread_wakeup_requested: AtomicBool::new(false),
+            flush_thread_pressure_relief_requested: AtomicBool::new(false),
             persisted_refresh_thread: Mutex::new(None),
             rollup_thread: Mutex::new(None),
             fail_fast_enabled: background_fail_fast,

@@ -31,12 +31,15 @@ pub(in crate::engine::storage_engine) struct WriteSeriesValidationContext<'a> {
     pub(in crate::engine::storage_engine) chunks: ChunkContext<'a>,
     pub(in crate::engine::storage_engine) registry: &'a RwLock<SeriesRegistry>,
     pub(in crate::engine::storage_engine) persisted_index: &'a RwLock<PersistedIndexState>,
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) lane_validation_probes: &'a AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) catalog: CatalogContext<'a>,
     pub(in crate::engine::storage_engine) support: WriteResolveSupportContext<'a>,
+    pub(in crate::engine::storage_engine) observability: &'a StorageObservabilityCounters,
     pub(in crate::engine::storage_engine) cardinality_limit: usize,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
@@ -108,7 +111,20 @@ impl ChunkStorage {
             chunks: self.chunk_context(),
             registry: &self.catalog.registry,
             persisted_index: &self.persisted.persisted_index,
+            #[cfg(test)]
+            lane_validation_probes: &self.lane_validation_probes,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lane_validation_probes(&self) -> usize {
+        self.lane_validation_probes.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visibility_full_estimation_probes(&self) -> usize {
+        self.visibility_full_estimation_probes
+            .load(Ordering::Acquire)
     }
 
     pub(in crate::engine::storage_engine) fn registry_memory_context(
@@ -119,7 +135,6 @@ impl ChunkStorage {
             registry: &self.catalog.registry,
             registry_used_bytes: &self.memory.registry_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -168,7 +183,6 @@ impl ChunkStorage {
             pending_series_ids: &self.catalog.pending_series_ids,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -216,7 +230,6 @@ impl ChunkStorage {
             accounting_enabled: self.memory.accounting_enabled,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -229,7 +242,6 @@ impl ChunkStorage {
             live_series_pruning_generation: &self.visibility.live_series_pruning_generation,
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
         }
     }
 
@@ -273,7 +285,8 @@ impl ChunkStorage {
             support: WriteResolveSupportContext {
                 registry_memory: self.registry_memory_context(),
             },
-            cardinality_limit: self.runtime.cardinality_limit,
+            observability: self.observability.as_ref(),
+            cardinality_limit: self.runtime.cardinality_limit.load(Ordering::Acquire),
             used_bytes: &self.memory.used_bytes,
             budget_bytes: &self.memory.budget_bytes,
         }
@@ -394,7 +407,6 @@ impl ChunkStorage {
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,
             persisted_mmap_used_bytes: &self.memory.persisted_mmap_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
-            used_bytes: &self.memory.used_bytes,
             registry_bookkeeping: self.registry_bookkeeping_context(),
             materialized_series: self.materialized_series_write_context(),
             runtime_metadata_delta: self.runtime_metadata_delta_write_context(),

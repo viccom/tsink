@@ -22,7 +22,9 @@ struct RawSeriesKey {
 impl RawSeriesKey {
     fn new(metric: &str, labels: &[Label]) -> Self {
         let mut normalized_labels = labels.to_vec();
-        normalized_labels.sort();
+        if !normalized_labels.is_sorted() {
+            normalized_labels.sort();
+        }
         Self {
             metric: metric.to_string(),
             labels: normalized_labels,
@@ -89,6 +91,11 @@ impl<'a> WriteResolveContext<'a> {
             .min(usize::MAX as u64) as usize;
         let required = used.saturating_add(estimated_registry_growth);
         if required > budget {
+            self.observability.record_admission_memory_rejection(
+                estimated_registry_growth,
+                budget,
+                required,
+            );
             return Err(TsinkError::MemoryBudgetExceeded { budget, required });
         }
 
@@ -121,6 +128,9 @@ impl<'a> WriteResolver<'a> {
                 let data_point = row.data_point();
                 let lane = lane_for_value(&data_point.value);
 
+                // resolve_existing serves repeat identities (within this
+                // batch and across batches) from the registry identity
+                // cache; only the first occurrence pays the dictionary walk.
                 if let Some(resolution) = registry.resolve_existing(row.metric(), row.labels()) {
                     pending_points.push(PendingPoint {
                         series_id: resolution.series_id,
@@ -255,5 +265,129 @@ impl<'a> WriteResolver<'a> {
     pub(super) fn rollback_resolved_write(&self, resolved: ResolvedWrite) {
         self.engine
             .rollback_created_series(&resolved.created_series);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::storage_engine::ChunkStorage;
+    use crate::storage::Storage;
+    use crate::{DataPoint, Row};
+
+    #[test]
+    fn batch_resolve_walks_existing_series_dictionary_once_per_distinct_series() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "batch_dedup_resolve_metric";
+        let labels = vec![crate::Label::new("host", "a")];
+
+        // First batch commits the series so the next batch exercises the
+        // existing-series fast path.
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let before = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+
+        // Same series repeated within one batch: rows arrive with the same
+        // canonical (metric, labels) identity, in both label orders to pin
+        // order-invariant dedup.
+        let rows: Vec<Row> = (0..8)
+            .map(|i| {
+                let batch_labels = if i % 2 == 0 {
+                    labels.clone()
+                } else {
+                    let mut flipped = labels.clone();
+                    flipped.reverse();
+                    flipped
+                };
+                Row::with_labels(metric, batch_labels, DataPoint::new(2 + i, i as f64))
+            })
+            .collect();
+        let resolver = WriteResolver::new(storage.write_resolve_context());
+        let resolved = resolver.resolve_write_rows(&rows).unwrap();
+
+        let after = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+
+        assert_eq!(
+            after - before,
+            1,
+            "one distinct series in the batch must trigger exactly one dictionary walk"
+        );
+
+        // Behavior equivalence: every row resolved to the same existing series.
+        let distinct_ids = resolved
+            .pending_points
+            .iter()
+            .map(|point| point.series_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct_ids.len(), 1);
+        assert!(resolved.created_series.is_empty());
+        assert!(resolved.new_series_defs.is_empty());
+    }
+
+    #[test]
+    fn cross_batch_resolves_are_served_by_identity_cache() {
+        let storage = ChunkStorage::new(crate::storage::DEFAULT_CHUNK_POINTS, None);
+        let metric = "cross_batch_cache_metric";
+        let labels = vec![crate::Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let resolver = WriteResolver::new(storage.write_resolve_context());
+        let rows: Vec<Row> = (0..4)
+            .map(|i| Row::with_labels(metric, labels.clone(), DataPoint::new(10 + i, i as f64)))
+            .collect();
+
+        // Cold batch: the first resolve walks the dictionaries once and
+        // warms the identity cache for the series.
+        let cold = resolver.resolve_write_rows(&rows).unwrap();
+        assert_eq!(cold.pending_points.len(), 4);
+        let after_cold = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+
+        // Warm batch: identical rows must resolve with zero dictionary walks.
+        let warm = resolver.resolve_write_rows(&rows).unwrap();
+        let after_warm = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing_dictionary_walks();
+        assert_eq!(
+            after_warm, after_cold,
+            "warm cross-batch resolve must be served by the identity cache"
+        );
+
+        let distinct_ids = warm
+            .pending_points
+            .iter()
+            .map(|point| point.series_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct_ids.len(), 1);
+        assert_eq!(
+            distinct_ids.iter().copied().next(),
+            cold.pending_points.first().map(|point| point.series_id)
+        );
     }
 }

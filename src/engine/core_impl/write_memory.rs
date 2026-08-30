@@ -1,10 +1,15 @@
 use super::*;
 
+// Budget-scope note (2026-08-29 load-test follow-up): these component helpers
+// track memory categories that are EXCLUDED from the budget criterion
+// (`used_bytes` covers only evictable active heads plus sealed chunks pending
+// flush). They maintain the per-component observability counters and the
+// `shared_used_bytes` aggregate (surfaced as `excluded_bytes`), but never touch
+// the budget criterion itself.
 pub(super) fn add_included_memory_component_bytes(
     accounting_enabled: bool,
     component: &AtomicU64,
     shared_used_bytes: &AtomicU64,
-    used_bytes: &AtomicU64,
     bytes: usize,
 ) {
     if !accounting_enabled || bytes == 0 {
@@ -14,14 +19,12 @@ pub(super) fn add_included_memory_component_bytes(
     let increment = saturating_u64_from_usize(bytes);
     component.fetch_add(increment, Ordering::AcqRel);
     shared_used_bytes.fetch_add(increment, Ordering::AcqRel);
-    used_bytes.fetch_add(increment, Ordering::AcqRel);
 }
 
 pub(super) fn sub_included_memory_component_bytes(
     accounting_enabled: bool,
     component: &AtomicU64,
     shared_used_bytes: &AtomicU64,
-    used_bytes: &AtomicU64,
     bytes: usize,
 ) {
     if !accounting_enabled || bytes == 0 {
@@ -31,14 +34,12 @@ pub(super) fn sub_included_memory_component_bytes(
     let decrement = saturating_u64_from_usize(bytes);
     component.fetch_sub(decrement, Ordering::AcqRel);
     shared_used_bytes.fetch_sub(decrement, Ordering::AcqRel);
-    used_bytes.fetch_sub(decrement, Ordering::AcqRel);
 }
 
 pub(super) fn reset_included_memory_component_bytes(
     accounting_enabled: bool,
     component: &AtomicU64,
     shared_used_bytes: &AtomicU64,
-    used_bytes: &AtomicU64,
     bytes: usize,
 ) {
     if !accounting_enabled {
@@ -50,11 +51,9 @@ pub(super) fn reset_included_memory_component_bytes(
     if next >= previous {
         let delta = next.saturating_sub(previous);
         shared_used_bytes.fetch_add(delta, Ordering::AcqRel);
-        used_bytes.fetch_add(delta, Ordering::AcqRel);
     } else {
         let delta = previous.saturating_sub(next);
         shared_used_bytes.fetch_sub(delta, Ordering::AcqRel);
-        used_bytes.fetch_sub(delta, Ordering::AcqRel);
     }
 }
 
@@ -62,7 +61,6 @@ pub(super) fn with_included_memory_delta<T, R>(
     accounting_enabled: bool,
     component: &AtomicU64,
     shared_used_bytes: &AtomicU64,
-    used_bytes: &AtomicU64,
     state: &mut T,
     measure: impl Fn(&T) -> usize,
     mutate: impl FnOnce(&mut T) -> R,
@@ -79,7 +77,6 @@ pub(super) fn with_included_memory_delta<T, R>(
             true,
             component,
             shared_used_bytes,
-            used_bytes,
             after.saturating_sub(before),
         );
     } else {
@@ -87,7 +84,6 @@ pub(super) fn with_included_memory_delta<T, R>(
             true,
             component,
             shared_used_bytes,
-            used_bytes,
             before.saturating_sub(after),
         );
     }
@@ -100,7 +96,6 @@ pub(in crate::engine::storage_engine) struct RegistryMemoryContext<'a> {
     pub(in crate::engine::storage_engine) registry: &'a RwLock<SeriesRegistry>,
     pub(in crate::engine::storage_engine) registry_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> RegistryMemoryContext<'a> {
@@ -110,7 +105,6 @@ impl<'a> RegistryMemoryContext<'a> {
             self.accounting_enabled,
             self.registry_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             registry_used,
         );
     }
@@ -122,7 +116,6 @@ pub(in crate::engine::storage_engine) struct RegistryBookkeepingContext<'a> {
     pub(in crate::engine::storage_engine) pending_series_ids: &'a RwLock<BTreeSet<SeriesId>>,
     pub(in crate::engine::storage_engine) metadata_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
 }
 
 impl<'a> RegistryBookkeepingContext<'a> {
@@ -142,7 +135,6 @@ impl<'a> RegistryBookkeepingContext<'a> {
             self.accounting_enabled,
             self.metadata_used_bytes,
             self.shared_used_bytes,
-            self.used_bytes,
             &mut pending,
             |pending| ChunkStorage::btree_set_series_id_memory_usage_bytes(pending),
             |pending| {

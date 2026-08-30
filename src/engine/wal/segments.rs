@@ -217,7 +217,11 @@ impl FramedWal {
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&active_path)?;
+            .open(&active_path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: active_path.clone(),
+                source,
+            })?;
         let capacity = writer.capacity();
         let old_writer = std::mem::replace(
             &mut *writer,
@@ -236,7 +240,12 @@ impl FramedWal {
                 match fs::remove_file(&segment.path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        return Err(TsinkError::IoWithPath {
+                            path: segment.path.clone(),
+                            source: e,
+                        })
+                    }
                 }
             }
 
@@ -550,7 +559,10 @@ pub(super) fn sync_dir_path(_path: &Path) -> Result<()> {
 
 pub(super) fn collect_wal_segment_files(dir: &Path) -> Result<Vec<WalSegmentFile>> {
     let mut deduped = BTreeMap::<u64, WalSegmentFile>::new();
-    for entry in fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir).map_err(|source| TsinkError::IoWithPath {
+        path: dir.to_path_buf(),
+        source,
+    })? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;

@@ -199,8 +199,11 @@ impl ActiveSeriesState {
     pub(in crate::engine::storage_engine) fn flush_background_eligible_partial(
         &mut self,
     ) -> Result<Option<Chunk>> {
-        // Background-eligible flushes keep the current head open so callers like admission
-        // pressure relief can persist older work without fragmenting the live head.
+        // Background-eligible flushes keep the current head open so generic wakeups
+        // (e.g. the post-commit flush poke) can persist older work without
+        // fragmenting the live head. Admission pressure relief deliberately runs
+        // the bounded policy instead: it must also be able to seal the current
+        // head, or a writer waiting on budget pressure has nothing to evict.
         let Some(partition_id) = self
             .partition_heads
             .keys()

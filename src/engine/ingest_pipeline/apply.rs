@@ -145,6 +145,11 @@ impl<'a> WriteApplier<'a> {
         series_id: SeriesId,
         lane: ValueLane,
     ) -> Result<()> {
+        #[cfg(test)]
+        engine
+            .lane_validation_probes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
         if let Some(active_lane) = engine.active_lane(series_id) {
             if active_lane != lane {
                 return Err(TsinkError::ValueTypeMismatch {

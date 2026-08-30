@@ -288,7 +288,7 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
 }
 
 #[test]
-fn memory_admission_backpressure_uses_background_flush_without_sealing_current_head() {
+fn memory_admission_backpressure_seals_heads_including_current_head() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
     let first_blob = "a".repeat(4096);
@@ -446,7 +446,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     );
     assert!(
         after.flush.persisted_segments_total > before.flush.persisted_segments_total,
-        "background flush should persist the non-current head instead of fragmenting the live head",
+        "background flush should persist the sealed heads so admission pressure can evict them",
     );
     {
         let active = storage.active_shard(series_id).read();
@@ -454,8 +454,8 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         assert_eq!(state.partition_head_count(), 1);
         assert_eq!(
             state.point_count(),
-            2,
-            "admission pressure must keep the current partial head intact while appending the new point",
+            1,
+            "admission pressure relief seals the current head (2026-08-29 plan Task 8); the waiting write reopens it for its new point",
         );
     }
     assert_eq!(
@@ -467,6 +467,164 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
             DataPoint::new(11, second_blob),
             DataPoint::new(21, third_blob),
             DataPoint::new(22, fourth_blob),
+        ]
+    );
+}
+
+#[test]
+fn admission_pressure_relief_seals_current_head_when_no_eligible_head_exists() {
+    // 2026-08-29 load-test root cause (plan Task 8): admission pressure relief
+    // woke the flush thread at BackgroundEligibleOnly, which only seals
+    // non-current heads. In the steady-state production shape all buffered data
+    // sits in the single live head, so the relief wakeup could not release any
+    // memory and the waiting writer idled for the full write_timeout before the
+    // batch was rejected. Relief must trigger a bounded flush that can seal,
+    // persist, and make the current head evictable.
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
+    let first_blob = "a".repeat(4096);
+    let second_blob = "b".repeat(4096);
+    let build_storage = |root: &TempDir, write_timeout: Duration| {
+        let wal = FramedWal::open(root.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            None,
+            Some(root.path().join(BLOB_LANE_ROOT)),
+            1,
+            ChunkStorageOptions {
+                timestamp_precision: TimestampPrecision::Nanoseconds,
+                retention_window: i64::MAX,
+                future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+                retention_enforced: false,
+                runtime_mode: StorageRuntimeMode::ReadWrite,
+                partition_window: i64::MAX,
+                max_active_partition_heads_per_series:
+                    crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+                max_writers: 1,
+                write_timeout,
+                // A finite build-time budget keeps incremental accounting enabled;
+                // the tight pressure budget is stored onto the atomic later.
+                memory_budget_bytes: 1_000_000,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: Duration::from_millis(5),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: false,
+                background_fail_fast: false,
+                metadata_shard_count: None,
+                remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+                remote_segment_refresh_interval: Duration::from_secs(5),
+                tiered_storage: None,
+                #[cfg(test)]
+                current_time_override: None,
+            },
+        )
+        .unwrap()
+    };
+
+    let calibration_dir = TempDir::new().unwrap();
+    let calibration = build_storage(&calibration_dir, Duration::ZERO);
+    calibration
+        .insert_rows(&[Row::new(
+            "memory_backpressure_single_head",
+            DataPoint::new(1, first_blob.clone()),
+        )])
+        .unwrap();
+    // Active-head growth lands in `used_bytes` lazily; refresh so the measured
+    // requirement reflects the buffered head the waiting writer competes with.
+    calibration.refresh_memory_usage();
+    let second_row = Row::new(
+        "memory_backpressure_single_head",
+        DataPoint::new(2, second_blob.clone()),
+    );
+    let required =
+        memory_required_for_rejected_write(&calibration, std::slice::from_ref(&second_row));
+    let target_budget = required.saturating_sub(1);
+
+    let storage = std::sync::Arc::new(build_storage(&temp_dir, Duration::from_secs(2)));
+    storage
+        .insert_rows(&[Row::new(
+            "memory_backpressure_single_head",
+            DataPoint::new(1, first_blob.clone()),
+        )])
+        .unwrap();
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("memory_backpressure_single_head", &[])
+        .unwrap()
+        .series_id;
+    let before = storage.observability_snapshot();
+    storage.refresh_memory_usage();
+    {
+        let active = storage.active_shard(series_id).read();
+        let state = active.get(&series_id).unwrap();
+        assert_eq!(state.partition_head_count(), 1);
+        assert_eq!(state.point_count(), 1);
+    }
+
+    // A 60s interval keeps the periodic bounded flush out of the picture: only
+    // the admission relief wakeup can seal the live head inside the timeout.
+    storage
+        .start_background_flush_thread(Duration::from_secs(60))
+        .unwrap();
+    storage
+        .memory
+        .budget_bytes
+        .store(target_budget as u64, std::sync::atomic::Ordering::Release);
+
+    storage
+        .insert_rows(std::slice::from_ref(&second_row))
+        .expect(
+            "admission pressure relief must seal and evict the current head instead of idling until the write timeout",
+        );
+
+    // The waiting writer is released as soon as the head is sealed; segment
+    // persistence completes asynchronously in the same relief pipeline pass.
+    assert!(
+        wait_for_condition(Duration::from_secs(1), Duration::from_millis(10), || {
+            !load_segments_for_level(&lane_path, 0).unwrap().is_empty()
+                && storage
+                    .observability_snapshot()
+                    .flush
+                    .persisted_segments_total
+                    > before.flush.persisted_segments_total
+        }),
+        "relief must persist the sealed current head so the admission loop can evict it",
+    );
+
+    let after = storage.observability_snapshot();
+    assert!(
+        after.flush.admission_backpressure_delays_total
+            > before.flush.admission_backpressure_delays_total
+    );
+    assert!(
+        after.flush.admission_pressure_relief_requests_total
+            > before.flush.admission_pressure_relief_requests_total
+    );
+    assert!(
+        after.flush.admission_pressure_relief_observed_total
+            > before.flush.admission_pressure_relief_observed_total,
+        "the waiting writer must observe real relief before the timeout",
+    );
+    assert!(
+        after.flush.persisted_segments_total > before.flush.persisted_segments_total,
+        "relief must persist the sealed current head so the admission loop can evict it",
+    );
+    assert!(
+        !load_segments_for_level(&lane_path, 0).unwrap().is_empty(),
+        "relief must publish the sealed current head to the blob lane",
+    );
+    assert_eq!(
+        storage
+            .select("memory_backpressure_single_head", &[], 0, 10)
+            .unwrap(),
+        vec![
+            DataPoint::new(1, first_blob),
+            DataPoint::new(2, second_blob),
         ]
     );
 }
@@ -657,6 +815,142 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
         TsinkError::WalSizeLimitExceeded { limit, required }
             if limit == wal_size_limit && required > limit
     ));
+}
+
+#[test]
+fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chunk() {
+    // 2026-08-29 load-test root cause: the per-new-head estimate charged a full
+    // chunk capacity (chunk_point_cap * sizeof(ChunkPoint) ~= 80.2KiB/head), so a
+    // 16384-row batch of brand-new series estimated ~1.34GB and any 64MB-class
+    // budget rejected it. ChunkBuilder actually grows in 64-point snapshot blocks
+    // (ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS), so the batch should estimate ~45MB and
+    // a 64MB budget must admit it. Post-commit incremental accounting plus the
+    // post-commit budget enforcement backstop any real growth beyond the estimate.
+    let rows: Vec<Row> = (0..16_384)
+        .map(|i| {
+            Row::with_labels(
+                "admission_first_block_estimate",
+                vec![Label::new("device", format!("{i:05}"))],
+                DataPoint::new(1, i as f64),
+            )
+        })
+        .collect();
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        crate::storage::DEFAULT_CHUNK_POINTS,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 1,
+            write_timeout: Duration::ZERO,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            cardinality_limit: usize::MAX,
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            #[cfg(test)]
+            current_time_override: None,
+        },
+    )
+    .unwrap();
+    storage.insert_rows(&rows).expect(
+        "a 64MB budget must admit a 16384-new-series batch estimated at its real first block cost",
+    );
+}
+
+#[test]
+fn admission_memory_rejection_exports_estimate_and_shortfall_snapshot() {
+    // 2026-08-29 load-test follow-up: "required at least 2.16GB" rejections were
+    // only visible inside error strings, so an operator could not tell an
+    // inflated batch estimate apart from a genuinely full budget from metrics
+    // alone. The last memory-budget rejection must export its batch estimate
+    // and shortfall through the `dyn Storage` observability face.
+    let temp_dir = TempDir::new().unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 1,
+            write_timeout: Duration::ZERO,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            cardinality_limit: usize::MAX,
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            #[cfg(test)]
+            current_time_override: None,
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("admission_gap_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+    let used_before_rejection = storage.memory_used();
+    assert!(used_before_rejection > 0);
+
+    storage
+        .memory
+        .budget_bytes
+        .store(1, std::sync::atomic::Ordering::Release);
+    let err = storage
+        .insert_rows(&[Row::new("admission_gap_metric", DataPoint::new(2, 2.0))])
+        .unwrap_err();
+    let TsinkError::MemoryBudgetExceeded { budget, required } = err else {
+        panic!("expected memory budget rejection, got {err:?}");
+    };
+    assert_eq!(budget, 1);
+    assert!(
+        required > used_before_rejection,
+        "required must be used({used_before_rejection}) plus the batch estimate, got {required}"
+    );
+
+    // rs-iot consumes the snapshot through the `dyn Storage` trait face.
+    let dyn_storage: &dyn Storage = &storage;
+    let snapshot = dyn_storage.observability_snapshot();
+    assert_eq!(snapshot.flush.admission_memory_rejections_total, 1);
+    assert_eq!(
+        snapshot.flush.admission_memory_last_estimate_bytes as usize,
+        required - used_before_rejection,
+        "the exported estimate is the rejected batch's estimated growth (used + estimate = required)",
+    );
+    assert_eq!(
+        snapshot.flush.admission_memory_last_shortfall_bytes as usize,
+        required - budget
+    );
 }
 
 #[test]
