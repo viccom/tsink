@@ -7,9 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -191,7 +189,13 @@ struct PersistedStorageState {
     persisted_refresh_in_progress: AtomicBool,
 }
 
-/// Runtime configuration that is fixed for the life of one storage instance.
+/// Runtime configuration for one storage instance.
+///
+/// Most fields are fixed for the life of the instance. `cardinality_limit` is
+/// the exception: it is hot-adjustable through [`Storage::set_cardinality_limit`]
+/// and write paths snapshot the current value when building their per-batch
+/// context, so an update takes effect for subsequent new-series admission
+/// decisions without recreating the storage.
 struct RuntimeConfigState {
     timestamp_precision: TimestampPrecision,
     retention_window: i64,
@@ -202,7 +206,7 @@ struct RuntimeConfigState {
     max_active_partition_heads_per_series: usize,
     write_limiter: Semaphore,
     write_timeout: Duration,
-    cardinality_limit: usize,
+    cardinality_limit: AtomicUsize,
     wal_size_limit_bytes: u64,
     admission_poll_interval: Duration,
 }
@@ -405,6 +409,12 @@ impl Storage for ChunkStorage {
 
     fn series_count(&self) -> u64 {
         self.series_count_api()
+    }
+
+    fn set_cardinality_limit(&self, limit: usize) {
+        self.runtime
+            .cardinality_limit
+            .store(limit, Ordering::Release);
     }
 
     fn list_metrics_in_shards(

@@ -1053,6 +1053,99 @@ fn cardinality_limit_rejects_new_series_beyond_limit() {
 }
 
 #[test]
+fn cardinality_limit_hot_update_takes_effect_for_subsequent_batches() {
+    let storage = StorageBuilder::new()
+        .with_cardinality_limit(2)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+    let write = |series: &str, timestamp: i64, value: f64| {
+        storage.insert_rows(&[Row::with_labels(
+            "cardinality_hot_update_metric",
+            vec![Label::new("series", series)],
+            DataPoint::new(timestamp, value),
+        )])
+    };
+
+    write("a", 1, 1.0).unwrap();
+    write("b", 1, 1.0).unwrap();
+
+    // Third series is rejected while the initial limit of 2 is in effect.
+    let err = write("c", 1, 1.0).unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::CardinalityLimitExceeded { limit: 2, .. }
+    ));
+
+    // Raising the limit at runtime admits new series up to the new bound.
+    storage.set_cardinality_limit(10);
+    for idx in 0..8u32 {
+        write(&format!("hot_{idx}"), 1, f64::from(idx)).unwrap();
+    }
+    assert_eq!(storage.series_count(), 10);
+
+    // Shrinking never deletes existing series but blocks new ones at the
+    // lowered bound; existing series keep accepting writes.
+    storage.set_cardinality_limit(2);
+    let err = write("d", 1, 1.0).unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::CardinalityLimitExceeded { limit: 2, .. }
+    ));
+    write("a", 2, 2.0).unwrap();
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn cardinality_limit_hot_update_is_safe_under_concurrent_writes() {
+    use std::thread;
+
+    let storage = StorageBuilder::new()
+        .with_cardinality_limit(16)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .unwrap();
+
+    let writer_storage = Arc::clone(&storage);
+    let writer = thread::spawn(move || {
+        for idx in 0..64u32 {
+            let row = Row::with_labels(
+                "cardinality_hot_concurrent_metric",
+                vec![Label::new("series", format!("s{idx}"))],
+                DataPoint::new(1, f64::from(idx)),
+            );
+            // A batch either observes the raised limit (admitted) or still
+            // snapshots the smaller limit (CardinalityLimitExceeded). Any
+            // other error under a concurrent hot update is a bug.
+            if let Err(err) = writer_storage.insert_rows(&[row]) {
+                assert!(
+                    matches!(err, TsinkError::CardinalityLimitExceeded { .. }),
+                    "unexpected error: {err:?}"
+                );
+            }
+        }
+    });
+
+    storage.set_cardinality_limit(64);
+    writer.join().unwrap();
+
+    // Once the update is published every series up to the new limit is
+    // admissible: rewriting all 64 succeeds and registers exactly 64 series.
+    for idx in 0..64u32 {
+        let row = Row::with_labels(
+            "cardinality_hot_concurrent_metric",
+            vec![Label::new("series", format!("s{idx}"))],
+            DataPoint::new(2, f64::from(idx)),
+        );
+        storage.insert_rows(&[row]).unwrap();
+    }
+    assert_eq!(storage.series_count(), 64);
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
     let storage = ChunkStorage::new_with_data_path_and_options(
         4,

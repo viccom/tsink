@@ -286,7 +286,7 @@ impl ChunkStorage {
                 registry_memory: self.registry_memory_context(),
             },
             observability: self.observability.as_ref(),
-            cardinality_limit: self.runtime.cardinality_limit,
+            cardinality_limit: self.runtime.cardinality_limit.load(Ordering::Acquire),
             used_bytes: &self.memory.used_bytes,
             budget_bytes: &self.memory.budget_bytes,
         }

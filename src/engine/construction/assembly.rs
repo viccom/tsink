@@ -134,7 +134,7 @@ impl StorageStateAssembly {
                 .max(1),
             write_limiter: Semaphore::new(options.max_writers.max(1)),
             write_timeout: options.write_timeout,
-            cardinality_limit: options.cardinality_limit,
+            cardinality_limit: AtomicUsize::new(options.cardinality_limit),
             wal_size_limit_bytes: options.wal_size_limit_bytes,
             admission_poll_interval: options.admission_poll_interval,
         }

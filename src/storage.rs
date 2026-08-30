@@ -684,6 +684,19 @@ pub trait Storage: Send + Sync {
         0
     }
 
+    /// Hot-updates the total series cardinality limit.
+    ///
+    /// The new limit takes effect immediately for subsequent new-series
+    /// admission decisions: write paths snapshot the limit when building their
+    /// per-batch context, so batches already in flight may still be judged
+    /// against the previous value. The change never deletes existing series —
+    /// lowering the limit only blocks creation of series beyond the new bound,
+    /// and raising it re-admits new series up to the raised bound.
+    ///
+    /// Backends that do not support runtime adjustment silently keep their
+    /// configured limit.
+    fn set_cardinality_limit(&self, _limit: usize) {}
+
     /// Lists known metric series within a shard scope.
     ///
     /// Backends must override this to provide a bounded shard-scoped implementation.
