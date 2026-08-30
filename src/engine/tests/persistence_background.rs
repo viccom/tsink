@@ -1,6 +1,35 @@
 use super::*;
 use std::sync::mpsc;
 
+/// Polls `load_segments_for_level` while tolerating the Windows rename race:
+/// the background compaction thread publishes segments with `rename`, so a
+/// concurrent manifest read can fail with a transient sharing violation
+/// (PermissionDenied / os error 5). Non-transient failures still propagate.
+fn load_segments_for_level_retrying_renames(
+    lane_path: &std::path::Path,
+    level: u8,
+) -> Vec<crate::engine::segment::LoadedSegment> {
+    let retry_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match load_segments_for_level(lane_path, level) {
+            Ok(segments) => return segments,
+            Err(TsinkError::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < retry_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TsinkError::IoWithPath { source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < retry_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("failed to load level {level} segments: {err}"),
+        }
+    }
+}
+
 fn new_raw_numeric_storage(lane_path: std::path::PathBuf, next_segment_id: u64) -> ChunkStorage {
     ChunkStorage::new_with_data_path_and_options(
         2,
@@ -120,8 +149,8 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
     let mut compacted = false;
 
     while Instant::now() < deadline {
-        let l0 = load_segments_for_level(&lane_path, 0).unwrap();
-        let l1 = load_segments_for_level(&lane_path, 1).unwrap();
+        let l0 = load_segments_for_level_retrying_renames(&lane_path, 0);
+        let l1 = load_segments_for_level_retrying_renames(&lane_path, 1);
         if l0.len() < 4 && !l1.is_empty() {
             compacted = true;
             break;
@@ -207,8 +236,8 @@ fn background_compaction_refreshes_persisted_index_in_background() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut compacted = false;
     while Instant::now() < deadline {
-        let l0 = load_segments_for_level(&lane_path, 0).unwrap();
-        let l1 = load_segments_for_level(&lane_path, 1).unwrap();
+        let l0 = load_segments_for_level_retrying_renames(&lane_path, 0);
+        let l1 = load_segments_for_level_retrying_renames(&lane_path, 1);
         if l0.len() < 4 && !l1.is_empty() {
             compacted = true;
             break;

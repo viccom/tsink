@@ -1033,3 +1033,296 @@ fn flush_worker_shutdown_skips_self_join_panics() {
         .store(super::super::STORAGE_CLOSED, Ordering::SeqCst);
     std::thread::sleep(Duration::from_millis(25));
 }
+
+/// N1 (2026-08-30 压测 T20 事故 1/2 的机制回归)：registry catalog 侧车在构建/校验
+/// 时会对内存持久化索引里的每个段根重读 manifest。当 compaction 替换已经把某个
+/// 源段目录从磁盘删除、而内存索引（及启动 finalize 路径）仍引用它时，
+/// `read_segment_manifest_fingerprint` 会以 os error 3（路径不存在）失败并让
+/// flush worker 报错、甚至让 build_storage 的启动 finalize 整体失败。侧车只是
+/// 校验缓存：被并发删除的段根应跳过并告警，而不是把 IO 错误上抛。
+#[test]
+fn registry_persist_tolerates_segment_roots_removed_after_load() {
+    let data_dir = TempDir::new().unwrap();
+    let lane_path = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let metric = "stale_index_persist_metric";
+    let labels = vec![Label::new("host", "stale-index")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    for segment_id in 1..=4u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+
+    let loaded_segments = load_segment_indexes(&lane_path).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(lane_path.clone()),
+        None,
+        loaded_segments.next_segment_id,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage.load_tombstones_index().unwrap();
+    storage
+        .apply_loaded_segment_indexes(loaded_segments, false)
+        .unwrap();
+
+    // Write the registry snapshot plus catalog sidecar first so the
+    // sidecar-exists validation branch is the one under test.
+    storage.checkpoint_series_registry_index().unwrap();
+
+    // Simulate a compaction replacement racing this persist pass: the source
+    // segment directory disappears on disk while the in-memory persisted
+    // index (and the catalog sidecar) still references it.
+    let removed_root = lane_path
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000004");
+    std::fs::remove_dir_all(&removed_root).unwrap();
+
+    storage.persist_series_registry_index().unwrap();
+    storage.checkpoint_series_registry_index().unwrap();
+
+    // Remaining segments stay queryable and the rewritten sidecar no longer
+    // references the removed root.
+    assert_eq!(
+        storage.select(metric, &labels, 0, 4).unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0),
+        ]
+    );
+    let sidecar = std::fs::read_to_string(data_dir.path().join("series_index.catalog.json"))
+        .expect("registry catalog sidecar should exist after persist");
+    assert!(
+        !sidecar.contains("seg-0000000000000004"),
+        "sidecar must not reference the concurrently removed segment root: {sidecar}"
+    );
+
+    storage.close().unwrap();
+}
+
+/// N1 事故 2（kill -9 后重启 init_failed 后二次重启自愈）的宏观回归：不调用
+/// close 直接 drop（模拟进程被杀：无收尾 flush/checkpoint、WAL 尾帧未清理），
+/// 重新 open 必须成功且 WAL 回放补齐全部已提交数据。Windows 时序敏感问题按
+/// 20 轮迭代反复触发。
+#[test]
+fn kill9_reopen_loop_survives_without_close() {
+    let data_dir = TempDir::new().unwrap();
+    let metric = "kill9_loop_metric";
+    let labels = vec![Label::new("host", "kill9")];
+    let points_per_series_per_iteration = 20usize;
+    // Retention (14d default) sweeps 1970-era timestamps, so anchor the loop
+    // at wall-clock now in second precision.
+    let now_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let open_options = || {
+        StorageBuilder::new()
+            .with_data_path(data_dir.path())
+            .with_wal_sync_mode(WalSyncMode::PerAppend)
+            .with_background_fail_fast(false)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(4)
+    };
+
+    for iteration in 0..20u64 {
+        let storage = open_options().build().unwrap();
+        let mut rows = Vec::with_capacity(3 * points_per_series_per_iteration);
+        for series in 0..3u64 {
+            for offset in 0..points_per_series_per_iteration as i64 {
+                rows.push(Row::with_labels(
+                    format!("{metric}_{series}"),
+                    labels.clone(),
+                    DataPoint::new(
+                        now_seconds + iteration as i64 * 100 + offset,
+                        iteration as f64 + offset as f64,
+                    ),
+                ));
+            }
+        }
+        storage.insert_rows(&rows).unwrap();
+
+        // Let the background flush pipeline publish this iteration's points
+        // into segments (and reset the WAL) before the simulated kill.
+        let expected_new_points = 3 * points_per_series_per_iteration;
+        let published =
+            wait_for_condition(Duration::from_secs(5), Duration::from_millis(20), || {
+                storage
+                    .observability_snapshot()
+                    .flush
+                    .persisted_points_total as usize
+                    >= expected_new_points
+            });
+        assert!(
+            published,
+            "background flush must publish iteration {iteration} before the simulated kill"
+        );
+
+        // Simulate kill -9: drop without close() — no final flush, no registry
+        // checkpoint, WAL frames stay behind for the next open to replay.
+        drop(storage);
+
+        let reopened = open_options().build().unwrap();
+        for series in 0..3u64 {
+            let points = reopened
+                .select(
+                    &format!("{metric}_{series}"),
+                    &labels,
+                    0,
+                    now_seconds + iteration as i64 * 100 + 100,
+                )
+                .unwrap();
+            assert_eq!(
+                points.len(),
+                (iteration as usize + 1) * points_per_series_per_iteration,
+                "series {series} must replay all committed points after unclean reopen at iteration {iteration}"
+            );
+        }
+        drop(reopened);
+    }
+}
+
+/// N1 事故 1（运行期 flush worker os error 3）的并发回归：flush 持久化与
+/// compaction 替换同跑时，catalog 校验不得因源段目录被并发删除而报
+/// os error 3；停止后重开必须成功且种子数据完整。
+#[test]
+fn flush_pipeline_tolerates_concurrent_compaction_replacement_race() {
+    let data_dir = TempDir::new().unwrap();
+    let lane_path = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let metric = "compaction_race_metric";
+    let labels = vec![Label::new("host", "race")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    for segment_id in 1..=6u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[
+                (segment_id as i64, segment_id as f64),
+                (segment_id as i64 + 100, 0.5),
+            ],
+        );
+    }
+
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(lane_path.clone()),
+            None,
+            7,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: true,
+                compaction_interval: Duration::from_millis(10),
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+    storage
+        .start_background_flush_thread(Duration::from_millis(5))
+        .unwrap();
+    storage.start_background_persisted_refresh_thread().unwrap();
+
+    let churn_threads: Vec<_> = (0..4)
+        .map(|writer| {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+                let mut batch = 0u64;
+                while std::time::Instant::now() < deadline {
+                    let rows: Vec<Row> = (0..10)
+                        .map(|offset| {
+                            Row::new(
+                                format!("{metric}_churn_{writer}"),
+                                DataPoint::new(
+                                    (batch * 10 + offset) as i64,
+                                    (batch + offset) as f64,
+                                ),
+                            )
+                        })
+                        .collect();
+                    if storage.insert_rows(&rows).is_err() {
+                        break;
+                    }
+                    batch += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        })
+        .collect();
+    for handle in churn_threads {
+        handle.join().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let health = storage.observability_snapshot().health;
+    assert!(
+        !health.fail_fast_triggered,
+        "fail_fast must stay off: last error {:?}",
+        health.last_background_error
+    );
+    assert!(
+        !health
+            .last_background_error
+            .as_deref()
+            .is_some_and(|message| message.contains("os error 3")),
+        "flush/compaction race must not surface os error 3: {:?} (errors_total={})",
+        health.last_background_error,
+        health.background_errors_total
+    );
+
+    // Simulate kill -9 mid-workload and reopen: init must succeed and the
+    // seeded points (rewritten across compaction levels) must stay queryable.
+    storage
+        .coordination
+        .lifecycle
+        .store(super::super::STORAGE_CLOSED, Ordering::SeqCst);
+    drop(storage);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(data_dir.path())
+        .with_wal_enabled(false)
+        .with_background_fail_fast(false)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .build()
+        .unwrap();
+    let seeded = reopened.select(metric, &labels, 0, 110).unwrap();
+    assert_eq!(
+        seeded.len(),
+        12,
+        "seeded points must survive the flush/compaction race: {seeded:?}"
+    );
+    reopened.close().unwrap();
+}
