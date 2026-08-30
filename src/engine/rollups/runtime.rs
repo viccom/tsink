@@ -237,7 +237,10 @@ pub(super) fn persist_rollup_state(
     };
     let encoded = serde_json::to_vec_pretty(&payload)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|source| TsinkError::IoWithPath {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     write_file_atomically_and_sync_parent(path, &encoded)
 }

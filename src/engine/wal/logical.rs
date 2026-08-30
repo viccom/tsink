@@ -620,9 +620,26 @@ impl FramedWal {
         frame_start_len: u64,
     ) -> Result<()> {
         let active_path = self.path.lock().clone();
-        let truncation_file = OpenOptions::new().write(true).open(&active_path)?;
-        truncation_file.set_len(frame_start_len)?;
-        truncation_file.sync_data()?;
+        let truncation_file =
+            OpenOptions::new()
+                .write(true)
+                .open(&active_path)
+                .map_err(|source| TsinkError::IoWithPath {
+                    path: active_path.clone(),
+                    source,
+                })?;
+        truncation_file
+            .set_len(frame_start_len)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: active_path.clone(),
+                source,
+            })?;
+        truncation_file
+            .sync_data()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: active_path.clone(),
+                source,
+            })?;
         drop(truncation_file);
 
         let (replacement, _, _) = open_segment_for_append(&active_path)?;

@@ -288,7 +288,12 @@ impl WalReplayStream {
             let file = match OpenOptions::new().read(true).open(&segment.path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: segment.path.clone(),
+                        source: e,
+                    })
+                }
             };
 
             self.current_segment_id = segment.id;

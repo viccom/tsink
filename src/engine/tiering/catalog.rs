@@ -85,7 +85,10 @@ pub(in crate::engine::storage_engine) fn load_segment_catalog(
     blob_lane_path: Option<&Path>,
     tiered_storage: Option<&TieredStorageConfig>,
 ) -> Result<SegmentInventory> {
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let file: SegmentCatalogFile = serde_json::from_slice(&bytes)?;
     if !(1..=SEGMENT_CATALOG_VERSION).contains(&file.version) {
         return Err(TsinkError::InvalidConfiguration(format!(

@@ -541,7 +541,10 @@ impl Storage for ChunkStorage {
                 destination.display()
             )));
         };
-        std::fs::create_dir_all(destination_parent)?;
+        std::fs::create_dir_all(destination_parent).map_err(|err| TsinkError::IoWithPath {
+            path: destination_parent.to_path_buf(),
+            source: err,
+        })?;
 
         let wal_dir = self
             .persisted
@@ -561,7 +564,10 @@ impl Storage for ChunkStorage {
         }
 
         let staging = crate::engine::fs_utils::stage_dir_path(destination, "snapshot")?;
-        std::fs::create_dir_all(&staging)?;
+        std::fs::create_dir_all(&staging).map_err(|err| TsinkError::IoWithPath {
+            path: staging.clone(),
+            source: err,
+        })?;
         let snapshot_result = (|| -> Result<()> {
             if let Some(path) = &self.persisted.numeric_lane_path {
                 crate::engine::fs_utils::copy_dir_if_exists(

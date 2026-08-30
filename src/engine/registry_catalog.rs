@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use xxhash_rust::xxh64::Xxh64;
 
 use super::tiering::SegmentLaneFamily;
@@ -73,12 +74,20 @@ pub(super) fn validate_registry_catalog(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<Option<ValidatedRegistryCatalog>> {
     let path = catalog_path(snapshot_path);
-    if !path_exists_no_follow(&path)? {
+    if !path_exists_no_follow(&path).map_err(|source| TsinkError::IoWithPath {
+        path: path.clone(),
+        source,
+    })? {
         return Ok(None);
     }
 
     let expected_segments = build_catalog_entries(sources)?;
-    let actual = serde_json::from_slice::<PersistedRegistryCatalogFile>(&std::fs::read(&path)?)?;
+    let actual = serde_json::from_slice::<PersistedRegistryCatalogFile>(
+        &std::fs::read(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?,
+    )?;
     if actual.segments != expected_segments {
         return Ok(None);
     }
@@ -142,17 +151,44 @@ fn build_catalog_entries(
     let mut segments = sources
         .iter()
         .map(build_catalog_entry)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<Option<PersistedRegistryCatalogEntry>>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     segments.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
     Ok(segments)
 }
 
 fn build_catalog_entry(
     source: &PersistedRegistryCatalogSource,
-) -> Result<PersistedRegistryCatalogEntry> {
-    let fingerprint = crate::engine::segment::read_segment_manifest_fingerprint(&source.root)?;
+) -> Result<Option<PersistedRegistryCatalogEntry>> {
+    let fingerprint = match crate::engine::segment::read_segment_manifest_fingerprint(&source.root)
+    {
+        Ok(fingerprint) => fingerprint,
+        // N1 (2026-08-30 压测 T20 两次 os error 3)：compaction 替换会先删除源段目录，
+        // 再让后台 refresh 线程把内存索引对齐。窗口期内 catalog 构建/校验仍会引用
+        // 已消失的段根——Windows 上表现为 os error 3（路径不存在）。侧车只是校验
+        // 缓存：跳过已消失的源并告警，段数据本身由替换输出承载，未丢失。
+        Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                root = %source.root.display(),
+                "Persisted segment root disappeared while building the registry catalog; skipping it"
+            );
+            return Ok(None);
+        }
+        Err(TsinkError::IoWithPath { path, source })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            warn!(
+                root = %path.display(),
+                "Persisted segment root disappeared while building the registry catalog; skipping it"
+            );
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     let [chunks, chunk_index, series, postings] = fingerprint.files;
-    Ok(PersistedRegistryCatalogEntry {
+    Ok(Some(PersistedRegistryCatalogEntry {
         lane: source.lane,
         level: fingerprint.manifest.level,
         segment_id: fingerprint.manifest.segment_id,
@@ -171,7 +207,7 @@ fn build_catalog_entry(
         series_hash64: series.hash64,
         postings_len: postings.file_len,
         postings_hash64: postings.hash64,
-    })
+    }))
 }
 
 fn build_series_fingerprint_from_sources(
@@ -181,7 +217,32 @@ fn build_series_fingerprint_from_sources(
     let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
 
     for source in sources {
-        for series in crate::engine::segment::load_segment_series_metadata(&source.root)? {
+        let segment_series = match crate::engine::segment::load_segment_series_metadata(
+            &source.root,
+        ) {
+            Ok(series) => series,
+            // Same tolerance as build_catalog_entry: a concurrently removed
+            // segment root (compaction replacement window) is skipped rather
+            // than failing the whole fingerprint build.
+            Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    root = %source.root.display(),
+                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
+                );
+                continue;
+            }
+            Err(TsinkError::IoWithPath { path, source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                warn!(
+                    root = %path.display(),
+                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        for series in segment_series {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
                     if existing.metric == series.metric && existing.labels == series.labels => {}

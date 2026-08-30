@@ -159,5 +159,12 @@ pub(crate) fn handle_segment_dir_load_error(
 }
 
 pub(crate) fn is_not_found_error(err: &TsinkError) -> bool {
-    matches!(err, TsinkError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+    // IoWithPath carries the same NotFound source kind (e.g. a concurrently
+    // removed segment root surfacing as Windows os error 3); both variants
+    // describe a disappearance that callers treat as "skip and continue".
+    match err {
+        TsinkError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        TsinkError::IoWithPath { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }

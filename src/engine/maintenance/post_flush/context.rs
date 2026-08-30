@@ -300,7 +300,10 @@ impl<'a> RetentionMaintenanceContext<'a> {
             &source_base,
             POST_FLUSH_REWRITE_STAGE_PURPOSE,
         )?;
-        std::fs::create_dir_all(&staging_base)?;
+        std::fs::create_dir_all(&staging_base).map_err(|source| TsinkError::IoWithPath {
+            path: staging_base.clone(),
+            source,
+        })?;
         let rewriter = Compactor::new_with_segment_id_allocator(
             &staging_base,
             self.chunk_point_cap,

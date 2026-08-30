@@ -171,7 +171,12 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source: err,
+            })
+        }
     };
     if metadata.is_dir() {
         let _ = remove_dir_if_exists(path)?;
@@ -220,7 +225,10 @@ pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
+    let metadata = std::fs::symlink_metadata(source).map_err(|err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
     if !metadata.is_dir() {
         return Err(TsinkError::InvalidConfiguration(format!(
             "expected directory while copying {}, found non-directory",
@@ -228,17 +236,34 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
         )));
     }
 
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let entry_type = entry.file_type()?;
+    std::fs::create_dir_all(destination).map_err(|err| TsinkError::IoWithPath {
+        path: destination.to_path_buf(),
+        source: err,
+    })?;
+    for entry in std::fs::read_dir(source).map_err(|err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: err,
+    })? {
+        let entry = entry.map_err(|err| TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: err,
+        })?;
+        let entry_type = entry.file_type().map_err(|err| TsinkError::IoWithPath {
+            path: entry.path(),
+            source: err,
+        })?;
         let entry_source = entry.path();
         let entry_destination = destination.join(entry.file_name());
 
         if entry_type.is_dir() {
             copy_dir_recursive(&entry_source, &entry_destination)?;
         } else if entry_type.is_file() {
-            std::fs::copy(&entry_source, &entry_destination)?;
+            std::fs::copy(&entry_source, &entry_destination).map_err(|err| {
+                TsinkError::IoWithPath {
+                    path: entry_destination.clone(),
+                    source: err,
+                }
+            })?;
         } else {
             return Err(TsinkError::InvalidConfiguration(format!(
                 "unsupported non-file entry while copying snapshot: {}",
@@ -262,12 +287,18 @@ pub(crate) fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()
             copy_dir_recursive(source, destination)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: err,
+        }),
     }
 }
 
 pub(crate) fn copy_dir_contents(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
+    let metadata = std::fs::symlink_metadata(source).map_err(|err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
     if !metadata.is_dir() {
         return Err(TsinkError::InvalidConfiguration(format!(
             "snapshot path is not a directory: {}",
@@ -275,17 +306,34 @@ pub(crate) fn copy_dir_contents(source: &Path, destination: &Path) -> Result<()>
         )));
     }
 
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let entry_type = entry.file_type()?;
+    std::fs::create_dir_all(destination).map_err(|err| TsinkError::IoWithPath {
+        path: destination.to_path_buf(),
+        source: err,
+    })?;
+    for entry in std::fs::read_dir(source).map_err(|err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: err,
+    })? {
+        let entry = entry.map_err(|err| TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: err,
+        })?;
+        let entry_type = entry.file_type().map_err(|err| TsinkError::IoWithPath {
+            path: entry.path(),
+            source: err,
+        })?;
         let entry_source = entry.path();
         let entry_destination = destination.join(entry.file_name());
 
         if entry_type.is_dir() {
             copy_dir_recursive(&entry_source, &entry_destination)?;
         } else if entry_type.is_file() {
-            std::fs::copy(&entry_source, &entry_destination)?;
+            std::fs::copy(&entry_source, &entry_destination).map_err(|err| {
+                TsinkError::IoWithPath {
+                    path: entry_destination.clone(),
+                    source: err,
+                }
+            })?;
         } else {
             return Err(TsinkError::InvalidConfiguration(format!(
                 "unsupported non-file entry while restoring snapshot: {}",
@@ -371,7 +419,14 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
 }
 
 pub(crate) fn rename_tmp(tmp_path: &Path, path: &Path) -> Result<()> {
-    rename_tmp_impl(tmp_path, path)?;
+    // Instrument the final publish rename with the destination path so os
+    // error 3 (path not found) forensics point at the affected target even
+    // when the failing component is a parent directory that vanished between
+    // the temporary write and this rename.
+    rename_tmp_impl(tmp_path, path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 

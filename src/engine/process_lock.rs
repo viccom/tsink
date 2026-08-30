@@ -13,7 +13,10 @@ pub(super) struct DataPathProcessLock {
 
 impl DataPathProcessLock {
     pub(super) fn acquire(data_path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_path)?;
+        std::fs::create_dir_all(data_path).map_err(|source| TsinkError::IoWithPath {
+            path: data_path.to_path_buf(),
+            source,
+        })?;
         let lock_path = data_path.join(DATA_PATH_LOCK_FILE_NAME);
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
