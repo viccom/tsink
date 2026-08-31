@@ -396,6 +396,110 @@ fn compactor_limits_source_window_per_pass() {
 }
 
 #[test]
+fn compaction_output_point_budget_is_decoupled_from_chunk_point_cap() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "budget")])
+        .unwrap()
+        .series_id;
+
+    // 4 non-overlapping L0 segments x 75k points = 300k points total. With
+    // chunk_points=512 the legacy budget (512 x 512 = 262,144) split this
+    // into two output segments; the decoupled ~1M-point budget must keep it
+    // in one segment so tuning chunk_points no longer multiplies the output
+    // segment count.
+    for (segment_id, base_ts) in [(1u64, 0i64), (2, 75_000), (3, 150_000), (4, 225_000)] {
+        let first = (base_ts..base_ts + 40_000)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        let second = (base_ts + 40_000..base_ts + 75_000)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            vec![
+                make_numeric_chunk(series_id, &first),
+                make_numeric_chunk(series_id, &second),
+            ],
+        );
+        SegmentWriter::new(temp_dir.path(), 0, segment_id)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 512);
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(
+        stats.output_segments, 1,
+        "300k points must stay in one output segment when chunk_points=512 \
+         (legacy budget split this into {})",
+        stats.output_segments
+    );
+
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].manifest.point_count, 300_000);
+
+    let loaded = load_segments(temp_dir.path()).unwrap();
+    let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
+    let total_points = chunks
+        .iter()
+        .map(|chunk| chunk.header.point_count as usize)
+        .sum::<usize>();
+    assert_eq!(total_points, 300_000);
+}
+
+#[test]
+fn compaction_output_point_budget_keeps_default_chunk_points_behavior() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "budget")])
+        .unwrap()
+        .series_id;
+
+    // Same 300k-point shape as the decoupling test, but with the default
+    // chunk_points=2048: the legacy budget (2048 x 512 = 1,048,576) and the
+    // new independent budget agree, so the single-segment behavior of the
+    // default configuration must not change.
+    for (segment_id, base_ts) in [(1u64, 0i64), (2, 75_000), (3, 150_000), (4, 225_000)] {
+        let first = (base_ts..base_ts + 40_000)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        let second = (base_ts + 40_000..base_ts + 75_000)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            vec![
+                make_numeric_chunk(series_id, &first),
+                make_numeric_chunk(series_id, &second),
+            ],
+        );
+        SegmentWriter::new(temp_dir.path(), 0, segment_id)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 2048);
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(stats.output_segments, 1);
+
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].manifest.point_count, 300_000);
+}
+
+#[test]
 fn compactor_splits_large_output_into_multiple_segments() {
     let temp_dir = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();
@@ -419,16 +523,20 @@ fn compactor_splits_large_output_into_multiple_segments() {
             .unwrap();
     }
 
-    let compactor = Compactor::new(temp_dir.path(), 2);
+    // The budget is decoupled from the chunk point cap, so the shard-boundary
+    // behavior is exercised with an explicit small budget instead of leaning
+    // on point_cap: 1200 points against a 500-point budget must split, with
+    // every output segment bounded by the budget plus one trailing chunk.
+    let compactor = Compactor::new(temp_dir.path(), 2).with_output_segment_point_budget(500);
     compactor.compact_once().unwrap();
 
     let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
     let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
     assert!(l0.is_empty());
     assert!(l1.len() >= 2);
-    assert!(l1.iter().all(|segment| {
-        segment.manifest.point_count <= 2 * super::DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER
-    }));
+    assert!(l1
+        .iter()
+        .all(|segment| segment.manifest.point_count <= 500 + 2));
 
     let loaded = load_segments(temp_dir.path()).unwrap();
     let chunks = loaded.chunks_by_series.get(&series_id).unwrap();

@@ -2137,7 +2137,12 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
 fn reopened_large_history_metadata_snapshots_drop_legacy_duplicate_postings_bytes() {
     let temp_dir = TempDir::new().unwrap();
     let series_count = 2_048usize;
-    let segment_count = 4usize;
+    // Stay below the L0 count trigger and keep the segments
+    // time-disjoint: close-time compaction merges triggered or overlapping
+    // L0 clusters, and since the compaction output budget was decoupled from
+    // chunk_point_cap (~1M points) a merged cluster no longer re-splits, so
+    // the multi-segment reopen fixture would collapse to one segment.
+    let segment_count = 3usize;
 
     let storage = persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Seconds, 1);
     for segment_idx in 0..segment_count {

@@ -33,7 +33,13 @@ pub(in crate::engine) use self::execution::finalize_pending_compaction_replaceme
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
 const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
-const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
+/// Point budget for one compaction output segment, independent of the chunk
+/// point cap. It used to be `chunk_point_cap * 512`, which silently shrank the
+/// budget (and multiplied the output segment / file count by the same factor)
+/// whenever chunk_points was tuned below its 2048 default (rs-iot runs
+/// chunk_points=512 and got a 4x segment amplification). The value matches
+/// the legacy default behavior exactly: 2048 * 512 = 1,048,576 points.
+const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 1_048_576;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -88,6 +94,7 @@ pub enum CompactionLevel {
 pub struct Compactor {
     data_path: PathBuf,
     point_cap: usize,
+    output_segment_point_budget: usize,
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
@@ -104,6 +111,7 @@ impl Compactor {
         Self {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
+            output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
@@ -120,12 +128,23 @@ impl Compactor {
         Self {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
+            output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
         }
+    }
+
+    /// Overrides the per-output-segment point budget. Intentionally not a
+    /// public `StorageBuilder` knob: no consumer needs to tune it yet, so the
+    /// decoupled budget stays an internal constant with a crate-internal
+    /// override for tests.
+    #[cfg(test)]
+    pub(in crate::engine) fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
+        self.output_segment_point_budget = budget.max(1);
+        self
     }
 
     /// Wires this compactor into a live engine's segment-replacement lock so

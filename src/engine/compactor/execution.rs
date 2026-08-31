@@ -297,10 +297,10 @@ impl Compactor {
             )?;
         }
 
-        let output_segment_point_budget = self
-            .point_cap
-            .saturating_mul(DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER)
-            .max(self.point_cap);
+        // Output segment sizing is decoupled from the chunk point cap: the
+        // budget is a fixed ~1M points (the legacy default-chunk_points
+        // behavior), clamped only so a single chunk always fits.
+        let output_segment_point_budget = self.output_segment_point_budget.max(self.point_cap);
         let mut pending_chunks = HashMap::<SeriesId, Vec<Chunk>>::new();
         let mut pending_points = 0usize;
         let mut emitted_segments = 0usize;
