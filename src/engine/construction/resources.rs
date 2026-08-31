@@ -8,6 +8,7 @@ pub(in crate::engine::storage_engine) struct StorageAssemblyResources {
     pub(in crate::engine::storage_engine) blob_compactor: Option<Compactor>,
     pub(in crate::engine::storage_engine) lifecycle: Arc<AtomicU8>,
     pub(in crate::engine::storage_engine) compaction_lock: Arc<Mutex<()>>,
+    pub(in crate::engine::storage_engine) segment_replacement_lock: Arc<Mutex<()>>,
     pub(in crate::engine::storage_engine) compaction_thread: Option<std::thread::JoinHandle<()>>,
     pub(in crate::engine::storage_engine) persisted_index_dirty: Arc<AtomicBool>,
     pub(in crate::engine::storage_engine) pending_persisted_segment_diff:
@@ -69,12 +70,16 @@ impl ChunkStorage {
             blob_lane_path.map(|path| path.as_path()),
         );
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
+        // Compaction's segment-replacement marker operations serialize against
+        // the flush persist pipeline through this lock; see CoordinationState.
+        let segment_replacement_lock = Arc::new(Mutex::new(()));
         let numeric_compactor = numeric_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
                 path,
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
             )
+            .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -82,6 +87,7 @@ impl ChunkStorage {
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
             )
+            .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -112,6 +118,7 @@ impl ChunkStorage {
             blob_compactor,
             lifecycle,
             compaction_lock,
+            segment_replacement_lock,
             compaction_thread,
             persisted_index_dirty,
             pending_persisted_segment_diff,

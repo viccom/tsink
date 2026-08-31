@@ -234,6 +234,13 @@ struct CoordinationState {
     lifecycle: Arc<AtomicU8>,
     background_maintenance_lock: Mutex<()>,
     compaction_lock: Arc<Mutex<()>>,
+    /// Serializes compaction's segment-replacement marker operations (marker
+    /// write + source deletion) against the flush persist pipeline's registry
+    /// catalog build. This is the only mutual exclusion persist needs: taking
+    /// the whole `compaction_lock` instead let a long compaction pass (e.g. a
+    /// multi-GB window load) block persist, `mark_durable_through`, and WAL
+    /// prefix reclaim until the pass finished.
+    segment_replacement_lock: Arc<Mutex<()>>,
     data_path_process_lock: Mutex<Option<DataPathProcessLock>>,
 }
 
@@ -638,15 +645,21 @@ impl Storage for ChunkStorage {
 
 impl Drop for ChunkStorage {
     fn drop(&mut self) {
-        if self.coordination.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
-            return;
+        if self.coordination.lifecycle.load(Ordering::SeqCst) == STORAGE_OPEN {
+            // Best-effort shutdown to avoid losing in-memory active chunks on last Arc drop.
+            let _ = <Self as Storage>::close(self);
+            self.coordination
+                .lifecycle
+                .store(STORAGE_CLOSED, Ordering::SeqCst);
         }
 
-        // Best-effort shutdown to avoid losing in-memory active chunks on last Arc drop.
-        let _ = <Self as Storage>::close(self);
-        self.coordination
-            .lifecycle
-            .store(STORAGE_CLOSED, Ordering::SeqCst);
+        // A non-OPEN lifecycle skips the close pipeline, but background worker
+        // threads must never outlive the engine object: a mid-pass compaction
+        // thread keeps writing segments with this engine's allocator after
+        // drop, and a same-process reopen (tests simulate kill -9 this way)
+        // then races its own allocator against the zombie's in-flight outputs
+        // ("segment directory already exists" on publish). Joining is
+        // idempotent: `close` takes the handles first and drops see None.
         self.notify_background_threads();
         let _ = self.join_background_threads();
         self.release_data_path_process_lock();

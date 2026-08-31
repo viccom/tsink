@@ -1,4 +1,20 @@
 use super::*;
+use tracing::warn;
+
+/// How many ids a compaction output tries before giving up on publish. The
+/// shared allocator starts as a scan-time snapshot, so a segment that appeared
+/// after that snapshot can already occupy the first allocated id.
+const COMPACTION_OUTPUT_PUBLISH_ATTEMPTS: usize = 3;
+
+/// True for the publish failure meaning "another segment already owns this
+/// output id" (see `ensure_publish_target_clear`).
+fn output_segment_id_already_taken(err: &TsinkError) -> bool {
+    matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.starts_with("segment directory already exists")
+    )
+}
 
 fn compaction_replacement_dir(data_path: &Path) -> PathBuf {
     data_path.join(COMPACTION_REPLACEMENT_DIR)
@@ -370,6 +386,10 @@ impl Compactor {
         }
 
         if apply_replacement {
+            // Publishing the replacement (marker write + source deletion) is
+            // the only destructive step of a pass; gate exactly this against
+            // the flush persist pipeline, never the multi-GB merge above it.
+            let _replacement_guard = self.segment_replacement_guard();
             let replacement_marker_path =
                 write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
             apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
@@ -405,13 +425,37 @@ impl Compactor {
             ));
         }
 
-        let next_segment_id = match &self.next_segment_id {
-            Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
-            None => load_segments_runtime_strict(&self.data_path)?.next_segment_id,
-        };
-        let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
-        writer.write_segment_with_wal_highwater(registry, chunks_by_series, wal_highwater)?;
-        Ok(writer.layout().root.clone())
+        // The segment id allocator is seeded from a scan-time snapshot, so a
+        // concurrently appearing segment can already own the id we just
+        // allocated (e.g. a straggler writer from a superseded engine
+        // instance). Publishing under a taken id must not wedge every future
+        // pass on the same collision: skip forward and retry.
+        let mut last_collision = None;
+        for _ in 0..COMPACTION_OUTPUT_PUBLISH_ATTEMPTS {
+            let next_segment_id = match &self.next_segment_id {
+                Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
+                None => load_segments_runtime_strict(&self.data_path)?.next_segment_id,
+            };
+            let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
+            match writer.write_segment_with_wal_highwater(registry, chunks_by_series, wal_highwater)
+            {
+                Ok(_) => return Ok(writer.layout().root.clone()),
+                Err(err) if output_segment_id_already_taken(&err) => {
+                    warn!(
+                        segment_id = next_segment_id,
+                        level = target_level,
+                        "Compaction output segment id already occupied; retrying with the next id"
+                    );
+                    last_collision = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_collision.unwrap_or_else(|| {
+            TsinkError::InvalidConfiguration("cannot flush empty compacted segment".to_string())
+        }))
     }
 }
 

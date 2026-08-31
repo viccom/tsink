@@ -188,6 +188,13 @@ impl ChunkStorage {
             crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)?;
         }
 
-        retention.finalize_retired_roots(&retired_roots)
+        {
+            // Retiring roots deletes segment directories the flush persist
+            // pipeline's registry catalog build may be reading; serialize this
+            // deletion step (not the whole sweep) through the segment
+            // replacement gate, mirroring compaction's marker application.
+            let _replacement_guard = self.segment_replacement_gate();
+            retention.finalize_retired_roots(&retired_roots)
+        }
     }
 }

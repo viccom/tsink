@@ -95,7 +95,14 @@ impl Compactor {
     /// semantics (count threshold / time overlap, minimum 2 segments) stay
     /// unchanged; a level that is not eligible simply yields the pass.
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
-        finalize_pending_compaction_replacements(&self.data_path)?;
+        {
+            // Marker application deletes source segment directories, so it must
+            // serialize against the flush persist pipeline's registry catalog
+            // build. The rest of the pass (survey, window load, merge, output
+            // writes) does not delete anything and runs outside this gate.
+            let _replacement_guard = self.segment_replacement_guard();
+            finalize_pending_compaction_replacements(&self.data_path)?;
+        }
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 
         let prefer_l1_to_l2 = self.last_compacted_transition.load(Ordering::Acquire)

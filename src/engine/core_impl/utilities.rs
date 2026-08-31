@@ -312,6 +312,15 @@ impl ChunkStorage {
         self.coordination.compaction_lock.lock()
     }
 
+    /// Serializes against compaction's segment-replacement marker operations
+    /// only (marker write + source segment deletion). The flush persist
+    /// pipeline takes this instead of [`Self::compaction_gate`] so a long
+    /// compaction pass cannot stall `mark_durable_through` and WAL prefix
+    /// reclaim; lock order is maintenance > compaction > segment replacement.
+    pub(in crate::engine::storage_engine) fn segment_replacement_gate(&self) -> MutexGuard<'_, ()> {
+        self.coordination.segment_replacement_lock.lock()
+    }
+
     pub(in crate::engine::storage_engine) fn lock_compaction_gate(
         compaction_lock: &Mutex<()>,
     ) -> MutexGuard<'_, ()> {

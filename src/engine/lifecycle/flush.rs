@@ -338,7 +338,14 @@ impl ChunkStorage {
         // Recovery metadata must reach disk before the newly published segment roots are
         // allowed to become the engine's durable view. If this step fails, roll the new
         // roots back rather than exposing data that restart cannot fully recover.
-        let _compaction_guard = self.compaction_gate();
+        //
+        // The only compaction mutual exclusion this build/write needs is against
+        // segment-replacement marker application (source dir deletion); the
+        // registry catalog already tolerates concurrently-disappeared roots.
+        // Taking the coarse compaction gate here instead let one long compaction
+        // pass stall the whole persist chain (mark_durable_through, WAL prefix
+        // reclaim) until the pass finished.
+        let _replacement_guard = self.segment_replacement_gate();
         if publish_ctx.0.load(Ordering::SeqCst) {
             if let Err(err) = self.apply_known_dirty_persisted_refresh_if_pending() {
                 tracing::warn!(

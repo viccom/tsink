@@ -346,6 +346,62 @@ fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
 }
 
 #[test]
+fn persist_completes_while_a_compaction_pass_holds_the_compaction_gate() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(lane_path),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "gate_persist",
+            vec![Label::new("host", "a")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    // Simulate a long compaction pass (e.g. a multi-GB window load/merge)
+    // holding the compaction gate for the whole test body.
+    let compaction_guard = storage.compaction_gate();
+
+    let persisting_storage = Arc::clone(&storage);
+    let (persist_done, persist_result) = std::sync::mpsc::channel();
+    let persist_handle = std::thread::spawn(move || {
+        let result = persisting_storage.persist_segment().map(|_| ());
+        let _ = persist_done.send(result);
+    });
+
+    match persist_result.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("persist failed under a concurrent compaction pass: {err}"),
+        Err(_) => panic!(
+            "persist stayed blocked >5s on the compaction gate; a wedged compaction pass stalls mark_durable_through and WAL reclaim until death"
+        ),
+    }
+
+    drop(compaction_guard);
+    persist_handle.join().unwrap();
+    storage.close().unwrap();
+}
+
+#[test]
 fn persist_segment_stamps_wal_highwater_when_wal_is_enabled() {
     let temp_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];

@@ -20,6 +20,7 @@ use crate::engine::tombstone::{
     load_tombstones, timestamp_is_tombstoned, TombstoneMap, TombstoneRange, TOMBSTONES_FILE_NAME,
 };
 use crate::{Result, TsinkError};
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 #[path = "compactor/execution.rs"]
@@ -91,6 +92,11 @@ pub struct Compactor {
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
     last_compacted_transition: Arc<AtomicU8>,
+    /// When wired into a live engine, serializes this compactor's
+    /// segment-replacement marker operations against the flush persist
+    /// pipeline's registry catalog build. `None` for standalone compactors
+    /// (tests, retention rewriters) that own their data path exclusively.
+    segment_replacement_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl Compactor {
@@ -102,6 +108,7 @@ impl Compactor {
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
+            segment_replacement_lock: None,
         }
     }
 
@@ -117,7 +124,24 @@ impl Compactor {
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
+            segment_replacement_lock: None,
         }
+    }
+
+    /// Wires this compactor into a live engine's segment-replacement lock so
+    /// its marker write/apply phases serialize against the flush persist
+    /// pipeline instead of forcing persist to wait out whole compaction passes.
+    pub fn with_segment_replacement_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.segment_replacement_lock = Some(lock);
+        self
+    }
+
+    /// Acquires the segment-replacement gate for the caller's next marker
+    /// operations. Returns `None` for standalone compactors without a lock.
+    fn segment_replacement_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.segment_replacement_lock
+            .as_ref()
+            .map(|lock| lock.lock())
     }
 
     pub fn compact_once(&self) -> Result<bool> {

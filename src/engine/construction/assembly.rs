@@ -30,6 +30,7 @@ impl StorageStateAssembly {
             blob_compactor,
             lifecycle,
             compaction_lock,
+            segment_replacement_lock,
             compaction_thread,
             persisted_index_dirty,
             pending_persisted_segment_diff,
@@ -56,7 +57,11 @@ impl StorageStateAssembly {
             ),
             runtime: Self::build_runtime_config_state(options),
             memory: Self::build_memory_accounting_state(options),
-            coordination: Self::build_coordination_state(lifecycle, compaction_lock),
+            coordination: Self::build_coordination_state(
+                lifecycle,
+                compaction_lock,
+                segment_replacement_lock,
+            ),
             background: Self::build_background_worker_supervision_state(
                 compaction_thread,
                 options.background_fail_fast,
@@ -160,6 +165,7 @@ impl StorageStateAssembly {
     fn build_coordination_state(
         lifecycle: Arc<AtomicU8>,
         compaction_lock: Arc<Mutex<()>>,
+        segment_replacement_lock: Arc<Mutex<()>>,
     ) -> CoordinationState {
         CoordinationState {
             post_flush_maintenance_pending: AtomicBool::new(false),
@@ -167,6 +173,7 @@ impl StorageStateAssembly {
             lifecycle,
             background_maintenance_lock: Mutex::new(()),
             compaction_lock,
+            segment_replacement_lock,
             data_path_process_lock: Mutex::new(None),
         }
     }

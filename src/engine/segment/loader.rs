@@ -588,9 +588,27 @@ fn load_indexed_segment_dir_with_policy(
                     let Some(details) = segment_validation_error_message(&err) else {
                         return Err(err);
                     };
-                    Ok(IndexedSegmentLoadOutcome::Quarantined(
-                        quarantine_invalid_startup_segment(dir, &details)?,
-                    ))
+                    match quarantine_invalid_startup_segment(dir, &details) {
+                        Ok(quarantined) => Ok(IndexedSegmentLoadOutcome::Quarantined(quarantined)),
+                        Err(quarantine_err) => {
+                            // A segment replacement racing this startup scan
+                            // (e.g. a superseded engine instance finishing its
+                            // compaction marker application) can delete the
+                            // root between validation and quarantine. A
+                            // vanished root has nothing left to quarantine;
+                            // skipping matches the disappearance tolerance
+                            // above instead of failing startup.
+                            if !crate::engine::fs_utils::path_exists_no_follow(dir)? {
+                                warn!(
+                                    path = %dir.display(),
+                                    error = %quarantine_err,
+                                    "Segment root vanished during startup quarantine; skipping"
+                                );
+                                return Ok(IndexedSegmentLoadOutcome::Skipped);
+                            }
+                            Err(quarantine_err)
+                        }
+                    }
                 }
             },
         },
