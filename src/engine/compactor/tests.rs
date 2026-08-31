@@ -58,6 +58,59 @@ fn write_level_segment(
 }
 
 #[test]
+fn compaction_window_selection_fully_loads_at_most_window_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // One overlapping cluster of 20 L0 segments: the window must pick 8 of
+    // them, and planning must fully load only those 8 — not the whole level.
+    for segment_id in 1..=20u64 {
+        write_level_segment(
+            &temp_dir,
+            0,
+            segment_id,
+            series_id,
+            &registry,
+            &[(10, 1.0), (11, 2.0)],
+        );
+    }
+
+    crate::engine::segment::reset_full_segment_dir_load_count();
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(1000)),
+    );
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted, "overlapping cluster must compact");
+
+    let loads = crate::engine::segment::full_segment_dir_load_count();
+    assert!(
+        loads <= super::DEFAULT_SOURCE_WINDOW_SEGMENTS as u64,
+        "single compaction pass fully loaded {loads} segment directories; window is {}",
+        super::DEFAULT_SOURCE_WINDOW_SEGMENTS
+    );
+
+    // Window semantics are unchanged: the 8 lowest-id segments of the cluster
+    // are compacted away and the rest of the level stays untouched.
+    let remaining_l0_ids = load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.manifest.segment_id)
+        .collect::<Vec<_>>();
+    assert_eq!(remaining_l0_ids, (9..=20).collect::<Vec<_>>());
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        1,
+        "compacted window must produce exactly one L1 output"
+    );
+}
+
+#[test]
 fn l1_to_l2_compaction_is_not_starved_by_continuous_l0_arrivals() {
     let temp_dir = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();
