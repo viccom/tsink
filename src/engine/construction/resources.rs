@@ -80,6 +80,8 @@ impl ChunkStorage {
                 Arc::clone(&next_segment_id),
             )
             .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
+            .with_source_window_segments(options.source_window_segments)
+            .with_output_segment_point_budget(options.output_segment_point_budget)
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -88,6 +90,8 @@ impl ChunkStorage {
                 Arc::clone(&next_segment_id),
             )
             .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
+            .with_source_window_segments(options.source_window_segments)
+            .with_output_segment_point_budget(options.output_segment_point_budget)
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -104,6 +108,7 @@ impl ChunkStorage {
                 Arc::clone(&persisted_index_dirty),
                 Arc::clone(&pending_persisted_segment_diff),
                 options.compaction_interval,
+                options.drain_time_budget,
                 Arc::clone(&observability),
                 options.background_fail_fast,
             )?

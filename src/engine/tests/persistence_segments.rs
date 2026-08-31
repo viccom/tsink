@@ -519,6 +519,10 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,

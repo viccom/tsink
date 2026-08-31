@@ -46,6 +46,10 @@ fn chunk_storage_at_time(now: i64, retention_window: i64) -> ChunkStorage {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -346,6 +350,10 @@ fn retention_sweep_reload_failure_keeps_existing_persisted_data_visible() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -613,6 +621,10 @@ fn retention_sweeper_uses_repaired_recency_after_deleting_anchor() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -794,6 +806,10 @@ fn tiered_retention_uses_repaired_recency_after_deleting_anchor() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,

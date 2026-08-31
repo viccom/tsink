@@ -38,7 +38,10 @@ const DEFAULT_L1_TRIGGER: usize = 4;
 /// yield park) over twice the input. Paired with the 8M-point output budget,
 /// a full window of 16x1M-point L0 shards re-emits as 2x8M L1 segments
 /// instead of leaving half the backlog for the next pass.
-const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16;
+///
+/// Exposure: [`StorageBuilder::with_source_window_segments`](crate::storage::StorageBuilder::with_source_window_segments)
+/// overrides this per deployment; this constant stays the default.
+pub(crate) const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16;
 /// Point budget for one compaction output segment, independent of the chunk
 /// point cap. It used to be `chunk_point_cap * 512`, which silently shrank the
 /// budget (and multiplied the output segment / file count by the same factor)
@@ -47,7 +50,10 @@ const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16;
 /// flush shard size (1M points): a budget equal to the shard size made an
 /// L0->L1 merge of 8x1M re-emit ~8x1M ("8-in-8-out"), so the level segment
 /// count never shrank. 8 x 1,048,576 = 8,388,608 points.
-const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 8_388_608;
+///
+/// Exposure: [`StorageBuilder::with_output_segment_point_budget`](crate::storage::StorageBuilder::with_output_segment_point_budget)
+/// overrides this per deployment; this constant stays the default.
+pub(crate) const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 8_388_608;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -103,6 +109,10 @@ pub struct Compactor {
     data_path: PathBuf,
     point_cap: usize,
     output_segment_point_budget: usize,
+    /// How many same-level segments one pass may merge; plumbed from the
+    /// builder's `source_window_segments` knob, defaulting to
+    /// [`DEFAULT_SOURCE_WINDOW_SEGMENTS`].
+    source_window_segments: usize,
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
@@ -120,6 +130,7 @@ impl Compactor {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
@@ -137,6 +148,7 @@ impl Compactor {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
@@ -145,13 +157,21 @@ impl Compactor {
         }
     }
 
-    /// Overrides the per-output-segment point budget. Intentionally not a
-    /// public `StorageBuilder` knob: no consumer needs to tune it yet, so the
-    /// decoupled budget stays an internal constant with a crate-internal
-    /// override for tests.
-    #[cfg(test)]
-    pub(in crate::engine) fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
+    /// Overrides the per-output-segment point budget. Exposed through the
+    /// `StorageBuilder::with_output_segment_point_budget` knob for deployment
+    /// tuning (default: [`DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET`]); also kept
+    /// on the compactor for standalone/tests use.
+    pub fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
         self.output_segment_point_budget = budget.max(1);
+        self
+    }
+
+    /// Overrides how many same-level segments one compaction pass may merge
+    /// (default: [`DEFAULT_SOURCE_WINDOW_SEGMENTS`]). Clamped to at least 2:
+    /// a window below 2 can never select a mergeable pair, which would
+    /// silently disable the level's compaction.
+    pub fn with_source_window_segments(mut self, segments: usize) -> Self {
+        self.source_window_segments = segments.max(2);
         self
     }
 

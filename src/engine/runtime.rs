@@ -41,7 +41,10 @@ enum BackgroundWorkerPass<G> {
 /// unbounded backlog in one go. 10s lets several fast passes chain within
 /// one tick while a single slow pass (16x1M-point windows) still yields the
 /// gate after finishing.
-const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(10);
+///
+/// Exposure: `StorageBuilder::with_drain_time_budget` overrides this per
+/// deployment; this constant stays the default.
+pub(crate) const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(10);
 
 /// Park interval between compaction passes while the previous pass stopped
 /// budget-exhausted with eligible work still pending. With 16x1M-point
@@ -276,6 +279,7 @@ impl ChunkStorage {
         persisted_index_dirty: Arc<AtomicBool>,
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
         compaction_interval: Duration,
+        drain_time_budget: Duration,
         observability: Arc<StorageObservabilityCounters>,
         background_fail_fast: bool,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
@@ -312,7 +316,7 @@ impl ChunkStorage {
                             numeric_compactor.as_ref(),
                             blob_compactor.as_ref(),
                             Some(observability.as_ref()),
-                            COMPACTION_DRAIN_TIME_BUDGET,
+                            drain_time_budget,
                         ) {
                             Ok(pass) => {
                                 if !pass.changes.is_empty() {

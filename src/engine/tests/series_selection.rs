@@ -2069,6 +2069,10 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -2324,6 +2328,10 @@ fn persisted_merged_postings_update_across_segment_removal_and_re_adoption() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -3112,6 +3120,10 @@ fn reconcile_live_metadata_indexes_uses_timestamp_search_index_for_bounded_overl
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -4466,6 +4478,10 @@ fn retention_sweep_reconciles_live_metadata_indexes_and_shard_scoped_reads() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: Some(shard_count),

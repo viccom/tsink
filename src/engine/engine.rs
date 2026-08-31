@@ -93,6 +93,7 @@ pub(in crate::engine::storage_engine) use core_impl::{
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
+pub(crate) use runtime::COMPACTION_DRAIN_TIME_BUDGET;
 use state::{
     ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, SegmentMapRegistry,
     SeriesVisibilityRangeSummary, SeriesVisibilitySummary, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT,
@@ -108,7 +109,10 @@ const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
 const DEFAULT_FUTURE_SKEW_ALLOWANCE: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
-const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+/// Interval between background compaction passes. Exposure:
+/// `StorageBuilder::with_compaction_interval` overrides this per deployment;
+/// this constant stays the default.
+pub(crate) const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_ROLLUP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);

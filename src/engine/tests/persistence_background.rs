@@ -290,6 +290,10 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: Duration::from_millis(25),
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -374,6 +378,10 @@ fn background_compaction_refreshes_persisted_index_in_background() {
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: Duration::from_millis(25),
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: true,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -499,6 +507,10 @@ fn flush_pipeline_reconciles_known_dirty_compaction_changes_before_checkpointing
         ChunkStorageOptions {
             retention_enforced: false,
             compaction_interval: Duration::from_millis(25),
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: true,
             ..ChunkStorageOptions::default()
         },
@@ -1899,6 +1911,10 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -2054,6 +2070,10 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -2552,6 +2572,10 @@ fn flush_pipeline_completes_while_another_writer_permit_is_held() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -3057,6 +3081,10 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3173,6 +3201,10 @@ fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_s
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3309,6 +3341,10 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3466,6 +3502,10 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -3561,6 +3601,10 @@ fn flush_pipeline_returns_while_background_post_flush_maintenance_is_staged() {
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,

@@ -150,7 +150,7 @@ impl Compactor {
         }
 
         let window =
-            select_compaction_window(&candidates, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
+            select_compaction_window(&candidates, count_trigger, self.source_window_segments);
         if window.len() < 2 {
             return Ok(None);
         }

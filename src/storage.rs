@@ -1070,6 +1070,10 @@ pub struct StorageBuilder {
     wal_sync_mode: WalSyncMode,
     wal_replay_mode: WalReplayMode,
     background_fail_fast: bool,
+    compaction_interval: Duration,
+    drain_time_budget: Duration,
+    source_window_segments: usize,
+    output_segment_point_budget: usize,
     metadata_shard_count: Option<u32>,
     #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
@@ -1105,6 +1109,11 @@ impl Default for StorageBuilder {
             wal_sync_mode: WalSyncMode::default(),
             wal_replay_mode: WalReplayMode::Strict,
             background_fail_fast: true,
+            compaction_interval: crate::engine::DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             metadata_shard_count: None,
             #[cfg(test)]
             background_threads_enabled_override: None,
@@ -1330,6 +1339,51 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets the park interval between background compaction passes.
+    ///
+    /// While a pass ends budget-exhausted with eligible work still pending,
+    /// the worker temporarily parks on the shorter backlog cadence instead of
+    /// waiting out this interval. Defaults to 5s.
+    #[must_use]
+    pub fn with_compaction_interval(mut self, interval: Duration) -> Self {
+        self.compaction_interval = interval;
+        self
+    }
+
+    /// Sets the time budget one background compaction drain pass may spend
+    /// starting new window compactions before yielding the compaction gate.
+    ///
+    /// The budget gates *starting* the next pass, so a drain holds the gate
+    /// for at most `budget + one pass`. Defaults to 10s.
+    #[must_use]
+    pub fn with_drain_time_budget(mut self, budget: Duration) -> Self {
+        self.drain_time_budget = budget;
+        self
+    }
+
+    /// Sets how many same-level segments one compaction pass may merge.
+    ///
+    /// Larger windows amortize per-pass fixed costs (marker scan, tombstone
+    /// parse, level survey) over more input. Clamped to at least 2; defaults
+    /// to 16.
+    #[must_use]
+    pub fn with_source_window_segments(mut self, segments: usize) -> Self {
+        self.source_window_segments = segments;
+        self
+    }
+
+    /// Sets the point budget for one compaction output segment, independent
+    /// of the chunk point cap.
+    ///
+    /// A budget at or below the L0 flush shard size re-emits "N-in-N-out"
+    /// segment counts that never shrink a level, so keep it a multiple of the
+    /// flush shard size. Defaults to 8,388,608 points (8 x 1M).
+    #[must_use]
+    pub fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
+        self.output_segment_point_budget = budget;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_current_time_override_for_tests(mut self, timestamp: i64) -> Self {
@@ -1421,6 +1475,22 @@ impl StorageBuilder {
 
     pub(crate) fn persisted_mmap_budget_bytes(&self) -> usize {
         self.persisted_mmap_budget_bytes
+    }
+
+    pub(crate) fn compaction_interval(&self) -> Duration {
+        self.compaction_interval
+    }
+
+    pub(crate) fn drain_time_budget(&self) -> Duration {
+        self.drain_time_budget
+    }
+
+    pub(crate) fn source_window_segments(&self) -> usize {
+        self.source_window_segments
+    }
+
+    pub(crate) fn output_segment_point_budget(&self) -> usize {
+        self.output_segment_point_budget
     }
 
     pub(crate) fn max_active_partition_heads_per_series(&self) -> usize {
