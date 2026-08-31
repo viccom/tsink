@@ -66,8 +66,8 @@ fn compaction_window_selection_fully_loads_at_most_window_segments() {
         .unwrap()
         .series_id;
 
-    // One overlapping cluster of 20 L0 segments: the window must pick 8 of
-    // them, and planning must fully load only those 8 — not the whole level.
+    // One overlapping cluster of 20 L0 segments: the window must pick 16 of
+    // them, and planning must fully load only those 16 — not the whole level.
     for segment_id in 1..=20u64 {
         write_level_segment(
             &temp_dir,
@@ -95,14 +95,14 @@ fn compaction_window_selection_fully_loads_at_most_window_segments() {
         super::DEFAULT_SOURCE_WINDOW_SEGMENTS
     );
 
-    // Window semantics are unchanged: the 8 lowest-id segments of the cluster
-    // are compacted away and the rest of the level stays untouched.
+    // Window semantics are unchanged: the 16 lowest-id segments of the
+    // cluster are compacted away and the rest of the level stays untouched.
     let remaining_l0_ids = load_segments_for_level(temp_dir.path(), 0)
         .unwrap()
         .into_iter()
         .map(|segment| segment.manifest.segment_id)
         .collect::<Vec<_>>();
-    assert_eq!(remaining_l0_ids, (9..=20).collect::<Vec<_>>());
+    assert_eq!(remaining_l0_ids, (17..=20).collect::<Vec<_>>());
     assert_eq!(
         load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
         1,
@@ -364,13 +364,19 @@ fn compactor_limits_source_window_per_pass() {
         .unwrap()
         .series_id;
 
-    for segment_id in 1..=6 {
+    // 18 L0 segments whose time ranges form one overlapping chain (segment i
+    // spans [2(i-1), 2(i-1)+17]), so window selection runs on the
+    // overlap-cluster path where only the source window cap can bound the
+    // pass. A window of 16 consumes segments 1..=16 and leaves the two
+    // newest untouched; every timestamp stays unique across segments.
+    for segment_id in 1..=18u64 {
+        let i = segment_id as i64 - 1;
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
             vec![make_numeric_chunk(
                 series_id,
-                &[(segment_id as i64, segment_id as f64)],
+                &[(2 * i, i as f64), (2 * i + 17, 100.0)],
             )],
         );
         SegmentWriter::new(temp_dir.path(), 0, segment_id)
@@ -391,7 +397,7 @@ fn compactor_limits_source_window_per_pass() {
         l0.iter()
             .map(|segment| segment.manifest.segment_id)
             .collect::<Vec<_>>(),
-        vec![5, 6]
+        vec![17, 18]
     );
 }
 
@@ -611,6 +617,79 @@ fn compaction_output_budget_eight_million_reduces_segment_count() {
     assert!(l0.is_empty());
     assert_eq!(l1.len(), 1);
     assert_eq!(l1[0].manifest.point_count, 8_000_000);
+}
+
+#[test]
+fn compaction_source_window_sixteen_merges_sixteen_l0_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "window")])
+        .unwrap()
+        .series_id;
+
+    // 16 L0 flush-sized segments (~1M points each) with timestamps interleaved
+    // modulo 16: every segment time range overlaps its neighbours (one
+    // overlap cluster, so a single window may take all 16) while every point
+    // timestamp stays unique across segments (the merged total is exactly 16M
+    // distinct points, no dedup shrinkage). An 8-segment window swallowed only
+    // half the cluster per pass; with the window at 16 and the 8M-point output
+    // budget, one pass must take the whole 16M-point window and re-emit it as
+    // exactly two budget-sized L1 segments (16M / 8,388,608).
+    for segment_index in 0..16u64 {
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            (0..16)
+                .map(|chunk_index| {
+                    let k_start = chunk_index * 62_500;
+                    make_numeric_chunk(
+                        series_id,
+                        &(k_start..k_start + 62_500)
+                            .map(|k| {
+                                let ts = segment_index as i64 + 16 * k;
+                                (ts, ts as f64)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        SegmentWriter::new(temp_dir.path(), 0, segment_index + 1)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 2048);
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(
+        stats.source_segments, 16,
+        "a 16-segment source window must swallow the whole overlap cluster"
+    );
+    assert_eq!(
+        stats.output_segments, 2,
+        "16x1M-point overlapping L0 segments must re-emit as two budget-sized \
+         L1 output segments (16M points / 8M budget), got {}",
+        stats.output_segments
+    );
+    assert_eq!(stats.output_points, 16_000_000);
+
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert!(l0.is_empty());
+    assert_eq!(l1.len(), 2);
+    assert_eq!(
+        l1.iter()
+            .map(|segment| segment.manifest.point_count)
+            .sum::<usize>(),
+        16_000_000
+    );
+    assert!(l1
+        .iter()
+        .all(|segment| segment.manifest.point_count <= 8_388_608 + 2048));
 }
 
 #[test]

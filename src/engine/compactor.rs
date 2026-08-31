@@ -32,7 +32,13 @@ pub(in crate::engine) use self::execution::finalize_pending_compaction_replaceme
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
-const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
+/// Source window: how many same-level segments one compaction pass may merge.
+/// Raised from 8 to 16 so a single pass amortizes the per-pass fixed costs
+/// (marker directory scan, tombstone parse, full-level survey, drain-budget
+/// yield park) over twice the input. Paired with the 8M-point output budget,
+/// a full window of 16x1M-point L0 shards re-emits as 2x8M L1 segments
+/// instead of leaving half the backlog for the next pass.
+const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16;
 /// Point budget for one compaction output segment, independent of the chunk
 /// point cap. It used to be `chunk_point_cap * 512`, which silently shrank the
 /// budget (and multiplied the output segment / file count by the same factor)
