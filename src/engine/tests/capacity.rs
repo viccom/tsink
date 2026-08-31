@@ -20,6 +20,7 @@ fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) 
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -413,6 +414,7 @@ fn memory_budget_rejects_registry_heavy_new_series_before_mutating_registry() {
             max_writers: 1,
             write_timeout: Duration::ZERO,
             memory_budget_bytes: 2_048,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -774,6 +776,7 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
         loaded.next_segment_id,
         ChunkStorageOptions {
             memory_budget_bytes: 1_000_000,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             background_threads_enabled: false,
             background_fail_fast: false,
             ..ChunkStorageOptions::default()
@@ -1165,6 +1168,7 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
             max_writers: 1,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             cardinality_limit: 1,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

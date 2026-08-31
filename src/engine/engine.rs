@@ -94,7 +94,7 @@ pub(in crate::engine::storage_engine) use core_impl::{
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
 use state::{
-    ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey,
+    ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, SegmentMapRegistry,
     SeriesVisibilityRangeSummary, SeriesVisibilitySummary, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT,
     SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
 };
@@ -173,6 +173,9 @@ struct VisibilityState {
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
     persisted_index: RwLock<PersistedIndexState>,
+    /// Resident segment-map cache (byte budget + LRU eviction); always
+    /// locked nested inside `persisted_index`, never the reverse.
+    segment_maps: SegmentMapRegistry,
     persisted_index_dirty: Arc<AtomicBool>,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,

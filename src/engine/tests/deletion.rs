@@ -939,12 +939,7 @@ fn metadata_queries_reuse_cached_tombstone_liveness_without_persisted_payloads()
     for shard in &storage.chunks.sealed_chunks {
         shard.write().clear();
     }
-    storage
-        .persisted
-        .persisted_index
-        .write()
-        .segment_maps
-        .clear();
+    storage.persisted.segment_maps.evict_all_for_tests();
 
     assert_eq!(
         storage.list_metrics().unwrap(),
@@ -997,12 +992,7 @@ fn metadata_queries_rebuild_tombstone_liveness_cache_across_restart() {
     for shard in &reopened.chunks.sealed_chunks {
         shard.write().clear();
     }
-    reopened
-        .persisted
-        .persisted_index
-        .write()
-        .segment_maps
-        .clear();
+    reopened.persisted.segment_maps.evict_all_for_tests();
 
     assert_eq!(
         reopened.list_metrics().unwrap(),

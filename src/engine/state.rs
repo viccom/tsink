@@ -4,6 +4,8 @@ mod active;
 mod persisted;
 #[path = "state/sealed.rs"]
 mod sealed;
+#[path = "state/segment_maps.rs"]
+mod segment_maps;
 #[path = "state/snapshot.rs"]
 mod snapshot;
 
@@ -15,6 +17,7 @@ pub(super) use persisted::{
     PersistedSeriesTimeRangeSummary,
 };
 pub(super) use sealed::SealedChunkKey;
+pub(super) use segment_maps::SegmentMapRegistry;
 #[cfg(test)]
 pub(in crate::engine) use snapshot::{
     active_series_snapshot_flatten_count, active_series_snapshot_point_count,

@@ -514,6 +514,7 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

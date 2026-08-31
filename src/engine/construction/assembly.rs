@@ -54,6 +54,7 @@ impl StorageStateAssembly {
                 options.remote_segment_refresh_interval,
                 persisted_index_dirty,
                 pending_persisted_segment_diff,
+                options.persisted_mmap_budget_bytes,
             ),
             runtime: Self::build_runtime_config_state(options),
             memory: Self::build_memory_accounting_state(options),
@@ -106,9 +107,11 @@ impl StorageStateAssembly {
         remote_segment_refresh_interval: Duration,
         persisted_index_dirty: Arc<AtomicBool>,
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
+        persisted_mmap_budget_bytes: usize,
     ) -> PersistedStorageState {
         PersistedStorageState {
             persisted_index: RwLock::new(PersistedIndexState::default()),
+            segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
             persisted_index_dirty,
             numeric_lane_path,
             blob_lane_path,

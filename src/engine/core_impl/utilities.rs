@@ -276,6 +276,21 @@ pub(in crate::engine::storage_engine) fn persisted_chunk_payload<'a>(
 }
 
 impl ChunkStorage {
+    /// Resolves a persisted segment slot to its resident mapping,
+    /// transparently re-mapping the chunks file when the registry evicted
+    /// it under the global persisted-mmap budget. Unknown slots (segment
+    /// absent from the index) stay a corruption error.
+    pub(in crate::engine::storage_engine) fn resolve_persisted_segment_map(
+        &self,
+        slot: usize,
+    ) -> Result<Arc<PlatformMmap>> {
+        self.persisted
+            .segment_maps
+            .get_or_remap(slot)?
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(format!("missing mapped segment slot {slot}"))
+            })
+    }
     pub(in crate::engine::storage_engine) fn ensure_open(&self) -> Result<()> {
         if self
             .observability

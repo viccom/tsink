@@ -71,6 +71,7 @@ mod persistence_segments;
 mod reliability;
 mod retention_policy;
 mod rollups;
+mod segment_map_residency;
 mod series_selection;
 
 /// Lists on-disk WAL segments as `(segment_id, size_bytes)`, sorted by id.

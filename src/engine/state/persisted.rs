@@ -131,7 +131,6 @@ pub(in crate::engine::storage_engine) struct PersistedIndexState {
     pub(in crate::engine::storage_engine) chunk_refs: HashMap<SeriesId, Vec<PersistedChunkRef>>,
     pub(in crate::engine::storage_engine) chunk_timestamp_indexes:
         HashMap<u64, OnceLock<TimestampSearchIndex>>,
-    pub(in crate::engine::storage_engine) segment_maps: HashMap<usize, Arc<PlatformMmap>>,
     pub(in crate::engine::storage_engine) segment_tiers: HashMap<usize, PersistedSegmentTier>,
     pub(in crate::engine::storage_engine) segments_by_root:
         BTreeMap<PathBuf, PersistedSegmentState>,

@@ -251,7 +251,12 @@ impl ChunkStorage {
             return Ok(timestamp_search_index);
         }
 
-        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+        let segment_map = self.resolve_persisted_segment_map(chunk_ref.segment_slot)?;
+        let payload = crate::engine::segment::chunk_payload_from_record(
+            segment_map.as_slice(),
+            chunk_ref.chunk_offset,
+            chunk_ref.chunk_len,
+        )?;
         let built = Encoder::build_timestamp_search_index_from_payload(
             chunk_ref.ts_codec,
             chunk_ref.point_count as usize,
@@ -333,7 +338,12 @@ impl ChunkStorage {
             }
             let timestamp_search_index =
                 self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
-            let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+            let segment_map = self.resolve_persisted_segment_map(chunk_ref.segment_slot)?;
+            let payload = crate::engine::segment::chunk_payload_from_record(
+                segment_map.as_slice(),
+                chunk_ref.chunk_offset,
+                chunk_ref.chunk_len,
+            )?;
             return self.latest_visible_timestamp_in_persisted_chunk_payload(
                 chunk_ref,
                 payload.as_ref(),
@@ -356,7 +366,12 @@ impl ChunkStorage {
             return Ok(Some(chunk_ref.max_ts));
         }
 
-        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+        let segment_map = self.resolve_persisted_segment_map(chunk_ref.segment_slot)?;
+        let payload = crate::engine::segment::chunk_payload_from_record(
+            segment_map.as_slice(),
+            chunk_ref.chunk_offset,
+            chunk_ref.chunk_len,
+        )?;
         let timestamp_search_index =
             self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
         self.latest_visible_timestamp_in_persisted_chunk_payload(

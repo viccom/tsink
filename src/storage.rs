@@ -11,6 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const DEFAULT_CHUNK_POINTS: usize = 2048;
+
+/// Default cap on resident segment-map bytes (the persisted-mmap memory
+/// component). Segment mappings are re-materialized from their chunks file
+/// on demand after eviction, so the cap bounds the commit growth seen when
+/// residency tracked total segment data. `usize::MAX` disables the cap.
+pub const DEFAULT_PERSISTED_MMAP_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
@@ -1056,6 +1062,7 @@ pub struct StorageBuilder {
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
+    persisted_mmap_budget_bytes: usize,
     cardinality_limit: usize,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
@@ -1090,6 +1097,7 @@ impl Default for StorageBuilder {
             partition_duration: Duration::from_secs(3600),
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
+            persisted_mmap_budget_bytes: DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
@@ -1246,6 +1254,20 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets the global byte budget for resident segment mappings
+    /// (persisted-mmap bytes). Once the resident total exceeds the budget,
+    /// the least recently used segment mappings are evicted and
+    /// transparently re-mapped from their chunks file on the next access.
+    ///
+    /// This bounds the memory component that otherwise grows monotonically
+    /// with total on-disk segment data. `usize::MAX` disables the cap;
+    /// defaults to [`DEFAULT_PERSISTED_MMAP_BUDGET_BYTES`] (4 GiB).
+    #[must_use]
+    pub fn with_persisted_mmap_budget_bytes(mut self, bytes: usize) -> Self {
+        self.persisted_mmap_budget_bytes = bytes;
+        self
+    }
+
     /// Sets a hard upper bound for total series cardinality.
     ///
     /// New metric+label combinations are rejected once the limit is reached.
@@ -1395,6 +1417,10 @@ impl StorageBuilder {
 
     pub(crate) fn memory_limit_bytes(&self) -> usize {
         self.memory_limit_bytes
+    }
+
+    pub(crate) fn persisted_mmap_budget_bytes(&self) -> usize {
+        self.persisted_mmap_budget_bytes
     }
 
     pub(crate) fn max_active_partition_heads_per_series(&self) -> usize {

@@ -91,13 +91,15 @@ impl QuerySnapshotContext<'_> {
         snapshot.segment_maps.reserve(segment_slots.len());
         snapshot.segment_tiers.reserve(segment_slots.len());
         for slot in &segment_slots {
-            let Some(segment_map) = persisted_index.segment_maps.get(slot) else {
+            // Resolution may transparently re-map a slot the registry
+            // evicted under the persisted-mmap budget; slots absent from
+            // the registry entirely are index corruption.
+            let Some(segment_map) = self.segment_maps.get_or_remap(*slot)? else {
                 return Err(TsinkError::DataCorruption(format!(
-                    "missing mapped segment slot {}",
-                    slot
+                    "missing mapped segment slot {slot}"
                 )));
             };
-            snapshot.segment_maps.insert(*slot, Arc::clone(segment_map));
+            snapshot.segment_maps.insert(*slot, segment_map);
             snapshot.segment_tiers.insert(
                 *slot,
                 persisted_index

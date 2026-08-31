@@ -402,9 +402,6 @@ impl ChunkStorage {
             u64,
             std::sync::OnceLock<crate::engine::encoder::TimestampSearchIndex>,
         >(&index.chunk_timestamp_indexes))
-        .saturating_add(
-            Self::hash_map_memory_usage_bytes::<usize, Arc<PlatformMmap>>(&index.segment_maps),
-        )
         .saturating_add(Self::hash_map_memory_usage_bytes::<
             usize,
             super::super::tiering::PersistedSegmentTier,
@@ -431,15 +428,6 @@ impl ChunkStorage {
             ));
         }
         bytes
-    }
-
-    pub(in super::super) fn persisted_index_persisted_mmap_bytes(
-        index: &PersistedIndexState,
-    ) -> usize {
-        index
-            .segment_maps
-            .values()
-            .fold(0usize, |acc, mapped| acc.saturating_add(mapped.len()))
     }
 
     pub(in super::super) fn prune_empty_active_series(&self) {
