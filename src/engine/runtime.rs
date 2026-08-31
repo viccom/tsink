@@ -35,6 +35,20 @@ enum BackgroundWorkerPass<G> {
     Exit,
 }
 
+/// Time budget for one background compaction drain pass. The budget gates
+/// *starting* the next window compaction, so a pass bounds its compaction
+/// gate hold to roughly `budget + one compaction` instead of draining an
+/// unbounded backlog in one go.
+const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+/// Park interval between compaction passes while the previous pass stopped
+/// budget-exhausted with eligible work still pending. At ~90k points/s of
+/// fresh L0 (one 1M-point segment every ~11s), a single window pass per 5s
+/// interval cannot keep up (~130 net backlog segments/hour observed); the
+/// expedited cadence lets drain passes catch up and then relaxes back to the
+/// configured interval once quiescent.
+const COMPACTION_BACKLOG_PARK_INTERVAL: Duration = Duration::from_secs(1);
+
 struct BackgroundWorkerControl<'a> {
     lifecycle: &'a AtomicU8,
     observability: &'a StorageObservabilityCounters,
@@ -270,41 +284,54 @@ impl ChunkStorage {
 
         let handle = std::thread::Builder::new()
             .name("tsink-compaction".to_string())
-            .spawn(move || loop {
-                std::thread::park_timeout(compaction_interval);
+            .spawn(move || {
+                // Backlog-adaptive cadence: the configured interval when the
+                // last pass drained to quiescence, the expedited interval while
+                // a pass ended budget-exhausted with eligible work remaining.
+                let mut park_interval = compaction_interval;
+                loop {
+                    std::thread::park_timeout(park_interval);
 
-                let Some(lifecycle) = lifecycle.upgrade() else {
-                    break;
-                };
+                    let Some(lifecycle) = lifecycle.upgrade() else {
+                        break;
+                    };
 
-                let control = BackgroundWorkerControl::new(
-                    lifecycle.as_ref(),
-                    observability.as_ref(),
-                    background_fail_fast,
-                );
-                match Self::run_background_worker_pass(
-                    &control,
-                    "compaction",
-                    compaction_interval,
-                    || Self::lock_compaction_gate(compaction_lock.as_ref()),
-                    || {
-                        match Self::compact_compactors_with_changes(
+                    let control = BackgroundWorkerControl::new(
+                        lifecycle.as_ref(),
+                        observability.as_ref(),
+                        background_fail_fast,
+                    );
+                    let mut backlog_remains = false;
+                    match Self::run_background_worker_pass(
+                        &control,
+                        "compaction",
+                        compaction_interval,
+                        || Self::lock_compaction_gate(compaction_lock.as_ref()),
+                        || match Self::drain_compactors_with_budget(
                             numeric_compactor.as_ref(),
                             blob_compactor.as_ref(),
                             Some(observability.as_ref()),
+                            COMPACTION_DRAIN_TIME_BUDGET,
                         ) {
-                            Ok(changes) if !changes.is_empty() => {
-                                pending_persisted_segment_diff.lock().merge(changes);
-                                persisted_index_dirty.store(true, Ordering::SeqCst);
+                            Ok(pass) => {
+                                if !pass.changes.is_empty() {
+                                    pending_persisted_segment_diff.lock().merge(pass.changes);
+                                    persisted_index_dirty.store(true, Ordering::SeqCst);
+                                }
+                                backlog_remains = pass.backlog_remains;
+                                Ok(())
                             }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
-                        }
-                        Ok(())
-                    },
-                ) {
-                    BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
-                    BackgroundWorkerFlow::Exit => break,
+                            Err(err) => Err(err),
+                        },
+                    ) {
+                        BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
+                        BackgroundWorkerFlow::Exit => break,
+                    }
+                    park_interval = if backlog_remains {
+                        COMPACTION_BACKLOG_PARK_INTERVAL.min(compaction_interval)
+                    } else {
+                        compaction_interval
+                    };
                 }
             })?;
 

@@ -82,6 +82,162 @@ fn incremental_segment_paths(snapshot_path: &std::path::Path) -> Vec<std::path::
 }
 
 #[test]
+fn compaction_drain_pass_consumes_l0_backlog_below_trigger_in_one_pass() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("drain_l0_backlog", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // 40 non-overlapping L0 segments: eligible only via the count trigger
+    // (L0 trigger = 4), so each window pass consumes 4 segments. One
+    // `compact_once` per tick leaves 36 behind (the observed field behavior:
+    // ~130 net L0 segments/hour of backlog); a drain pass must keep taking
+    // windows until L0 is below the trigger.
+    for segment_id in 1..=40u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64 * 100, segment_id as f64)],
+        );
+    }
+
+    let compactor = crate::engine::compactor::Compactor::new(&lane_path, 8);
+    let pass = ChunkStorage::drain_compactors_with_budget(
+        Some(&compactor),
+        None,
+        None,
+        Duration::from_secs(300),
+    )
+    .unwrap();
+
+    let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+    assert!(
+        l0.len() < 4,
+        "drain pass must push L0 below the count trigger; {} segments remain",
+        l0.len()
+    );
+    assert!(
+        pass.compaction_runs >= 2,
+        "drain pass must run more than one window compaction; ran {}",
+        pass.compaction_runs
+    );
+    assert!(
+        !pass.backlog_remains,
+        "a drain that reaches quiescence must not report a leftover backlog"
+    );
+}
+
+#[test]
+fn compaction_drain_pass_keeps_l1_to_l2_progressing_alongside_l0_backlog() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("drain_fairness", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // Five overlapping L1 segments only L1->L2 can drain, plus sixteen
+    // overlapping L0 segments that keep L0->L1 continuously eligible. Within
+    // one drain pass the round-robin arbitration must keep handing L1->L2
+    // turns; a drain that only chases L0 until it settles would starve L1->L2
+    // for the whole pass.
+    for (segment_id, ts) in [(1u64, 10i64), (2, 12), (3, 14), (4, 16), (5, 18)] {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            1,
+            segment_id,
+            &[(ts, ts as f64), (ts + 10, 100.0)],
+        );
+    }
+    for offset in 0..16u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            100 + offset,
+            &[(1000 + offset as i64, 1.0), (1010 + offset as i64, 2.0)],
+        );
+    }
+
+    let compactor = crate::engine::compactor::Compactor::new(&lane_path, 8);
+    let pass = ChunkStorage::drain_compactors_with_budget(
+        Some(&compactor),
+        None,
+        None,
+        Duration::from_secs(300),
+    )
+    .unwrap();
+
+    assert!(
+        pass.l0_to_l1_runs > 0,
+        "test setup broken: L0->L1 never ran during the drain"
+    );
+    assert!(
+        pass.l1_to_l2_runs > 0,
+        "drain starved L1->L2: L0->L1 ran {} times, L1->L2 ran {} times",
+        pass.l0_to_l1_runs,
+        pass.l1_to_l2_runs
+    );
+}
+
+#[test]
+fn compaction_drain_pass_yields_once_time_budget_is_exhausted() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("drain_budget", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // Same 40-segment count-trigger backlog as the drain test, but the pass
+    // starts with its time budget already spent: it must still perform one
+    // compaction (a pass never does zero work when work exists) and then
+    // yield instead of draining to quiescence.
+    for segment_id in 1..=40u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64 * 100, segment_id as f64)],
+        );
+    }
+
+    let compactor = crate::engine::compactor::Compactor::new(&lane_path, 8);
+    let pass =
+        ChunkStorage::drain_compactors_with_budget(Some(&compactor), None, None, Duration::ZERO)
+            .unwrap();
+
+    assert!(
+        pass.compaction_runs <= 1,
+        "drain must stop starting new compactions once the time budget is spent; ran {}",
+        pass.compaction_runs
+    );
+    assert!(
+        pass.backlog_remains,
+        "a budget-exhausted stop must flag the backlog so the worker expedites the next pass"
+    );
+    let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(
+        l0.len(),
+        36,
+        "exactly one window of 4 segments may be consumed by the single budgeted compaction"
+    );
+}
+
+#[test]
 fn background_compaction_reduces_l0_segments_while_storage_is_open() {
     use std::thread;
     use std::time::Instant;
