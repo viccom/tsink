@@ -405,25 +405,28 @@ fn compaction_output_point_budget_is_decoupled_from_chunk_point_cap() {
         .unwrap()
         .series_id;
 
-    // 4 non-overlapping L0 segments x 75k points = 300k points total. With
-    // chunk_points=512 the legacy budget (512 x 512 = 262,144) split this
-    // into two output segments; the decoupled ~1M-point budget must keep it
-    // in one segment so tuning chunk_points no longer multiplies the output
-    // segment count.
-    for (segment_id, base_ts) in [(1u64, 0i64), (2, 75_000), (3, 150_000), (4, 225_000)] {
-        let first = (base_ts..base_ts + 40_000)
-            .map(|ts| (ts, ts as f64))
-            .collect::<Vec<_>>();
-        let second = (base_ts + 40_000..base_ts + 75_000)
-            .map(|ts| (ts, ts as f64))
-            .collect::<Vec<_>>();
+    // 4 non-overlapping L0 segments x 600k points = 2.4M points total. The
+    // decoupled output budget is now 8x the L0 flush shard size (8,388,608
+    // points), so the discriminating dataset scales accordingly: with
+    // chunk_points=512 the legacy cap-derived budgets (262,144 / 1,048,576)
+    // split this into multiple output segments; the 8M-point budget must keep
+    // it in one segment so tuning chunk_points no longer multiplies the
+    // output segment count.
+    for (segment_id, base_ts) in [(1u64, 0i64), (2, 600_000), (3, 1_200_000), (4, 1_800_000)] {
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
-            vec![
-                make_numeric_chunk(series_id, &first),
-                make_numeric_chunk(series_id, &second),
-            ],
+            (0..10)
+                .map(|chunk_index| {
+                    let start = base_ts + chunk_index * 60_000;
+                    make_numeric_chunk(
+                        series_id,
+                        &(start..start + 60_000)
+                            .map(|ts| (ts, ts as f64))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
         );
         SegmentWriter::new(temp_dir.path(), 0, segment_id)
             .unwrap()
@@ -436,14 +439,14 @@ fn compaction_output_point_budget_is_decoupled_from_chunk_point_cap() {
     assert!(stats.compacted);
     assert_eq!(
         stats.output_segments, 1,
-        "300k points must stay in one output segment when chunk_points=512 \
-         (legacy budget split this into {})",
+        "2.4M points must stay in one output segment when chunk_points=512 \
+         (the previous 1M-point budget split this into {})",
         stats.output_segments
     );
 
     let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
     assert_eq!(l1.len(), 1);
-    assert_eq!(l1[0].manifest.point_count, 300_000);
+    assert_eq!(l1[0].manifest.point_count, 2_400_000);
 
     let loaded = load_segments(temp_dir.path()).unwrap();
     let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
@@ -451,7 +454,7 @@ fn compaction_output_point_budget_is_decoupled_from_chunk_point_cap() {
         .iter()
         .map(|chunk| chunk.header.point_count as usize)
         .sum::<usize>();
-    assert_eq!(total_points, 300_000);
+    assert_eq!(total_points, 2_400_000);
 }
 
 #[test]
@@ -464,24 +467,25 @@ fn compaction_output_point_budget_keeps_default_chunk_points_behavior() {
         .unwrap()
         .series_id;
 
-    // Same 300k-point shape as the decoupling test, but with the default
-    // chunk_points=2048: the legacy budget (2048 x 512 = 1,048,576) and the
-    // new independent budget agree, so the single-segment behavior of the
-    // default configuration must not change.
-    for (segment_id, base_ts) in [(1u64, 0i64), (2, 75_000), (3, 150_000), (4, 225_000)] {
-        let first = (base_ts..base_ts + 40_000)
-            .map(|ts| (ts, ts as f64))
-            .collect::<Vec<_>>();
-        let second = (base_ts + 40_000..base_ts + 75_000)
-            .map(|ts| (ts, ts as f64))
-            .collect::<Vec<_>>();
+    // Same 2.4M-point shape as the decoupling test, but with the default
+    // chunk_points=2048: the previous budget (2048 x 512 = 1,048,576) would
+    // split this into three output segments; with the 8M-point budget the
+    // default configuration must keep it in a single segment.
+    for (segment_id, base_ts) in [(1u64, 0i64), (2, 600_000), (3, 1_200_000), (4, 1_800_000)] {
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
-            vec![
-                make_numeric_chunk(series_id, &first),
-                make_numeric_chunk(series_id, &second),
-            ],
+            (0..10)
+                .map(|chunk_index| {
+                    let start = base_ts + chunk_index * 60_000;
+                    make_numeric_chunk(
+                        series_id,
+                        &(start..start + 60_000)
+                            .map(|ts| (ts, ts as f64))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
         );
         SegmentWriter::new(temp_dir.path(), 0, segment_id)
             .unwrap()
@@ -496,7 +500,7 @@ fn compaction_output_point_budget_keeps_default_chunk_points_behavior() {
 
     let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
     assert_eq!(l1.len(), 1);
-    assert_eq!(l1[0].manifest.point_count, 300_000);
+    assert_eq!(l1[0].manifest.point_count, 2_400_000);
 }
 
 #[test]
@@ -510,8 +514,8 @@ fn compactor_splits_large_output_into_multiple_segments() {
         .series_id;
 
     for segment_id in 1..=4 {
-        let start = (segment_id as i64 - 1) * 300;
-        let points = (start..start + 300)
+        let start = (segment_id as i64 - 1) * 2_400;
+        let points = (start..start + 2_400)
             .map(|ts| (ts, ts as f64))
             .collect::<Vec<_>>();
 
@@ -525,9 +529,9 @@ fn compactor_splits_large_output_into_multiple_segments() {
 
     // The budget is decoupled from the chunk point cap, so the shard-boundary
     // behavior is exercised with an explicit small budget instead of leaning
-    // on point_cap: 1200 points against a 500-point budget must split, with
+    // on point_cap: 9600 points against a 4000-point budget must split, with
     // every output segment bounded by the budget plus one trailing chunk.
-    let compactor = Compactor::new(temp_dir.path(), 2).with_output_segment_point_budget(500);
+    let compactor = Compactor::new(temp_dir.path(), 2).with_output_segment_point_budget(4_000);
     compactor.compact_once().unwrap();
 
     let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
@@ -536,7 +540,7 @@ fn compactor_splits_large_output_into_multiple_segments() {
     assert!(l1.len() >= 2);
     assert!(l1
         .iter()
-        .all(|segment| segment.manifest.point_count <= 500 + 2));
+        .all(|segment| segment.manifest.point_count <= 4_000 + 2));
 
     let loaded = load_segments(temp_dir.path()).unwrap();
     let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
@@ -544,7 +548,69 @@ fn compactor_splits_large_output_into_multiple_segments() {
         .iter()
         .map(|chunk| chunk.header.point_count as usize)
         .sum::<usize>();
-    assert_eq!(total_points, 1200);
+    assert_eq!(total_points, 9_600);
+}
+
+#[test]
+fn compaction_output_budget_eight_million_reduces_segment_count() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "budget")])
+        .unwrap()
+        .series_id;
+
+    // The "8-in-8-out" regression shape: 8 L0 flush-sized segments (~1M
+    // points each). Each segment's timestamps are interleaved modulo 8 so the
+    // segment time ranges overlap (one window takes all 8) while every point
+    // timestamp stays unique across segments (merged total is exactly 8M
+    // distinct points, no dedup shrinkage). An output budget equal to the L0
+    // shard size re-emitted the 8M merged points as ~8 more 1M segments, so
+    // the level segment count never shrank. The 8M-point budget must collapse
+    // the whole window into a single ~8M-point L1 segment (8 -> 1).
+    for segment_index in 0..8u64 {
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            (0..16)
+                .map(|chunk_index| {
+                    let k_start = chunk_index * 62_500;
+                    make_numeric_chunk(
+                        series_id,
+                        &(k_start..k_start + 62_500)
+                            .map(|k| {
+                                let ts = segment_index as i64 + 8 * k;
+                                (ts, ts as f64)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        SegmentWriter::new(temp_dir.path(), 0, segment_index + 1)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 2048);
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(stats.source_segments, 8);
+    assert_eq!(
+        stats.output_segments, 1,
+        "8x1M-point overlapping L0 segments must collapse into one L1 output \
+         segment, got {}",
+        stats.output_segments
+    );
+    assert_eq!(stats.output_points, 8_000_000);
+
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert!(l0.is_empty());
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].manifest.point_count, 8_000_000);
 }
 
 #[test]

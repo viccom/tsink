@@ -37,9 +37,11 @@ const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
 /// point cap. It used to be `chunk_point_cap * 512`, which silently shrank the
 /// budget (and multiplied the output segment / file count by the same factor)
 /// whenever chunk_points was tuned below its 2048 default (rs-iot runs
-/// chunk_points=512 and got a 4x segment amplification). The value matches
-/// the legacy default behavior exactly: 2048 * 512 = 1,048,576 points.
-const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 1_048_576;
+/// chunk_points=512 and got a 4x segment amplification). It is now 8x the L0
+/// flush shard size (1M points): a budget equal to the shard size made an
+/// L0->L1 merge of 8x1M re-emit ~8x1M ("8-in-8-out"), so the level segment
+/// count never shrank. 8 x 1,048,576 = 8,388,608 points.
+const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 8_388_608;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
