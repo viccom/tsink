@@ -41,6 +41,134 @@ fn sample_histogram() -> NativeHistogram {
     }
 }
 
+fn write_level_segment(
+    temp_dir: &tempfile::TempDir,
+    level: u8,
+    segment_id: u64,
+    series_id: u64,
+    registry: &SeriesRegistry,
+    points: &[(i64, f64)],
+) {
+    let mut chunks = HashMap::new();
+    chunks.insert(series_id, vec![make_numeric_chunk(series_id, points)]);
+    SegmentWriter::new(temp_dir.path(), level, segment_id)
+        .unwrap()
+        .write_segment(registry, &chunks)
+        .unwrap();
+}
+
+#[test]
+fn l1_to_l2_compaction_is_not_starved_by_continuous_l0_arrivals() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // An L1 backlog (5 overlapping segments, eligible via time overlap) that
+    // only L1->L2 compaction can drain, while fresh overlapping L0 segments
+    // keep arriving every pass so L0->L1 is always eligible too.
+    for (segment_id, ts) in [(1u64, 10i64), (2, 12), (3, 14), (4, 16), (5, 18)] {
+        write_level_segment(
+            &temp_dir,
+            1,
+            segment_id,
+            series_id,
+            &registry,
+            &[(ts, ts as f64), (ts + 10, 100.0)],
+        );
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    let mut l0_to_l1_runs = 0usize;
+    let mut l1_to_l2_runs = 0usize;
+
+    for round in 0..8u64 {
+        let base_ts = 100 + (round as i64) * 100;
+        let first_id = 100 + round * 10;
+        write_level_segment(
+            &temp_dir,
+            0,
+            first_id,
+            series_id,
+            &registry,
+            &[(base_ts, 1.0), (base_ts + 50, 2.0)],
+        );
+        write_level_segment(
+            &temp_dir,
+            0,
+            first_id + 1,
+            series_id,
+            &registry,
+            &[(base_ts + 25, 3.0), (base_ts + 75, 4.0)],
+        );
+
+        let stats = compactor.compact_once_with_stats().unwrap();
+        match (stats.source_level, stats.target_level) {
+            (Some(0), Some(1)) => l0_to_l1_runs += 1,
+            (Some(1), Some(2)) => l1_to_l2_runs += 1,
+            _ => {}
+        }
+    }
+
+    assert!(
+        l0_to_l1_runs > 0,
+        "test setup broken: L0->L1 never ran ({l0_to_l1_runs} runs)"
+    );
+    assert!(
+        l1_to_l2_runs > 0,
+        "L1->L2 starved under continuous L0 arrivals: L0->L1 ran {l0_to_l1_runs} times, L1->L2 ran {l1_to_l2_runs} times"
+    );
+}
+
+#[test]
+fn l0_backlog_is_not_starved_by_level_rotation() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // Only L0 has work (12 non-overlapping segments, count-trigger eligible in
+    // windows of 4). While the L0 backlog is at or above the trigger, every
+    // pass must compact L0 regardless of which transition ran last.
+    for segment_id in 1..=12u64 {
+        write_level_segment(
+            &temp_dir,
+            0,
+            segment_id,
+            series_id,
+            &registry,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    let mut l0_to_l1_runs = 0usize;
+    loop {
+        let stats = compactor.compact_once_with_stats().unwrap();
+        if !stats.compacted {
+            break;
+        }
+        assert_eq!(
+            (stats.source_level, stats.target_level),
+            (Some(0), Some(1)),
+            "L0 backlog at trigger must keep winning passes"
+        );
+        l0_to_l1_runs += 1;
+    }
+
+    assert_eq!(
+        l0_to_l1_runs, 3,
+        "expected three window passes over 12 L0 segments"
+    );
+    assert!(load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn compacts_overlapping_l0_segments_into_l1() {
     let temp_dir = TempDir::new().unwrap();

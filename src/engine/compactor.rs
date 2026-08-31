@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,14 @@ const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Level-fair arbitration state: which level transition compacted last.
+/// `LAST_TRANSITION_L0_TO_L1` / `LAST_TRANSITION_L1_TO_L2` make the next pass
+/// prefer the other transition first, so a continuously-triggering L0->L1
+/// cannot starve L1->L2 (the 4640-segment L1 backlog root cause).
+const LAST_TRANSITION_NONE: u8 = 0;
+const LAST_TRANSITION_L0_TO_L1: u8 = 1;
+const LAST_TRANSITION_L1_TO_L2: u8 = 2;
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
@@ -82,6 +90,7 @@ pub struct Compactor {
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
+    last_compacted_transition: Arc<AtomicU8>,
 }
 
 impl Compactor {
@@ -92,6 +101,7 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
+            last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
         }
     }
 
@@ -106,6 +116,7 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
+            last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
         }
     }
 

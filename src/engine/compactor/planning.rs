@@ -1,26 +1,69 @@
 use super::*;
 
+/// Which level transition compacted most recently, as recorded by
+/// [`Compactor::compact_once_with_changes`] through its arbitration pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LevelTransition {
+    L0ToL1,
+    L1ToL2,
+}
+
+impl LevelTransition {
+    fn source(self) -> CompactionLevel {
+        match self {
+            Self::L0ToL1 => CompactionLevel::L0,
+            Self::L1ToL2 => CompactionLevel::L1,
+        }
+    }
+
+    fn target(self) -> CompactionLevel {
+        match self {
+            Self::L0ToL1 => CompactionLevel::L1,
+            Self::L1ToL2 => CompactionLevel::L2,
+        }
+    }
+
+    fn count_trigger(self, compactor: &Compactor) -> usize {
+        match self {
+            Self::L0ToL1 => compactor.l0_trigger,
+            Self::L1ToL2 => compactor.l1_trigger,
+        }
+    }
+
+    fn arbitration_tag(self) -> u8 {
+        match self {
+            Self::L0ToL1 => super::LAST_TRANSITION_L0_TO_L1,
+            Self::L1ToL2 => super::LAST_TRANSITION_L1_TO_L2,
+        }
+    }
+}
+
 impl Compactor {
+    /// Level-fair arbitration: whichever transition compacted last is tried
+    /// second on the next pass. Under sustained writes L0->L1 stays eligible
+    /// forever, so a first-win policy starves L1->L2 and the L1 backlog grows
+    /// without bound (observed: 4640 segments after a 7h run). Round-robin
+    /// keeps both transitions making progress while each level's own trigger
+    /// semantics (count threshold / time overlap, minimum 2 segments) stay
+    /// unchanged; a level that is not eligible simply yields the pass.
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
         finalize_pending_compaction_replacements(&self.data_path)?;
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 
-        if let Some(outcome) = self.try_compact_level(
-            CompactionLevel::L0,
-            CompactionLevel::L1,
-            self.l0_trigger,
-            &tombstones,
-        )? {
-            return Ok(outcome);
-        }
+        let prefer_l1_to_l2 = self.last_compacted_transition.load(Ordering::Acquire)
+            == super::LAST_TRANSITION_L0_TO_L1;
+        let transitions = if prefer_l1_to_l2 {
+            [LevelTransition::L1ToL2, LevelTransition::L0ToL1]
+        } else {
+            [LevelTransition::L0ToL1, LevelTransition::L1ToL2]
+        };
 
-        if let Some(outcome) = self.try_compact_level(
-            CompactionLevel::L1,
-            CompactionLevel::L2,
-            self.l1_trigger,
-            &tombstones,
-        )? {
-            return Ok(outcome);
+        for transition in transitions {
+            if let Some(outcome) = self.try_compact_level(transition, &tombstones)? {
+                self.last_compacted_transition
+                    .store(transition.arbitration_tag(), Ordering::Release);
+                return Ok(outcome);
+            }
         }
 
         Ok(CompactionOutcome::default())
@@ -28,11 +71,12 @@ impl Compactor {
 
     fn try_compact_level(
         &self,
-        source: CompactionLevel,
-        target: CompactionLevel,
-        count_trigger: usize,
+        transition: LevelTransition,
         tombstones: &TombstoneMap,
     ) -> Result<Option<CompactionOutcome>> {
+        let source = transition.source();
+        let target = transition.target();
+        let count_trigger = transition.count_trigger(self);
         let source_level = level_to_u8(source);
         let target_level = level_to_u8(target);
 
