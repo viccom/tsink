@@ -283,7 +283,6 @@ impl ChunkStorage {
         let chunk_entries = indexed_segment.chunk_index.entries;
 
         let segment_slot = persisted_index.next_segment_slot;
-        let mut refs_by_series = HashMap::<SeriesId, Vec<PersistedChunkRef>>::new();
         let mut series_time_summaries =
             HashMap::<SeriesId, state::PersistedSeriesTimeRangeSummary>::new();
         let mut time_bucket_postings = segment_manifest
@@ -323,10 +322,6 @@ impl ChunkStorage {
                 segment_slot,
             };
 
-            refs_by_series
-                .entry(entry.series_id)
-                .or_default()
-                .push(chunk_ref);
             if let Some(time_bucket_postings) = time_bucket_postings.as_mut() {
                 time_bucket_postings.insert_series_range(
                     entry.series_id,
@@ -362,9 +357,6 @@ impl ChunkStorage {
             .segment_tiers
             .insert(segment_slot, segment_tier);
 
-        for refs in refs_by_series.values_mut() {
-            Self::sort_persisted_chunk_refs(refs.as_mut_slice());
-        }
         for series_id in &affected_series {
             if let Some(refs) = persisted_index.chunk_refs.get_mut(series_id) {
                 Self::sort_persisted_chunk_refs(refs.as_mut_slice());
@@ -380,7 +372,6 @@ impl ChunkStorage {
                 manifest: segment_manifest,
                 time_bucket_postings,
                 series_time_summaries,
-                chunk_refs_by_series: refs_by_series,
             },
         );
 
@@ -395,7 +386,7 @@ impl ChunkStorage {
         persisted_index: &mut PersistedIndexState,
         root: &Path,
     ) -> (Vec<SeriesId>, Vec<SeriesId>, Vec<usize>) {
-        let Some(mut removed_segment) = persisted_index.segments_by_root.remove(root) else {
+        let Some(removed_segment) = persisted_index.segments_by_root.remove(root) else {
             return (Vec::new(), Vec::new(), Vec::new());
         };
 
@@ -405,20 +396,24 @@ impl ChunkStorage {
             .remove(&removed_segment.segment_slot);
         let mut affected_series = BTreeSet::new();
         let mut fully_removed_series = Vec::new();
-        for (series_id, removed_refs) in std::mem::take(&mut removed_segment.chunk_refs_by_series) {
+        // `series_time_summaries` is populated by the same per-chunk loop that
+        // feeds the global chunk refs, so its keys are exactly the series with
+        // refs in this segment; the global refs are filtered back out by
+        // `segment_slot` (sequences are unique per chunk).
+        for series_id in removed_segment.series_time_summaries.keys().copied() {
             affected_series.insert(series_id);
-            for removed_ref in &removed_refs {
-                persisted_index
-                    .chunk_timestamp_indexes
-                    .remove(&removed_ref.sequence);
+            let Some(existing_refs) = persisted_index.chunk_refs.get_mut(&series_id) else {
+                continue;
+            };
+            for candidate in existing_refs.iter() {
+                if candidate.segment_slot == removed_slot {
+                    persisted_index
+                        .chunk_timestamp_indexes
+                        .remove(&candidate.sequence);
+                }
             }
-            let mut remove_series = false;
-            if let Some(existing_refs) = persisted_index.chunk_refs.get_mut(&series_id) {
-                existing_refs
-                    .retain(|candidate| !removed_refs.iter().any(|removed| removed == candidate));
-                remove_series = existing_refs.is_empty();
-            }
-            if remove_series {
+            existing_refs.retain(|candidate| candidate.segment_slot != removed_slot);
+            if existing_refs.is_empty() {
                 persisted_index.chunk_refs.remove(&series_id);
                 fully_removed_series.push(series_id);
             }

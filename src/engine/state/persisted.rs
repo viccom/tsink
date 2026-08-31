@@ -122,8 +122,6 @@ pub(in crate::engine::storage_engine) struct PersistedSegmentState {
         Option<PersistedSegmentTimeBucketIndex>,
     pub(in crate::engine::storage_engine) series_time_summaries:
         HashMap<SeriesId, PersistedSeriesTimeRangeSummary>,
-    pub(in crate::engine::storage_engine) chunk_refs_by_series:
-        HashMap<SeriesId, Vec<PersistedChunkRef>>,
 }
 
 #[derive(Default)]

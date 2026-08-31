@@ -379,16 +379,6 @@ impl ChunkStorage {
             SeriesId,
             super::super::state::PersistedSeriesTimeRangeSummary,
         >(&state.series_time_summaries));
-        bytes = bytes.saturating_add(Self::hash_map_memory_usage_bytes::<
-            SeriesId,
-            Vec<PersistedChunkRef>,
-        >(&state.chunk_refs_by_series));
-        for refs in state.chunk_refs_by_series.values() {
-            bytes = bytes.saturating_add(
-                refs.capacity()
-                    .saturating_mul(std::mem::size_of::<PersistedChunkRef>()),
-            );
-        }
         bytes
     }
 

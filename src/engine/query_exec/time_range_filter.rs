@@ -183,13 +183,8 @@ impl TimeRangeFilterContext<'_> {
                 && min_ts < end
                 && ChunkStorage::plan_includes_persisted_tier(plan, segment.tier)
         });
-        let result = prune_persisted_exact_scan_candidates(
-            persisted_index.segments_by_root.values(),
-            &series_ids,
-            start,
-            end,
-            plan,
-        );
+        let result =
+            prune_persisted_exact_scan_candidates(&persisted_index, &series_ids, start, end, plan);
         drop(persisted_index);
 
         #[cfg(test)]
