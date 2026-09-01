@@ -885,6 +885,337 @@ fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chunk pass-through fast path (non-overlapping series skip decode/merge).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compaction_passthrough_non_overlapping_chunks_without_decoding() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "passthrough")])
+        .unwrap()
+        .series_id;
+
+    // Function level: two non-overlapping chunks with payloads must pass
+    // through byte-for-byte, built by field-level copies only — never a
+    // whole-chunk clone (which would materialize the decoded points).
+    let first = make_numeric_chunk(series_id, &[(0, 1.0), (5, 2.0)]);
+    let second = make_numeric_chunk(series_id, &[(6, 3.0), (20, 4.0)]);
+    let chunk_refs = [&first, &second];
+
+    crate::engine::chunk::reset_chunk_clone_count();
+    let mut emitted = Vec::new();
+    let passed_through =
+        execution::try_pass_through_series_chunks(series_id, &chunk_refs, 8, None, None, |chunk| {
+            emitted.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(passed_through, "non-overlapping chunks must pass through");
+    assert_eq!(
+        emitted.len(),
+        2,
+        "pass-through must emit exactly one chunk per input chunk"
+    );
+    assert_eq!(
+        crate::engine::chunk::chunk_clone_count(),
+        0,
+        "pass-through emit must never clone a whole chunk"
+    );
+    for (output, source) in emitted.iter().zip(chunk_refs.iter()) {
+        assert!(output.points.is_empty());
+        assert_eq!(output.header.min_ts, source.header.min_ts);
+        assert_eq!(output.header.max_ts, source.header.max_ts);
+        assert_eq!(output.header.point_count, source.header.point_count);
+        assert_eq!(output.header.ts_codec, source.header.ts_codec);
+        assert_eq!(output.header.value_codec, source.header.value_codec);
+        assert_eq!(
+            output.encoded_payload, source.encoded_payload,
+            "pass-through payload must stay byte-for-byte identical"
+        );
+    }
+
+    // End to end: four non-overlapping L0 segments (the default count trigger)
+    // compact into one L1 output whose chunks are the inputs verbatim.
+    let source_windows = [
+        [(0, 1.0), (9, 2.0)],
+        [(10, 3.0), (19, 4.0)],
+        [(20, 5.0), (29, 6.0)],
+        [(30, 7.0), (39, 8.0)],
+    ];
+    for (offset, points) in source_windows.iter().enumerate() {
+        let mut chunks = HashMap::new();
+        chunks.insert(series_id, vec![make_numeric_chunk(series_id, points)]);
+        SegmentWriter::new(temp_dir.path(), 0, offset as u64 + 1)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+
+    // Snapshot the loaded-form payloads before the pass.
+    let mut source_payloads_by_min_ts = HashMap::new();
+    for segment in load_segments_for_level(temp_dir.path(), 0).unwrap() {
+        for chunk in segment.chunks_by_series.get(&series_id).unwrap() {
+            source_payloads_by_min_ts.insert(chunk.header.min_ts, chunk.encoded_payload.clone());
+        }
+    }
+    assert_eq!(source_payloads_by_min_ts.len(), 4);
+
+    crate::engine::chunk::reset_chunk_clone_count();
+    // A shared id allocator keeps the pass from re-loading every segment
+    // just to allocate the output id, so the only remaining clones are the
+    // four window loads (one per input chunk, loader.rs chunk materialize).
+    let compactor =
+        Compactor::new_with_segment_id_allocator(temp_dir.path(), 8, Arc::new(AtomicU64::new(100)));
+    let stats = compactor.compact_once_with_stats().unwrap();
+
+    assert!(stats.compacted);
+    assert_eq!(stats.source_points, 8);
+    assert_eq!(stats.output_points, 8, "pass-through must conserve points");
+    assert_eq!(
+        stats.output_chunks, 4,
+        "pass-through must neither merge nor re-split chunks"
+    );
+    assert_eq!(
+        crate::engine::chunk::chunk_clone_count(),
+        4,
+        "only the four window-load clones may happen; pass-through emit adds none"
+    );
+
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert!(l0.is_empty());
+    assert_eq!(l1.len(), 1);
+    let output_chunks = l1[0].chunks_by_series.get(&series_id).unwrap();
+    assert_eq!(output_chunks.len(), 4);
+    for chunk in output_chunks {
+        assert_eq!(
+            chunk.encoded_payload,
+            *source_payloads_by_min_ts
+                .get(&chunk.header.min_ts)
+                .expect("output chunk min_ts must match a source chunk"),
+            "reloaded output payload must be byte-for-byte identical to its source"
+        );
+    }
+}
+
+#[test]
+fn compaction_passthrough_falls_back_on_time_overlap() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "overlap-fallback")])
+        .unwrap()
+        .series_id;
+
+    // Closed ranges sharing the ts=20 endpoint overlap — the same predicate
+    // the query-side scan uses (query_read/analysis.rs) — so pass-through
+    // must decline and leave the decode/merge path in charge.
+    let first = make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)]);
+    let second = make_numeric_chunk(series_id, &[(20, 3.0), (30, 4.0)]);
+    let chunk_refs = [&first, &second];
+
+    let mut emitted = 0usize;
+    let passed_through =
+        execution::try_pass_through_series_chunks(series_id, &chunk_refs, 8, None, None, |_| {
+            emitted += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        !passed_through,
+        "a shared timestamp must force the decode path"
+    );
+    assert_eq!(emitted, 0, "a declined pass-through must not emit anything");
+
+    // End to end: overlapping segments keep the decode/merge semantics of
+    // compacts_overlapping_l0_segments_into_l1 (one ordered chunk, exact
+    // duplicates of ts+value deduped, distinct same-ts values both kept).
+    let mut seg1_chunks = HashMap::new();
+    seg1_chunks.insert(series_id, vec![first]);
+    let mut seg2_chunks = HashMap::new();
+    seg2_chunks.insert(series_id, vec![second]);
+
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &seg1_chunks)
+        .unwrap();
+    SegmentWriter::new(temp_dir.path(), 0, 2)
+        .unwrap()
+        .write_segment(&registry, &seg2_chunks)
+        .unwrap();
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.compact_once().unwrap();
+
+    let loaded = load_segments(temp_dir.path()).unwrap();
+    let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
+    assert_eq!(chunks.len(), 1, "overlapping chunks must merge into one");
+    assert_eq!(chunks[0].header.point_count, 4);
+    let timestamps = execution::decode_chunk_points_for_compaction(&chunks[0])
+        .unwrap()
+        .into_iter()
+        .map(|point| point.ts)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, vec![10, 20, 20, 30]);
+}
+
+#[test]
+fn compaction_passthrough_falls_back_on_tombstones() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "tombstone-fallback")])
+        .unwrap()
+        .series_id;
+
+    // The fallback is deliberately conservative this round: any tombstone
+    // range for the series — even one intersecting nothing — declines
+    // pass-through, because point-level filtering is only correct there.
+    let first = make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)]);
+    let second = make_numeric_chunk(series_id, &[(30, 3.0), (40, 4.0)]);
+    let chunk_refs = [&first, &second];
+    let ranges = [TombstoneRange { start: 5, end: 6 }];
+
+    let mut emitted = 0usize;
+    let passed_through = execution::try_pass_through_series_chunks(
+        series_id,
+        &chunk_refs,
+        8,
+        Some(&ranges),
+        None,
+        |_| {
+            emitted += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        !passed_through,
+        "tombstoned series must force the decode path"
+    );
+    assert_eq!(emitted, 0, "a declined pass-through must not emit anything");
+
+    // End to end: tombstoned points stay purged
+    // (compactor_purges_tombstoned_points semantics; the overlapping source
+    // segments are what makes the pass eligible).
+    let mut seg1_chunks = HashMap::new();
+    seg1_chunks.insert(
+        series_id,
+        vec![make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)])],
+    );
+    let mut seg2_chunks = HashMap::new();
+    seg2_chunks.insert(
+        series_id,
+        vec![make_numeric_chunk(series_id, &[(15, 3.0), (30, 4.0)])],
+    );
+
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &seg1_chunks)
+        .unwrap();
+    SegmentWriter::new(temp_dir.path(), 0, 2)
+        .unwrap()
+        .write_segment(&registry, &seg2_chunks)
+        .unwrap();
+
+    let mut tombstones = HashMap::new();
+    tombstones.insert(series_id, vec![TombstoneRange { start: 15, end: 21 }]);
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    assert!(compactor.compact_once().unwrap());
+
+    let loaded = load_segments(temp_dir.path()).unwrap();
+    let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
+    let timestamps = execution::decode_chunk_points_for_compaction(&chunks[0])
+        .unwrap()
+        .into_iter()
+        .map(|point| point.ts)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, vec![10, 30]);
+}
+
+#[test]
+fn compaction_passthrough_falls_back_when_retention_cutoff_set() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "retention-fallback")])
+        .unwrap()
+        .series_id;
+
+    // Retention rewrites drop points below the cutoff, so even non-
+    // overlapping chunks must take the decode path.
+    let first = make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)]);
+    let second = make_numeric_chunk(series_id, &[(30, 3.0), (40, 4.0)]);
+    let chunk_refs = [&first, &second];
+
+    let mut emitted = 0usize;
+    let passed_through = execution::try_pass_through_series_chunks(
+        series_id,
+        &chunk_refs,
+        8,
+        None,
+        Some(25),
+        |_| {
+            emitted += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        !passed_through,
+        "retention rewrites must force the decode path"
+    );
+    assert_eq!(emitted, 0, "a declined pass-through must not emit anything");
+
+    // End to end: the retention rewrite keeps dropping expired points.
+    let mut chunks = HashMap::new();
+    chunks.insert(
+        series_id,
+        vec![make_numeric_chunk(
+            series_id,
+            &[(1, 1.0), (2, 2.0), (100, 100.0), (101, 101.0)],
+        )],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &chunks)
+        .unwrap();
+
+    let loaded_l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    assert_eq!(loaded_l0.len(), 1);
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    let outcome = compactor
+        .stage_segment_rewrite_with_retention(&loaded_l0[0], 50)
+        .unwrap();
+    assert_eq!(outcome.output_roots.len(), 1);
+
+    let reloaded = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    let output = reloaded
+        .iter()
+        .find(|segment| segment.root == outcome.output_roots[0])
+        .expect("retention rewrite output must be loadable");
+    let timestamps = output
+        .chunks_by_series
+        .get(&series_id)
+        .unwrap()
+        .iter()
+        .flat_map(|chunk| execution::decode_chunk_points_for_compaction(chunk).unwrap())
+        .map(|point| point.ts)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timestamps,
+        vec![100, 101],
+        "expired points must stay pruned"
+    );
+}
+
 fn make_histogram_chunk(series_id: u64, timestamps: &[i64]) -> Chunk {
     let histogram = sample_histogram();
     let points = timestamps

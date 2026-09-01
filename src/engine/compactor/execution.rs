@@ -315,34 +315,46 @@ impl Compactor {
                 };
                 let tombstone_ranges = tombstones.get(&series_id).map(|ranges| ranges.as_slice());
 
-                stream_merge_series_chunks(
+                let mut emit_chunk = |chunk: Chunk| -> Result<()> {
+                    emitted_chunks = emitted_chunks.saturating_add(1);
+                    emitted_points =
+                        emitted_points.saturating_add(chunk.header.point_count as usize);
+                    pending_points =
+                        pending_points.saturating_add(chunk.header.point_count as usize);
+                    pending_chunks.entry(series_id).or_default().push(chunk);
+                    if pending_points >= output_segment_point_budget {
+                        let output_root = self.flush_compacted_segment(
+                            target_level,
+                            &registry,
+                            &pending_chunks,
+                            source_wal_highwater,
+                        )?;
+                        output_roots.push(output_root);
+                        pending_chunks.clear();
+                        pending_points = 0;
+                        emitted_segments = emitted_segments.saturating_add(1);
+                    }
+                    Ok(())
+                };
+
+                let passed_through = try_pass_through_series_chunks(
                     series_id,
                     chunks,
                     self.point_cap,
                     tombstone_ranges,
                     retention_cutoff,
-                    |chunk| {
-                        emitted_chunks = emitted_chunks.saturating_add(1);
-                        emitted_points =
-                            emitted_points.saturating_add(chunk.header.point_count as usize);
-                        pending_points =
-                            pending_points.saturating_add(chunk.header.point_count as usize);
-                        pending_chunks.entry(series_id).or_default().push(chunk);
-                        if pending_points >= output_segment_point_budget {
-                            let output_root = self.flush_compacted_segment(
-                                target_level,
-                                &registry,
-                                &pending_chunks,
-                                source_wal_highwater,
-                            )?;
-                            output_roots.push(output_root);
-                            pending_chunks.clear();
-                            pending_points = 0;
-                            emitted_segments = emitted_segments.saturating_add(1);
-                        }
-                        Ok(())
-                    },
+                    &mut emit_chunk,
                 )?;
+                if !passed_through {
+                    stream_merge_series_chunks(
+                        series_id,
+                        chunks,
+                        self.point_cap,
+                        tombstone_ranges,
+                        retention_cutoff,
+                        &mut emit_chunk,
+                    )?;
+                }
             }
 
             if !pending_chunks.is_empty() {
@@ -489,6 +501,72 @@ fn collect_series_and_chunk_refs<'a>(
     }
 
     Ok((series_by_id.into_values().collect(), chunks_by_series))
+}
+
+/// Fast path for series that need no point-level work during compaction.
+///
+/// When the series' chunk sequence has no time overlap (the closed-range
+/// predicate `next.min_ts <= running previous max_ts`, kept verbatim in sync
+/// with the query-side scan in `query_read/analysis.rs`), no tombstone or
+/// retention filtering applies, every chunk fits `point_cap`, and every chunk
+/// carries an encoded payload, chunks are re-emitted as-is: header and
+/// payload are copied field-by-field (never a whole-chunk `Clone`, never
+/// decoded points) and the segment writer re-compresses the payload on the
+/// way out. Returns `false` without emitting anything whenever any fallback
+/// condition holds (F1-F5), leaving `stream_merge_series_chunks` in charge.
+pub(super) fn try_pass_through_series_chunks<F>(
+    _series_id: SeriesId,
+    chunks: &[&Chunk],
+    point_cap: usize,
+    tombstone_ranges: Option<&[TombstoneRange]>,
+    retention_cutoff: Option<i64>,
+    mut emit_chunk: F,
+) -> Result<bool>
+where
+    F: FnMut(Chunk) -> Result<()>,
+{
+    // F2: any tombstone range for the series forces the decode path. The
+    // conservative whole-series fallback (instead of per-range intersection
+    // pruning) is deliberate this round.
+    if tombstone_ranges.is_some() {
+        return Ok(false);
+    }
+    // F3: retention rewrites drop points below the cutoff.
+    if retention_cutoff.is_some() {
+        return Ok(false);
+    }
+
+    let point_cap = point_cap.max(1);
+    let mut has_previous_chunk = false;
+    let mut previous_max_ts = i64::MIN;
+    for chunk in chunks {
+        // F1: overlap predicate kept verbatim in sync with the query-side
+        // scan (query_read/analysis.rs): closed ranges sharing any timestamp.
+        if has_previous_chunk && chunk.header.min_ts <= previous_max_ts {
+            return Ok(false);
+        }
+        // F4: oversized chunks must be re-split by the merge path.
+        if chunk.header.point_count as usize > point_cap {
+            return Ok(false);
+        }
+        // F5: the segment writer rejects chunks without an encoded payload.
+        if chunk.encoded_payload.is_empty() {
+            return Ok(false);
+        }
+
+        has_previous_chunk = true;
+        previous_max_ts = previous_max_ts.max(chunk.header.max_ts);
+    }
+
+    for chunk in chunks {
+        emit_chunk(Chunk {
+            header: chunk.header.clone(),
+            points: Vec::new(),
+            encoded_payload: chunk.encoded_payload.clone(),
+            wal_highwater: WalHighWatermark::default(),
+        })?;
+    }
+    Ok(true)
 }
 
 fn stream_merge_series_chunks<F>(
