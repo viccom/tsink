@@ -32,6 +32,8 @@ fn test_options(current_time_override: Option<i64>) -> ChunkStorageOptions {
         write_timeout: Duration::from_secs(2),
         memory_budget_bytes: u64::MAX,
         persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+        timestamp_index_cache_budget_bytes:
+            crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
         cardinality_limit: usize::MAX,
         wal_size_limit_bytes: u64::MAX,
         admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

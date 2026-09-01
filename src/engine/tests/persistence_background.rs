@@ -286,6 +286,8 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -374,6 +376,8 @@ fn background_compaction_refreshes_persisted_index_in_background() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -1907,6 +1911,8 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -2066,6 +2072,8 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -2568,6 +2576,8 @@ fn flush_pipeline_completes_while_another_writer_permit_is_held() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3077,6 +3087,8 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3197,6 +3209,8 @@ fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_s
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3337,6 +3351,8 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3498,6 +3514,8 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3597,6 +3615,8 @@ fn flush_pipeline_returns_while_background_post_flush_maintenance_is_staged() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

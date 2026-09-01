@@ -6,7 +6,7 @@ use super::time_range_planner::{
     prune_persisted_exact_scan_candidates, PersistedTimeRangePruneResult,
 };
 use super::{
-    Chunk, ChunkStorage, PersistedChunkRef, PersistedIndexState, Result, SealedChunkKey, SeriesId,
+    Chunk, ChunkStorage, PersistedChunkRef, Result, SealedChunkKey, SeriesId,
     SeriesVisibilitySummary, TimeRangeFilterContext,
 };
 
@@ -89,7 +89,6 @@ impl TimeRangeFilterContext<'_> {
 
     fn persisted_chunk_has_visible_timestamp_in_time_range(
         self,
-        persisted_index: &PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
         start: i64,
         end: i64,
@@ -115,7 +114,6 @@ impl TimeRangeFilterContext<'_> {
         Ok(self
             .ops
             .latest_visible_timestamp_in_persisted_chunk(
-                persisted_index,
                 chunk_ref,
                 tombstone_ranges,
                 start.saturating_sub(1),
@@ -202,7 +200,6 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
     ) -> Result<bool> {
-        let persisted_index = self.persisted_index.read();
         #[cfg(test)]
         if !chunk_refs.is_empty() {
             self.ops
@@ -213,7 +210,6 @@ impl TimeRangeFilterContext<'_> {
         let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
         for chunk_ref in chunk_refs {
             if self.persisted_chunk_has_visible_timestamp_in_time_range(
-                &persisted_index,
                 chunk_ref,
                 start,
                 end,

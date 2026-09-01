@@ -403,6 +403,7 @@ impl ChunkStorage {
             registry: &self.catalog.registry,
             persisted_index: &self.persisted.persisted_index,
             segment_maps: &self.persisted.segment_maps,
+            timestamp_indexes: &self.persisted.timestamp_indexes,
             accounting_enabled: self.memory.accounting_enabled,
             registry_used_bytes: &self.memory.registry_used_bytes,
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,

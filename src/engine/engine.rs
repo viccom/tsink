@@ -96,8 +96,8 @@ use process_lock::DataPathProcessLock;
 pub(crate) use runtime::COMPACTION_DRAIN_TIME_BUDGET;
 use state::{
     ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, SegmentMapRegistry,
-    SeriesVisibilityRangeSummary, SeriesVisibilitySummary, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT,
-    SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
+    SeriesVisibilityRangeSummary, SeriesVisibilitySummary, TimestampIndexCache, BLOB_LANE_ROOT,
+    NUMERIC_LANE_ROOT, SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
 };
 #[cfg(test)]
 use test_hooks::{IngestCommitHook, PersistTestHooks};
@@ -180,6 +180,9 @@ struct PersistedStorageState {
     /// Resident segment-map cache (byte budget + LRU eviction); always
     /// locked nested inside `persisted_index`, never the reverse.
     segment_maps: SegmentMapRegistry,
+    /// Resident timestamp-search-index cache (byte budget + LRU eviction);
+    /// same nesting rule as `segment_maps`.
+    timestamp_indexes: TimestampIndexCache,
     persisted_index_dirty: Arc<AtomicBool>,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,

@@ -142,7 +142,6 @@ impl ChunkStorage {
         if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
             for chunk_ref in chunks {
                 if let Some(chunk_latest) = self.latest_visible_timestamp_in_persisted_chunk(
-                    persisted_index,
                     chunk_ref,
                     tombstone_ranges,
                     latest,
@@ -233,45 +232,43 @@ impl ChunkStorage {
         )
     }
 
-    fn persisted_chunk_timestamp_search_index<'a>(
+    fn persisted_chunk_timestamp_search_index(
         &self,
-        persisted_index: &'a PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
-    ) -> Result<&'a crate::engine::encoder::TimestampSearchIndex> {
-        let timestamp_search_index = persisted_index
-            .chunk_timestamp_indexes
-            .get(&chunk_ref.sequence)
-            .ok_or_else(|| {
-                TsinkError::DataCorruption(format!(
-                    "missing timestamp search index for persisted chunk sequence {}",
-                    chunk_ref.sequence
-                ))
-            })?;
-        if let Some(timestamp_search_index) = timestamp_search_index.get() {
-            return Ok(timestamp_search_index);
+    ) -> Result<Arc<crate::engine::encoder::TimestampSearchIndex>> {
+        if let Some(cached) = self.persisted.timestamp_indexes.get(chunk_ref.sequence) {
+            return Ok(cached);
         }
 
+        // Build outside the cache lock so a slow payload decode cannot stall
+        // concurrent cache lookups; `install` collapses double-builds.
         let segment_map = self.resolve_persisted_segment_map(chunk_ref.segment_slot)?;
         let payload = crate::engine::segment::chunk_payload_from_record(
             segment_map.as_slice(),
             chunk_ref.chunk_offset,
             chunk_ref.chunk_len,
         )?;
-        let built = Encoder::build_timestamp_search_index_from_payload(
+        let built = Arc::new(Encoder::build_timestamp_search_index_from_payload(
             chunk_ref.ts_codec,
             chunk_ref.point_count as usize,
             payload.as_ref(),
-        )?;
-        let built_bytes = built.memory_usage_bytes();
-        if timestamp_search_index.set(built).is_ok() {
+        )?);
+        let installed = self.persisted.timestamp_indexes.install(
+            chunk_ref.sequence,
+            chunk_ref.segment_slot,
+            Arc::clone(&built),
+        );
+        // Account only a fresh install (a concurrent double-build's winner
+        // was already accounted); evicted bytes flow back through the
+        // maintenance recompute.
+        if Arc::ptr_eq(&installed, &built) {
+            let built_bytes = built.memory_usage_bytes();
             self.add_included_memory_component_bytes(
                 &self.memory.persisted_index_used_bytes,
                 built_bytes,
             );
         }
-        Ok(timestamp_search_index
-            .get()
-            .expect("timestamp search index must be initialized after set"))
+        Ok(installed)
     }
 
     fn latest_visible_timestamp_in_persisted_chunk_payload(
@@ -322,7 +319,6 @@ impl ChunkStorage {
 
     pub(super) fn latest_visible_timestamp_in_persisted_chunk(
         &self,
-        persisted_index: &PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
         tombstone_ranges: Option<&[tombstone::TombstoneRange]>,
         floor_exclusive: i64,
@@ -336,8 +332,7 @@ impl ChunkStorage {
             if chunk_ref.max_ts <= ceiling_inclusive {
                 return Ok(Some(chunk_ref.max_ts));
             }
-            let timestamp_search_index =
-                self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
+            let timestamp_search_index = self.persisted_chunk_timestamp_search_index(chunk_ref)?;
             let segment_map = self.resolve_persisted_segment_map(chunk_ref.segment_slot)?;
             let payload = crate::engine::segment::chunk_payload_from_record(
                 segment_map.as_slice(),
@@ -347,7 +342,7 @@ impl ChunkStorage {
             return self.latest_visible_timestamp_in_persisted_chunk_payload(
                 chunk_ref,
                 payload.as_ref(),
-                timestamp_search_index,
+                timestamp_search_index.as_ref(),
                 None,
                 floor_exclusive,
                 ceiling_inclusive,
@@ -372,12 +367,11 @@ impl ChunkStorage {
             chunk_ref.chunk_offset,
             chunk_ref.chunk_len,
         )?;
-        let timestamp_search_index =
-            self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
+        let timestamp_search_index = self.persisted_chunk_timestamp_search_index(chunk_ref)?;
         self.latest_visible_timestamp_in_persisted_chunk_payload(
             chunk_ref,
             payload.as_ref(),
-            timestamp_search_index,
+            timestamp_search_index.as_ref(),
             Some(tombstone_ranges),
             floor_exclusive,
             ceiling_inclusive,

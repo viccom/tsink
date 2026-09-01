@@ -128,9 +128,6 @@ fn fixed_topology_index() -> PersistedIndexState {
                     .entry(*series_id)
                     .or_default()
                     .push(chunk_ref);
-                index
-                    .chunk_timestamp_indexes
-                    .insert(sequence, std::sync::OnceLock::new());
             }
         }
         index
@@ -151,7 +148,11 @@ const DOUBLE_INCLUSIVE_BASELINE: usize = 5290;
 
 /// Double-inclusive baseline minus the segment-local map payload and the
 /// removed per-segment `HashMap` field (2 segments x 48B struct shrink).
-const DEDUPED_EXPECTED: usize = 4106;
+/// Re-measured for the Task 6 timestamp-index LRU cache: the per-chunk
+/// `OnceLock` pre-seats left the persisted index entirely (their map
+/// bookkeeping, ~336B for this topology, now lives in the budgeted cache's
+/// own structures accounting instead).
+const DEDUPED_EXPECTED: usize = 3770;
 
 #[test]
 fn persisted_index_accounting_excludes_segment_local_chunk_ref_copies() {

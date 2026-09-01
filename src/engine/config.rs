@@ -36,6 +36,10 @@ pub(super) struct ChunkStorageOptions {
     pub(super) write_timeout: Duration,
     pub(super) memory_budget_bytes: u64,
     pub(super) persisted_mmap_budget_bytes: usize,
+    /// Global byte budget for resident timestamp-search-index cache entries.
+    /// Default:
+    /// [`DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES`](crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES).
+    pub(super) timestamp_index_cache_budget_bytes: usize,
     pub(super) cardinality_limit: usize,
     pub(super) wal_size_limit_bytes: u64,
     pub(super) admission_poll_interval: Duration,
@@ -91,6 +95,8 @@ impl Default for ChunkStorageOptions {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -180,6 +186,7 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             write_timeout: builder.write_timeout(),
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
             persisted_mmap_budget_bytes: builder.persisted_mmap_budget_bytes(),
+            timestamp_index_cache_budget_bytes: builder.timestamp_index_cache_budget_bytes(),
             cardinality_limit: builder.cardinality_limit(),
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

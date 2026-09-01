@@ -8,6 +8,8 @@ mod sealed;
 mod segment_maps;
 #[path = "state/snapshot.rs"]
 mod snapshot;
+#[path = "state/timestamp_indexes.rs"]
+mod timestamp_indexes;
 
 pub(super) use active::{
     plan_partition_head_open, ActivePartitionHead, ActiveSeriesState, PartitionHeadOpenAction,
@@ -24,6 +26,7 @@ pub(in crate::engine) use snapshot::{
     reset_active_series_snapshot_flatten_count, reset_active_series_snapshot_point_count,
 };
 pub(super) use snapshot::{ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor};
+pub(super) use timestamp_indexes::TimestampIndexCache;
 
 pub(super) const SERIES_VISIBILITY_SUMMARY_MAX_RANGES: usize = 32;
 

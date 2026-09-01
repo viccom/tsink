@@ -80,6 +80,8 @@ fn write_limiter_respects_configured_timeout() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -136,6 +138,8 @@ fn wal_pressure_with_busy_writer_permit_returns_limit_error_not_timeout() {
             write_timeout: Duration::from_millis(100),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: 1,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -190,6 +194,8 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: 1,
                 admission_poll_interval: Duration::from_millis(5),
@@ -266,6 +272,8 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
             write_timeout: Duration::from_millis(100),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -336,6 +344,8 @@ fn memory_admission_backpressure_seals_heads_including_current_head() {
                 write_timeout,
                 memory_budget_bytes: 1_000_000,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: Duration::from_millis(5),
@@ -532,6 +542,8 @@ fn admission_pressure_relief_seals_current_head_when_no_eligible_head_exists() {
                 // the tight pressure budget is stored onto the atomic later.
                 memory_budget_bytes: 1_000_000,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: Duration::from_millis(5),
@@ -683,6 +695,8 @@ fn wal_admission_backpressure_rejects_without_flushing_current_head() {
             write_timeout: Duration::from_millis(25),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: Duration::from_millis(5),
@@ -820,6 +834,8 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: wal_size_limit,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -895,6 +911,8 @@ fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chun
             write_timeout: Duration::ZERO,
             memory_budget_bytes: 64 * 1024 * 1024,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -946,6 +964,8 @@ fn admission_memory_rejection_exports_estimate_and_shortfall_snapshot() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: 64 * 1024 * 1024,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -1029,6 +1049,8 @@ fn close_blocks_until_in_flight_writer_releases_permit() {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

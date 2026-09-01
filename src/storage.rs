@@ -17,6 +17,13 @@ pub(crate) const DEFAULT_CHUNK_POINTS: usize = 2048;
 /// on demand after eviction, so the cap bounds the commit growth seen when
 /// residency tracked total segment data. `usize::MAX` disables the cap.
 pub const DEFAULT_PERSISTED_MMAP_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Default cap on resident timestamp-search-index cache bytes. Indexes are
+/// rebuilt transparently from their chunk payload on the next visibility
+/// read after eviction, so the cap bounds the per-chunk anchor-index
+/// residency that otherwise grows with total persisted chunks. `usize::MAX`
+/// disables the cap.
+pub const DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
@@ -1063,6 +1070,7 @@ pub struct StorageBuilder {
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
     persisted_mmap_budget_bytes: usize,
+    timestamp_index_cache_budget_bytes: usize,
     cardinality_limit: usize,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
@@ -1102,6 +1110,7 @@ impl Default for StorageBuilder {
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
             persisted_mmap_budget_bytes: DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes: DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
@@ -1274,6 +1283,20 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_persisted_mmap_budget_bytes(mut self, bytes: usize) -> Self {
         self.persisted_mmap_budget_bytes = bytes;
+        self
+    }
+
+    /// Sets the global byte budget for resident timestamp-search-index
+    /// cache entries. Once the resident total exceeds the budget, the least
+    /// recently used indexes are evicted and transparently rebuilt from
+    /// their chunk payload on the next visibility read.
+    ///
+    /// This bounds the memory component that otherwise grows monotonically
+    /// with total persisted chunks. `usize::MAX` disables the cap; defaults
+    /// to [`DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES`] (128 MiB).
+    #[must_use]
+    pub fn with_timestamp_index_cache_budget_bytes(mut self, bytes: usize) -> Self {
+        self.timestamp_index_cache_budget_bytes = bytes;
         self
     }
 
@@ -1475,6 +1498,10 @@ impl StorageBuilder {
 
     pub(crate) fn persisted_mmap_budget_bytes(&self) -> usize {
         self.persisted_mmap_budget_bytes
+    }
+
+    pub(crate) fn timestamp_index_cache_budget_bytes(&self) -> usize {
+        self.timestamp_index_cache_budget_bytes
     }
 
     pub(crate) fn compaction_interval(&self) -> Duration {

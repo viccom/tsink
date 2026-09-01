@@ -389,10 +389,6 @@ impl ChunkStorage {
             &index.chunk_refs,
         )
         .saturating_add(Self::hash_map_memory_usage_bytes::<
-            u64,
-            std::sync::OnceLock<crate::engine::encoder::TimestampSearchIndex>,
-        >(&index.chunk_timestamp_indexes))
-        .saturating_add(Self::hash_map_memory_usage_bytes::<
             usize,
             super::super::tiering::PersistedSegmentTier,
         >(&index.segment_tiers))
@@ -406,11 +402,6 @@ impl ChunkStorage {
                 refs.capacity()
                     .saturating_mul(std::mem::size_of::<PersistedChunkRef>()),
             );
-        }
-        for search_index in index.chunk_timestamp_indexes.values() {
-            if let Some(search_index) = search_index.get() {
-                bytes = bytes.saturating_add(search_index.memory_usage_bytes());
-            }
         }
         for (root, state) in &index.segments_by_root {
             bytes = bytes.saturating_add(Self::persisted_segment_state_memory_usage_bytes(

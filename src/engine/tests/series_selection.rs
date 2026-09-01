@@ -2065,6 +2065,8 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -2324,6 +2326,8 @@ fn persisted_merged_postings_update_across_segment_removal_and_re_adoption() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -3116,6 +3120,8 @@ fn reconcile_live_metadata_indexes_uses_timestamp_search_index_for_bounded_overl
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -4474,6 +4480,8 @@ fn retention_sweep_reconciles_live_metadata_indexes_and_shard_scoped_reads() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,

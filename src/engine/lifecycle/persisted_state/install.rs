@@ -22,9 +22,24 @@ impl ChunkStorage {
         mutate: impl FnOnce(&mut PersistedIndexState) -> R,
     ) -> R {
         let mut persisted_index = publication.persisted_index.write();
+        let timestamp_indexes_total = || {
+            publication
+                .timestamp_indexes
+                .structures_memory_usage_bytes()
+                .saturating_add(
+                    usize::try_from(
+                        publication
+                            .timestamp_indexes
+                            .resident_bytes()
+                            .load(Ordering::Acquire),
+                    )
+                    .unwrap_or(usize::MAX),
+                )
+        };
         let before_included = if publication.accounting_enabled {
             Self::persisted_index_included_memory_usage_bytes(&persisted_index)
                 .saturating_add(publication.segment_maps.structures_memory_usage_bytes())
+                .saturating_add(timestamp_indexes_total())
         } else {
             0
         };
@@ -65,7 +80,8 @@ impl ChunkStorage {
             publication.persisted_index_used_bytes,
             before_included,
             Self::persisted_index_included_memory_usage_bytes(&persisted_index)
-                .saturating_add(publication.segment_maps.structures_memory_usage_bytes()),
+                .saturating_add(publication.segment_maps.structures_memory_usage_bytes())
+                .saturating_add(timestamp_indexes_total()),
         );
         account(
             publication.persisted_mmap_used_bytes,
@@ -138,6 +154,7 @@ impl ChunkStorage {
     ) -> Result<PersistedSegmentRemovalStateUpdate> {
         let publication = self.lifecycle_publication_context();
         let segment_maps = &self.persisted.segment_maps;
+        let timestamp_indexes = &self.persisted.timestamp_indexes;
         let metadata_delta = publication.runtime_metadata_delta;
         let state_update = Self::with_lifecycle_persisted_index_publication(
             publication,
@@ -152,9 +169,11 @@ impl ChunkStorage {
                     // Releasing the registry entry inside the same write
                     // section drops the resident mapping (commit) and the
                     // re-map path, so a removed segment cannot be
-                    // resurrected from a deleted chunks file.
+                    // resurrected from a deleted chunks file; the segment's
+                    // cached timestamp indexes go with it.
                     for slot in removed_slots {
                         segment_maps.remove(slot);
+                        timestamp_indexes.remove_for_slot(slot);
                     }
                     removed_any |= !removed_series.is_empty();
                     affected_series.extend(removed_series);
@@ -235,6 +254,7 @@ impl ChunkStorage {
         } = prepared;
         let publication = self.lifecycle_publication_context();
         let registry = &self.persisted.segment_maps;
+        let timestamp_indexes = &self.persisted.timestamp_indexes;
         let metadata_delta = publication.runtime_metadata_delta;
         Self::with_lifecycle_persisted_index_publication(
             publication,
@@ -243,8 +263,11 @@ impl ChunkStorage {
                 // The prepared state renumbers segment slots from scratch,
                 // so the registry is replaced wholesale inside the same
                 // write section; its budget enforcement evicts the least
-                // recently installed mappings on boot reload.
+                // recently installed mappings on boot reload. The timestamp
+                // index cache is cleared for the same reason: every prior
+                // entry is keyed by stale sequences and slots.
                 registry.replace_all(installed_maps);
+                timestamp_indexes.clear();
                 metadata_delta.rebuild_locked(current_persisted_index);
             },
         );
@@ -344,9 +367,6 @@ impl ChunkStorage {
                 .entry(entry.series_id)
                 .or_default()
                 .push(chunk_ref);
-            persisted_index
-                .chunk_timestamp_indexes
-                .insert(sequence, std::sync::OnceLock::new());
             affected_series.insert(entry.series_id);
         }
 
@@ -399,19 +419,14 @@ impl ChunkStorage {
         // `series_time_summaries` is populated by the same per-chunk loop that
         // feeds the global chunk refs, so its keys are exactly the series with
         // refs in this segment; the global refs are filtered back out by
-        // `segment_slot` (sequences are unique per chunk).
+        // `segment_slot` (sequences are unique per chunk). The segment's
+        // cached timestamp indexes are cleared separately by slot (the cache
+        // is bounded, so a slot scan is O(cache size)).
         for series_id in removed_segment.series_time_summaries.keys().copied() {
             affected_series.insert(series_id);
             let Some(existing_refs) = persisted_index.chunk_refs.get_mut(&series_id) else {
                 continue;
             };
-            for candidate in existing_refs.iter() {
-                if candidate.segment_slot == removed_slot {
-                    persisted_index
-                        .chunk_timestamp_indexes
-                        .remove(&candidate.sequence);
-                }
-            }
             existing_refs.retain(|candidate| candidate.segment_slot != removed_slot);
             if existing_refs.is_empty() {
                 persisted_index.chunk_refs.remove(&series_id);
