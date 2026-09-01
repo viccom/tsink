@@ -1,10 +1,7 @@
-use std::sync::OnceLock;
-
 use roaring::RoaringTreemap;
 
 use super::super::tiering::{PersistedSegmentTier, SegmentLaneFamily};
 use super::super::*;
-use crate::engine::encoder::TimestampSearchIndex;
 use crate::engine::segment::SegmentManifest;
 
 const PERSISTED_SEGMENT_TIME_BUCKET_TARGET_COUNT: usize = 32;
@@ -122,16 +119,11 @@ pub(in crate::engine::storage_engine) struct PersistedSegmentState {
         Option<PersistedSegmentTimeBucketIndex>,
     pub(in crate::engine::storage_engine) series_time_summaries:
         HashMap<SeriesId, PersistedSeriesTimeRangeSummary>,
-    pub(in crate::engine::storage_engine) chunk_refs_by_series:
-        HashMap<SeriesId, Vec<PersistedChunkRef>>,
 }
 
 #[derive(Default)]
 pub(in crate::engine::storage_engine) struct PersistedIndexState {
     pub(in crate::engine::storage_engine) chunk_refs: HashMap<SeriesId, Vec<PersistedChunkRef>>,
-    pub(in crate::engine::storage_engine) chunk_timestamp_indexes:
-        HashMap<u64, OnceLock<TimestampSearchIndex>>,
-    pub(in crate::engine::storage_engine) segment_maps: HashMap<usize, Arc<PlatformMmap>>,
     pub(in crate::engine::storage_engine) segment_tiers: HashMap<usize, PersistedSegmentTier>,
     pub(in crate::engine::storage_engine) segments_by_root:
         BTreeMap<PathBuf, PersistedSegmentState>,

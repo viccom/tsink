@@ -35,10 +35,30 @@ pub(super) struct ChunkStorageOptions {
     pub(super) max_writers: usize,
     pub(super) write_timeout: Duration,
     pub(super) memory_budget_bytes: u64,
+    pub(super) persisted_mmap_budget_bytes: usize,
+    /// Global byte budget for resident timestamp-search-index cache entries.
+    /// Default:
+    /// [`DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES`](crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES).
+    pub(super) timestamp_index_cache_budget_bytes: usize,
     pub(super) cardinality_limit: usize,
     pub(super) wal_size_limit_bytes: u64,
     pub(super) admission_poll_interval: Duration,
+    /// Park interval between background compaction passes when the last pass
+    /// drained to quiescence (backlogged passes park on the shorter
+    /// `drain`-cadence interval instead). Default:
+    /// [`DEFAULT_COMPACTION_INTERVAL`](super::DEFAULT_COMPACTION_INTERVAL).
     pub(super) compaction_interval: Duration,
+    /// Time budget one background drain pass may spend starting new window
+    /// compactions before yielding the compaction gate. Default:
+    /// [`COMPACTION_DRAIN_TIME_BUDGET`](super::COMPACTION_DRAIN_TIME_BUDGET).
+    pub(super) drain_time_budget: Duration,
+    /// How many same-level segments one compaction pass may merge. Default:
+    /// [`DEFAULT_SOURCE_WINDOW_SEGMENTS`](crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS).
+    pub(super) source_window_segments: usize,
+    /// Point budget for one compaction output segment, independent of the
+    /// chunk point cap. Default:
+    /// [`DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET`](crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET).
+    pub(super) output_segment_point_budget: usize,
     pub(super) background_threads_enabled: bool,
     pub(super) background_fail_fast: bool,
     pub(super) metadata_shard_count: Option<u32>,
@@ -74,10 +94,17 @@ impl Default for ChunkStorageOptions {
             max_writers: crate::cgroup::default_workers_limit().max(1),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: true,
             background_fail_fast: true,
             metadata_shard_count: None,
@@ -158,10 +185,15 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             max_writers: builder.max_writers(),
             write_timeout: builder.write_timeout(),
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
+            persisted_mmap_budget_bytes: builder.persisted_mmap_budget_bytes(),
+            timestamp_index_cache_budget_bytes: builder.timestamp_index_cache_budget_bytes(),
             cardinality_limit: builder.cardinality_limit(),
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            compaction_interval: builder.compaction_interval(),
+            drain_time_budget: builder.drain_time_budget(),
+            source_window_segments: builder.source_window_segments(),
+            output_segment_point_budget: builder.output_segment_point_budget(),
             background_threads_enabled: {
                 let enabled = has_data_path || needs_compute_only_refresh_worker;
                 #[cfg(test)]

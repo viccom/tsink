@@ -51,4 +51,7 @@ pub use storage_engine as engine;
 pub const STORAGE_FORMAT_VERSION: u16 = 2;
 pub const DEFAULT_CHUNK_POINTS: usize = crate::storage::DEFAULT_CHUNK_POINTS;
 
-pub(crate) use storage_engine::{build_storage, restore_storage_from_snapshot};
+pub(crate) use storage_engine::{
+    build_storage, restore_storage_from_snapshot, COMPACTION_DRAIN_TIME_BUDGET,
+    DEFAULT_COMPACTION_INTERVAL,
+};

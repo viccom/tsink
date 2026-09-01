@@ -4,8 +4,12 @@ mod active;
 mod persisted;
 #[path = "state/sealed.rs"]
 mod sealed;
+#[path = "state/segment_maps.rs"]
+mod segment_maps;
 #[path = "state/snapshot.rs"]
 mod snapshot;
+#[path = "state/timestamp_indexes.rs"]
+mod timestamp_indexes;
 
 pub(super) use active::{
     plan_partition_head_open, ActivePartitionHead, ActiveSeriesState, PartitionHeadOpenAction,
@@ -15,12 +19,14 @@ pub(super) use persisted::{
     PersistedSeriesTimeRangeSummary,
 };
 pub(super) use sealed::SealedChunkKey;
+pub(super) use segment_maps::SegmentMapRegistry;
 #[cfg(test)]
 pub(in crate::engine) use snapshot::{
     active_series_snapshot_flatten_count, active_series_snapshot_point_count,
     reset_active_series_snapshot_flatten_count, reset_active_series_snapshot_point_count,
 };
 pub(super) use snapshot::{ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor};
+pub(super) use timestamp_indexes::TimestampIndexCache;
 
 pub(super) const SERIES_VISIBILITY_SUMMARY_MAX_RANGES: usize = 32;
 

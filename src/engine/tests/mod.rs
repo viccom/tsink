@@ -40,9 +40,9 @@ pub(super) use crate::engine::wal::{
 };
 pub(super) use crate::wal::{WalReplayMode, WalSyncMode};
 pub(super) use crate::{
-    DataPoint, Label, MetricSeries, RemoteSegmentCachePolicy, Row, SeriesMatcher, SeriesPoints,
-    SeriesSelection, Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision, TsinkError,
-    Value,
+    DataPoint, Label, MetricSeries, RemoteSegmentCachePolicy, Row, SeriesMatcher, SeriesMatcherOp,
+    SeriesPoints, SeriesSelection, Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision,
+    TsinkError, Value,
 };
 
 #[path = "fixtures/mod.rs"]
@@ -60,18 +60,22 @@ pub(in crate::engine::storage_engine::tests) use self::fixtures::{
 
 mod admission_control;
 mod capacity;
+mod compaction_builder_override;
 mod deletion;
 mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;
+mod persisted_index_accounting;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
 mod reliability;
 mod retention_policy;
 mod rollups;
+mod segment_map_residency;
 mod series_selection;
+mod timestamp_index_residency;
 
 /// Lists on-disk WAL segments as `(segment_id, size_bytes)`, sorted by id.
 ///

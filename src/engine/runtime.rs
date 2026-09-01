@@ -35,6 +35,26 @@ enum BackgroundWorkerPass<G> {
     Exit,
 }
 
+/// Time budget for one background compaction drain pass. The budget gates
+/// *starting* the next window compaction, so a pass bounds its compaction
+/// gate hold to roughly `budget + one compaction` instead of draining an
+/// unbounded backlog in one go. A 10s budget (27f69c6, reverted) held the
+/// compaction lock near-continuously and starved the persisted-refresh /
+/// maintenance gate enough to stall writers at 100k pts/s (bench bisect
+/// 2026-09-01: 10s+250ms collapsed ingest to <1k pts/s within minutes;
+/// 2s+1s held 50k+). Keep the conservative r3 pacing.
+///
+/// Exposure: `StorageBuilder::with_drain_time_budget` overrides this per
+/// deployment; this constant stays the default.
+pub(crate) const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+/// Park interval between compaction passes while the previous pass stopped
+/// budget-exhausted with eligible work still pending. 250ms (27f69c6,
+/// reverted) left near-zero yield windows for maintenance between long
+/// passes and contributed to the same writer stall; 1s restores the r3
+/// interleaving cadence.
+const COMPACTION_BACKLOG_PARK_INTERVAL: Duration = Duration::from_secs(1);
+
 struct BackgroundWorkerControl<'a> {
     lifecycle: &'a AtomicU8,
     observability: &'a StorageObservabilityCounters,
@@ -261,6 +281,7 @@ impl ChunkStorage {
         persisted_index_dirty: Arc<AtomicBool>,
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
         compaction_interval: Duration,
+        drain_time_budget: Duration,
         observability: Arc<StorageObservabilityCounters>,
         background_fail_fast: bool,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
@@ -270,41 +291,54 @@ impl ChunkStorage {
 
         let handle = std::thread::Builder::new()
             .name("tsink-compaction".to_string())
-            .spawn(move || loop {
-                std::thread::park_timeout(compaction_interval);
+            .spawn(move || {
+                // Backlog-adaptive cadence: the configured interval when the
+                // last pass drained to quiescence, the expedited interval while
+                // a pass ended budget-exhausted with eligible work remaining.
+                let mut park_interval = compaction_interval;
+                loop {
+                    std::thread::park_timeout(park_interval);
 
-                let Some(lifecycle) = lifecycle.upgrade() else {
-                    break;
-                };
+                    let Some(lifecycle) = lifecycle.upgrade() else {
+                        break;
+                    };
 
-                let control = BackgroundWorkerControl::new(
-                    lifecycle.as_ref(),
-                    observability.as_ref(),
-                    background_fail_fast,
-                );
-                match Self::run_background_worker_pass(
-                    &control,
-                    "compaction",
-                    compaction_interval,
-                    || Self::lock_compaction_gate(compaction_lock.as_ref()),
-                    || {
-                        match Self::compact_compactors_with_changes(
+                    let control = BackgroundWorkerControl::new(
+                        lifecycle.as_ref(),
+                        observability.as_ref(),
+                        background_fail_fast,
+                    );
+                    let mut backlog_remains = false;
+                    match Self::run_background_worker_pass(
+                        &control,
+                        "compaction",
+                        compaction_interval,
+                        || Self::lock_compaction_gate(compaction_lock.as_ref()),
+                        || match Self::drain_compactors_with_budget(
                             numeric_compactor.as_ref(),
                             blob_compactor.as_ref(),
                             Some(observability.as_ref()),
+                            drain_time_budget,
                         ) {
-                            Ok(changes) if !changes.is_empty() => {
-                                pending_persisted_segment_diff.lock().merge(changes);
-                                persisted_index_dirty.store(true, Ordering::SeqCst);
+                            Ok(pass) => {
+                                if !pass.changes.is_empty() {
+                                    pending_persisted_segment_diff.lock().merge(pass.changes);
+                                    persisted_index_dirty.store(true, Ordering::SeqCst);
+                                }
+                                backlog_remains = pass.backlog_remains;
+                                Ok(())
                             }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
-                        }
-                        Ok(())
-                    },
-                ) {
-                    BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
-                    BackgroundWorkerFlow::Exit => break,
+                            Err(err) => Err(err),
+                        },
+                    ) {
+                        BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
+                        BackgroundWorkerFlow::Exit => break,
+                    }
+                    park_interval = if backlog_remains {
+                        COMPACTION_BACKLOG_PARK_INTERVAL.min(compaction_interval)
+                    } else {
+                        compaction_interval
+                    };
                 }
             })?;
 

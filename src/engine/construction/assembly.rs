@@ -30,6 +30,7 @@ impl StorageStateAssembly {
             blob_compactor,
             lifecycle,
             compaction_lock,
+            segment_replacement_lock,
             compaction_thread,
             persisted_index_dirty,
             pending_persisted_segment_diff,
@@ -53,10 +54,16 @@ impl StorageStateAssembly {
                 options.remote_segment_refresh_interval,
                 persisted_index_dirty,
                 pending_persisted_segment_diff,
+                options.persisted_mmap_budget_bytes,
+                options.timestamp_index_cache_budget_bytes,
             ),
             runtime: Self::build_runtime_config_state(options),
             memory: Self::build_memory_accounting_state(options),
-            coordination: Self::build_coordination_state(lifecycle, compaction_lock),
+            coordination: Self::build_coordination_state(
+                lifecycle,
+                compaction_lock,
+                segment_replacement_lock,
+            ),
             background: Self::build_background_worker_supervision_state(
                 compaction_thread,
                 options.background_fail_fast,
@@ -101,9 +108,13 @@ impl StorageStateAssembly {
         remote_segment_refresh_interval: Duration,
         persisted_index_dirty: Arc<AtomicBool>,
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
+        persisted_mmap_budget_bytes: usize,
+        timestamp_index_cache_budget_bytes: usize,
     ) -> PersistedStorageState {
         PersistedStorageState {
             persisted_index: RwLock::new(PersistedIndexState::default()),
+            segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
+            timestamp_indexes: TimestampIndexCache::new(timestamp_index_cache_budget_bytes),
             persisted_index_dirty,
             numeric_lane_path,
             blob_lane_path,
@@ -160,6 +171,7 @@ impl StorageStateAssembly {
     fn build_coordination_state(
         lifecycle: Arc<AtomicU8>,
         compaction_lock: Arc<Mutex<()>>,
+        segment_replacement_lock: Arc<Mutex<()>>,
     ) -> CoordinationState {
         CoordinationState {
             post_flush_maintenance_pending: AtomicBool::new(false),
@@ -167,6 +179,7 @@ impl StorageStateAssembly {
             lifecycle,
             background_maintenance_lock: Mutex::new(()),
             compaction_lock,
+            segment_replacement_lock,
             data_path_process_lock: Mutex::new(None),
         }
     }

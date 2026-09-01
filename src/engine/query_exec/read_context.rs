@@ -215,7 +215,6 @@ pub(super) trait TimeRangeFilterOps {
 
     fn latest_visible_timestamp_in_persisted_chunk(
         &self,
-        persisted_index: &PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
         tombstone_ranges: Option<&[crate::engine::tombstone::TombstoneRange]>,
         floor_exclusive: i64,
@@ -379,7 +378,6 @@ impl TimeRangeFilterOps for ChunkStorage {
 
     fn latest_visible_timestamp_in_persisted_chunk(
         &self,
-        persisted_index: &PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
         tombstone_ranges: Option<&[crate::engine::tombstone::TombstoneRange]>,
         floor_exclusive: i64,
@@ -387,7 +385,6 @@ impl TimeRangeFilterOps for ChunkStorage {
     ) -> Result<Option<i64>> {
         ChunkStorage::latest_visible_timestamp_in_persisted_chunk(
             self,
-            persisted_index,
             chunk_ref,
             tombstone_ranges,
             floor_exclusive,

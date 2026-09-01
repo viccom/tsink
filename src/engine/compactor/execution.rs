@@ -1,4 +1,20 @@
 use super::*;
+use tracing::warn;
+
+/// How many ids a compaction output tries before giving up on publish. The
+/// shared allocator starts as a scan-time snapshot, so a segment that appeared
+/// after that snapshot can already occupy the first allocated id.
+const COMPACTION_OUTPUT_PUBLISH_ATTEMPTS: usize = 3;
+
+/// True for the publish failure meaning "another segment already owns this
+/// output id" (see `ensure_publish_target_clear`).
+fn output_segment_id_already_taken(err: &TsinkError) -> bool {
+    matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.starts_with("segment directory already exists")
+    )
+}
 
 fn compaction_replacement_dir(data_path: &Path) -> PathBuf {
     data_path.join(COMPACTION_REPLACEMENT_DIR)
@@ -266,6 +282,8 @@ impl Compactor {
                     output_chunks: 0,
                     source_points,
                     output_points: 0,
+                    passthrough_chunks: 0,
+                    passthrough_points: 0,
                 },
                 source_roots,
                 output_roots: Vec::new(),
@@ -281,15 +299,17 @@ impl Compactor {
             )?;
         }
 
-        let output_segment_point_budget = self
-            .point_cap
-            .saturating_mul(DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER)
-            .max(self.point_cap);
+        // Output segment sizing is decoupled from the chunk point cap: the
+        // budget is a fixed ~1M points (the legacy default-chunk_points
+        // behavior), clamped only so a single chunk always fits.
+        let output_segment_point_budget = self.output_segment_point_budget.max(self.point_cap);
         let mut pending_chunks = HashMap::<SeriesId, Vec<Chunk>>::new();
         let mut pending_points = 0usize;
         let mut emitted_segments = 0usize;
         let mut emitted_chunks = 0usize;
         let mut emitted_points = 0usize;
+        let mut passthrough_chunks = 0usize;
+        let mut passthrough_points = 0usize;
         let mut output_roots = Vec::<PathBuf>::new();
         let write_outputs_result = (|| -> Result<()> {
             for series_def in &series {
@@ -299,34 +319,57 @@ impl Compactor {
                 };
                 let tombstone_ranges = tombstones.get(&series_id).map(|ranges| ranges.as_slice());
 
-                stream_merge_series_chunks(
+                let mut emit_chunk = |chunk: Chunk| -> Result<()> {
+                    emitted_chunks = emitted_chunks.saturating_add(1);
+                    emitted_points =
+                        emitted_points.saturating_add(chunk.header.point_count as usize);
+                    pending_points =
+                        pending_points.saturating_add(chunk.header.point_count as usize);
+                    pending_chunks.entry(series_id).or_default().push(chunk);
+                    if pending_points >= output_segment_point_budget {
+                        let output_root = self.flush_compacted_segment(
+                            target_level,
+                            &registry,
+                            &pending_chunks,
+                            source_wal_highwater,
+                        )?;
+                        output_roots.push(output_root);
+                        pending_chunks.clear();
+                        pending_points = 0;
+                        emitted_segments = emitted_segments.saturating_add(1);
+                    }
+                    Ok(())
+                };
+
+                let passed_through = try_pass_through_series_chunks(
                     series_id,
                     chunks,
                     self.point_cap,
                     tombstone_ranges,
                     retention_cutoff,
-                    |chunk| {
-                        emitted_chunks = emitted_chunks.saturating_add(1);
-                        emitted_points =
-                            emitted_points.saturating_add(chunk.header.point_count as usize);
-                        pending_points =
-                            pending_points.saturating_add(chunk.header.point_count as usize);
-                        pending_chunks.entry(series_id).or_default().push(chunk);
-                        if pending_points >= output_segment_point_budget {
-                            let output_root = self.flush_compacted_segment(
-                                target_level,
-                                &registry,
-                                &pending_chunks,
-                                source_wal_highwater,
-                            )?;
-                            output_roots.push(output_root);
-                            pending_chunks.clear();
-                            pending_points = 0;
-                            emitted_segments = emitted_segments.saturating_add(1);
-                        }
-                        Ok(())
-                    },
+                    &mut emit_chunk,
                 )?;
+                if passed_through {
+                    // The fast path is all-or-nothing per series: `true` means
+                    // every chunk was emitted verbatim, so the counters can be
+                    // summed here without touching the emit closure.
+                    passthrough_chunks = passthrough_chunks.saturating_add(chunks.len());
+                    passthrough_points = passthrough_points.saturating_add(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.header.point_count as usize)
+                            .sum::<usize>(),
+                    );
+                } else {
+                    stream_merge_series_chunks(
+                        series_id,
+                        chunks,
+                        self.point_cap,
+                        tombstone_ranges,
+                        retention_cutoff,
+                        &mut emit_chunk,
+                    )?;
+                }
             }
 
             if !pending_chunks.is_empty() {
@@ -363,6 +406,8 @@ impl Compactor {
                     output_chunks: emitted_chunks,
                     source_points,
                     output_points: emitted_points,
+                    passthrough_chunks,
+                    passthrough_points,
                 },
                 source_roots,
                 output_roots,
@@ -370,6 +415,10 @@ impl Compactor {
         }
 
         if apply_replacement {
+            // Publishing the replacement (marker write + source deletion) is
+            // the only destructive step of a pass; gate exactly this against
+            // the flush persist pipeline, never the multi-GB merge above it.
+            let _replacement_guard = self.segment_replacement_guard();
             let replacement_marker_path =
                 write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
             apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
@@ -386,6 +435,8 @@ impl Compactor {
                 output_chunks: emitted_chunks,
                 source_points,
                 output_points: emitted_points,
+                passthrough_chunks,
+                passthrough_points,
             },
             source_roots,
             output_roots,
@@ -405,13 +456,37 @@ impl Compactor {
             ));
         }
 
-        let next_segment_id = match &self.next_segment_id {
-            Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
-            None => load_segments_runtime_strict(&self.data_path)?.next_segment_id,
-        };
-        let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
-        writer.write_segment_with_wal_highwater(registry, chunks_by_series, wal_highwater)?;
-        Ok(writer.layout().root.clone())
+        // The segment id allocator is seeded from a scan-time snapshot, so a
+        // concurrently appearing segment can already own the id we just
+        // allocated (e.g. a straggler writer from a superseded engine
+        // instance). Publishing under a taken id must not wedge every future
+        // pass on the same collision: skip forward and retry.
+        let mut last_collision = None;
+        for _ in 0..COMPACTION_OUTPUT_PUBLISH_ATTEMPTS {
+            let next_segment_id = match &self.next_segment_id {
+                Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
+                None => load_segments_runtime_strict(&self.data_path)?.next_segment_id,
+            };
+            let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
+            match writer.write_segment_with_wal_highwater(registry, chunks_by_series, wal_highwater)
+            {
+                Ok(_) => return Ok(writer.layout().root.clone()),
+                Err(err) if output_segment_id_already_taken(&err) => {
+                    warn!(
+                        segment_id = next_segment_id,
+                        level = target_level,
+                        "Compaction output segment id already occupied; retrying with the next id"
+                    );
+                    last_collision = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_collision.unwrap_or_else(|| {
+            TsinkError::InvalidConfiguration("cannot flush empty compacted segment".to_string())
+        }))
     }
 }
 
@@ -445,6 +520,72 @@ fn collect_series_and_chunk_refs<'a>(
     }
 
     Ok((series_by_id.into_values().collect(), chunks_by_series))
+}
+
+/// Fast path for series that need no point-level work during compaction.
+///
+/// When the series' chunk sequence has no time overlap (the closed-range
+/// predicate `next.min_ts <= running previous max_ts`, kept verbatim in sync
+/// with the query-side scan in `query_read/analysis.rs`), no tombstone or
+/// retention filtering applies, every chunk fits `point_cap`, and every chunk
+/// carries an encoded payload, chunks are re-emitted as-is: header and
+/// payload are copied field-by-field (never a whole-chunk `Clone`, never
+/// decoded points) and the segment writer re-compresses the payload on the
+/// way out. Returns `false` without emitting anything whenever any fallback
+/// condition holds (F1-F5), leaving `stream_merge_series_chunks` in charge.
+pub(super) fn try_pass_through_series_chunks<F>(
+    _series_id: SeriesId,
+    chunks: &[&Chunk],
+    point_cap: usize,
+    tombstone_ranges: Option<&[TombstoneRange]>,
+    retention_cutoff: Option<i64>,
+    mut emit_chunk: F,
+) -> Result<bool>
+where
+    F: FnMut(Chunk) -> Result<()>,
+{
+    // F2: any tombstone range for the series forces the decode path. The
+    // conservative whole-series fallback (instead of per-range intersection
+    // pruning) is deliberate this round.
+    if tombstone_ranges.is_some() {
+        return Ok(false);
+    }
+    // F3: retention rewrites drop points below the cutoff.
+    if retention_cutoff.is_some() {
+        return Ok(false);
+    }
+
+    let point_cap = point_cap.max(1);
+    let mut has_previous_chunk = false;
+    let mut previous_max_ts = i64::MIN;
+    for chunk in chunks {
+        // F1: overlap predicate kept verbatim in sync with the query-side
+        // scan (query_read/analysis.rs): closed ranges sharing any timestamp.
+        if has_previous_chunk && chunk.header.min_ts <= previous_max_ts {
+            return Ok(false);
+        }
+        // F4: oversized chunks must be re-split by the merge path.
+        if chunk.header.point_count as usize > point_cap {
+            return Ok(false);
+        }
+        // F5: the segment writer rejects chunks without an encoded payload.
+        if chunk.encoded_payload.is_empty() {
+            return Ok(false);
+        }
+
+        has_previous_chunk = true;
+        previous_max_ts = previous_max_ts.max(chunk.header.max_ts);
+    }
+
+    for chunk in chunks {
+        emit_chunk(Chunk {
+            header: chunk.header.clone(),
+            points: Vec::new(),
+            encoded_payload: chunk.encoded_payload.clone(),
+            wal_highwater: WalHighWatermark::default(),
+        })?;
+    }
+    Ok(true)
 }
 
 fn stream_merge_series_chunks<F>(

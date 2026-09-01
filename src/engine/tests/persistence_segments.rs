@@ -346,6 +346,62 @@ fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
 }
 
 #[test]
+fn persist_completes_while_a_compaction_pass_holds_the_compaction_gate() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(lane_path),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "gate_persist",
+            vec![Label::new("host", "a")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    // Simulate a long compaction pass (e.g. a multi-GB window load/merge)
+    // holding the compaction gate for the whole test body.
+    let compaction_guard = storage.compaction_gate();
+
+    let persisting_storage = Arc::clone(&storage);
+    let (persist_done, persist_result) = std::sync::mpsc::channel();
+    let persist_handle = std::thread::spawn(move || {
+        let result = persisting_storage.persist_segment().map(|_| ());
+        let _ = persist_done.send(result);
+    });
+
+    match persist_result.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("persist failed under a concurrent compaction pass: {err}"),
+        Err(_) => panic!(
+            "persist stayed blocked >5s on the compaction gate; a wedged compaction pass stalls mark_durable_through and WAL reclaim until death"
+        ),
+    }
+
+    drop(compaction_guard);
+    persist_handle.join().unwrap();
+    storage.close().unwrap();
+}
+
+#[test]
 fn persist_segment_stamps_wal_highwater_when_wal_is_enabled() {
     let temp_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];
@@ -458,10 +514,17 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -634,6 +697,210 @@ fn wal_disk_usage_stays_bounded_under_sustained_write_persist_cycles() {
 
     let points = storage.select(metric, &labels, 0, 1000).unwrap();
     assert_eq!(points.len() as i64, 3 + 2 * (rounds - 1));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn persist_splits_large_flush_snapshot_into_bounded_l0_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage =
+        persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Milliseconds, 1024);
+
+    // 8 series x 156 sealed chunks x 1024 points = 1,277,952 points: a
+    // snapshot well past a ~1M-point shard budget. The un-sharded writer
+    // turned snapshots like this (rs-iot terminal state: 581MB / 124M points)
+    // into single giant L0 segments whose write + verify + catalog rewrite
+    // cost fed back into ever longer persist cycles.
+    for series_idx in 0..8u64 {
+        let labels = vec![Label::new("host", format!("shard-{series_idx}"))];
+        let base_ts = (series_idx as i64) * 200_000;
+        let rows = (0..156 * 1024)
+            .map(|offset| {
+                Row::with_labels(
+                    "flush_shard_metric",
+                    labels.clone(),
+                    DataPoint::new(base_ts + offset as i64, offset as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+    }
+
+    let outcome = storage.persist_segment_with_outcome().unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(outcome.points, 8 * 156 * 1024);
+    assert!(
+        outcome.segments >= 2,
+        "a 1.28M-point flush snapshot must not persist as one unbounded L0 segment \
+         (segments={})",
+        outcome.segments
+    );
+
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+    assert!(l0.len() >= 2, "on-disk L0 must carry the same shard split");
+    for segment in &l0 {
+        assert!(
+            segment.manifest.point_count <= 1_048_576 + 65_535,
+            "single L0 segment carried {} points; flush persist shards must stay bounded",
+            segment.manifest.point_count
+        );
+    }
+    let persisted_points: usize = l0.iter().map(|segment| segment.manifest.point_count).sum();
+    assert_eq!(persisted_points, 8 * 156 * 1024);
+
+    // Query correctness across shard boundaries after sealed-chunk eviction
+    // pushed the reads onto the persisted view.
+    let labels = vec![Label::new("host", "shard-3")];
+    let points = storage
+        .select("flush_shard_metric", &labels, 600_000, 601_000)
+        .unwrap();
+    assert_eq!(points.len(), 1_000);
+    assert_eq!(points[0].timestamp, 600_000);
+    assert_eq!(points[999].timestamp, 600_999);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn persist_multi_shard_snapshot_marks_full_highwater_durable_and_drains_wal() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+    let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Milliseconds, None);
+    options.retention_enforced = false;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1024,
+        Some(wal),
+        Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    // Chunk-aligned insert per series (156 x 1024 points) so the flush
+    // snapshot covers every appended WAL frame once persist runs. Batches
+    // stay at one chunk cap each because WAL sample frames cap at u16 points.
+    for series_idx in 0..8u64 {
+        let labels = vec![Label::new("host", format!("shard-{series_idx}"))];
+        let base_ts = (series_idx as i64) * 200_000;
+        for chunk_idx in 0..156 {
+            let rows = (0..1024)
+                .map(|offset| {
+                    Row::with_labels(
+                        "flush_shard_wal_metric",
+                        labels.clone(),
+                        DataPoint::new(
+                            base_ts + chunk_idx * 1024 + offset,
+                            (chunk_idx * 1024 + offset) as f64,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            storage.insert_rows(&rows).unwrap();
+        }
+    }
+
+    let wal_bytes_before: u64 = wal_segment_ids_and_size(&wal_dir)
+        .iter()
+        .map(|(_, size)| size)
+        .sum();
+    assert!(
+        wal_bytes_before > 0,
+        "fixture must leave WAL bytes to reclaim after persist"
+    );
+
+    let appended_before_persist = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .current_appended_highwater();
+    assert!(
+        appended_before_persist > WalHighWatermark::default(),
+        "fixture must have appended WAL frames before persist"
+    );
+
+    let outcome = storage.persist_segment_with_outcome().unwrap();
+    assert!(outcome.persisted);
+    assert!(
+        outcome.segments >= 2,
+        "fixture must produce a multi-shard persist (segments={})",
+        outcome.segments
+    );
+
+    // The durable watermark may only advance once every shard of the snapshot
+    // is on disk, and it must then cover the whole appended prefix, so the WAL
+    // reset can drain the log instead of leaking an uncovered tail.
+    let wal = storage.persisted.wal.as_ref().unwrap();
+    assert_eq!(
+        wal.current_durable_highwater(),
+        appended_before_persist,
+        "multi-shard persist must advance the durable watermark to the full \
+         snapshot highwater only after every shard landed"
+    );
+    let wal_bytes_after: u64 = wal_segment_ids_and_size(&wal_dir)
+        .iter()
+        .map(|(_, size)| size)
+        .sum();
+    assert_eq!(
+        wal_bytes_after, 0,
+        "full-coverage persist must drain the WAL (before={wal_bytes_before})"
+    );
+
+    let labels = vec![Label::new("host", "shard-7")];
+    let points = storage
+        .select("flush_shard_wal_metric", &labels, 1_400_000, 1_600_000)
+        .unwrap();
+    assert_eq!(
+        points.len(),
+        156 * 1024,
+        "sharded persist must not lose data"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn persist_small_flush_snapshot_stays_a_single_segment() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage =
+        persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Milliseconds, 1024);
+
+    // 3 series x 2048 points: far below any sane shard budget, so persist
+    // must keep writing exactly one L0 segment per lane instead of paying
+    // for needless sharding.
+    for series_idx in 0..3u64 {
+        let labels = vec![Label::new("host", format!("small-{series_idx}"))];
+        let rows = (0..2048)
+            .map(|offset| {
+                Row::with_labels(
+                    "flush_small_metric",
+                    labels.clone(),
+                    DataPoint::new(offset as i64, offset as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+    }
+
+    let outcome = storage.persist_segment_with_outcome().unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(
+        outcome.segments, 1,
+        "small snapshots must not be needlessly sharded"
+    );
+
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 1);
+
+    let labels = vec![Label::new("host", "small-1")];
+    let points = storage
+        .select("flush_small_metric", &labels, 0, 2048)
+        .unwrap();
+    assert_eq!(points.len(), 2048);
 
     storage.close().unwrap();
 }

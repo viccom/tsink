@@ -85,6 +85,14 @@ impl StorageObservabilityCounters {
             saturating_u64_from_usize(stats.output_points),
             Ordering::Relaxed,
         );
+        self.compaction.passthrough_chunks_total.fetch_add(
+            saturating_u64_from_usize(stats.passthrough_chunks),
+            Ordering::Relaxed,
+        );
+        self.compaction.passthrough_points_total.fetch_add(
+            saturating_u64_from_usize(stats.passthrough_points),
+            Ordering::Relaxed,
+        );
         if stats.compacted {
             self.compaction
                 .success_total
@@ -256,6 +264,8 @@ pub(super) struct CompactionObservabilityCounters {
     pub(super) output_chunks_total: AtomicU64,
     pub(super) source_points_total: AtomicU64,
     pub(super) output_points_total: AtomicU64,
+    pub(super) passthrough_chunks_total: AtomicU64,
+    pub(super) passthrough_points_total: AtomicU64,
     pub(super) duration_nanos_total: AtomicU64,
 }
 

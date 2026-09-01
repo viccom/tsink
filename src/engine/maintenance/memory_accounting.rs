@@ -379,16 +379,6 @@ impl ChunkStorage {
             SeriesId,
             super::super::state::PersistedSeriesTimeRangeSummary,
         >(&state.series_time_summaries));
-        bytes = bytes.saturating_add(Self::hash_map_memory_usage_bytes::<
-            SeriesId,
-            Vec<PersistedChunkRef>,
-        >(&state.chunk_refs_by_series));
-        for refs in state.chunk_refs_by_series.values() {
-            bytes = bytes.saturating_add(
-                refs.capacity()
-                    .saturating_mul(std::mem::size_of::<PersistedChunkRef>()),
-            );
-        }
         bytes
     }
 
@@ -397,13 +387,6 @@ impl ChunkStorage {
     ) -> usize {
         let mut bytes = Self::hash_map_memory_usage_bytes::<SeriesId, Vec<PersistedChunkRef>>(
             &index.chunk_refs,
-        )
-        .saturating_add(Self::hash_map_memory_usage_bytes::<
-            u64,
-            std::sync::OnceLock<crate::engine::encoder::TimestampSearchIndex>,
-        >(&index.chunk_timestamp_indexes))
-        .saturating_add(
-            Self::hash_map_memory_usage_bytes::<usize, Arc<PlatformMmap>>(&index.segment_maps),
         )
         .saturating_add(Self::hash_map_memory_usage_bytes::<
             usize,
@@ -420,26 +403,12 @@ impl ChunkStorage {
                     .saturating_mul(std::mem::size_of::<PersistedChunkRef>()),
             );
         }
-        for search_index in index.chunk_timestamp_indexes.values() {
-            if let Some(search_index) = search_index.get() {
-                bytes = bytes.saturating_add(search_index.memory_usage_bytes());
-            }
-        }
         for (root, state) in &index.segments_by_root {
             bytes = bytes.saturating_add(Self::persisted_segment_state_memory_usage_bytes(
                 root, state,
             ));
         }
         bytes
-    }
-
-    pub(in super::super) fn persisted_index_persisted_mmap_bytes(
-        index: &PersistedIndexState,
-    ) -> usize {
-        index
-            .segment_maps
-            .values()
-            .fold(0usize, |acc, mapped| acc.saturating_add(mapped.len()))
     }
 
     pub(in super::super) fn prune_empty_active_series(&self) {

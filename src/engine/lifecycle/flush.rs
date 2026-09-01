@@ -184,7 +184,22 @@ impl ChunkStorage {
         *self.persist_test_hooks.post_publish_hook.write() = None;
     }
 
-    fn write_flush_segment_stage(
+    /// Upper bound on the number of points a single flush-persist L0 segment
+    /// may carry. Persist used to write each lane's whole snapshot as one L0
+    /// segment; under sustained ingestion that segment grew without bound (the
+    /// rs-iot long run ended at a single 581MB / 124M-point L0) and the cost
+    /// of writing, fsyncing, verifying, and catalog-rewriting each giant
+    /// segment fed back into ever longer persist cycles. Sharding keeps every
+    /// per-segment cost proportional and stays transparent to compaction (L0
+    /// legitimately holds any number of segments and the level-fair rotation
+    /// drains it).
+    ///
+    /// Shard boundaries settle at chunk granularity, so a shard can exceed
+    /// the budget by at most one chunk (`point_count` is capped at `u16::MAX`).
+    /// The durable highwater and WAL prefix reclaim still only advance once
+    /// the whole snapshot — every shard of both lanes — has been written,
+    /// verified, and recorded in the recovery metadata.
+    fn write_flush_segment_stages(
         snapshot_ctx: FlushSnapshotContext<'_>,
         registry: &SeriesRegistry,
         lane_path: &Path,
@@ -192,10 +207,42 @@ impl ChunkStorage {
         wal_highwater: WalHighWatermark,
         published_segment_roots: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        let segment_id = snapshot_ctx.next_segment_id.fetch_add(1, Ordering::SeqCst);
-        let writer = SegmentWriter::new(lane_path, 0, segment_id)?;
-        writer.write_segment_with_wal_highwater(registry, chunks, wal_highwater)?;
-        published_segment_roots.push(writer.layout().root.clone());
+        const FLUSH_SEGMENT_MAX_POINTS: usize = 1_048_576;
+
+        let mut series_ids = chunks.keys().copied().collect::<Vec<_>>();
+        series_ids.sort_unstable();
+
+        let mut write_shard = |shard_chunks: &mut HashMap<SeriesId, Vec<Arc<Chunk>>>,
+                               shard_points: &mut usize|
+         -> Result<()> {
+            if shard_chunks.is_empty() {
+                return Ok(());
+            }
+            let segment_id = snapshot_ctx.next_segment_id.fetch_add(1, Ordering::SeqCst);
+            let writer = SegmentWriter::new(lane_path, 0, segment_id)?;
+            writer.write_segment_with_wal_highwater(registry, shard_chunks, wal_highwater)?;
+            published_segment_roots.push(writer.layout().root.clone());
+            shard_chunks.clear();
+            *shard_points = 0;
+            Ok(())
+        };
+
+        let mut shard_chunks = HashMap::<SeriesId, Vec<Arc<Chunk>>>::new();
+        let mut shard_points = 0usize;
+        for series_id in series_ids {
+            for chunk in &chunks[&series_id] {
+                shard_chunks
+                    .entry(series_id)
+                    .or_default()
+                    .push(Arc::clone(chunk));
+                shard_points = shard_points.saturating_add(chunk.header.point_count as usize);
+                if shard_points >= FLUSH_SEGMENT_MAX_POINTS {
+                    write_shard(&mut shard_chunks, &mut shard_points)?;
+                }
+            }
+        }
+        write_shard(&mut shard_chunks, &mut shard_points)?;
+
         Ok(())
     }
 
@@ -242,7 +289,7 @@ impl ChunkStorage {
                 if let (Some(path), false) =
                     (snapshot_ctx.numeric_lane_path, numeric_chunks.is_empty())
                 {
-                    Self::write_flush_segment_stage(
+                    Self::write_flush_segment_stages(
                         snapshot_ctx,
                         &registry,
                         path,
@@ -253,7 +300,7 @@ impl ChunkStorage {
                 }
 
                 if let (Some(path), false) = (snapshot_ctx.blob_lane_path, blob_chunks.is_empty()) {
-                    Self::write_flush_segment_stage(
+                    Self::write_flush_segment_stages(
                         snapshot_ctx,
                         &registry,
                         path,
@@ -338,7 +385,14 @@ impl ChunkStorage {
         // Recovery metadata must reach disk before the newly published segment roots are
         // allowed to become the engine's durable view. If this step fails, roll the new
         // roots back rather than exposing data that restart cannot fully recover.
-        let _compaction_guard = self.compaction_gate();
+        //
+        // The only compaction mutual exclusion this build/write needs is against
+        // segment-replacement marker application (source dir deletion); the
+        // registry catalog already tolerates concurrently-disappeared roots.
+        // Taking the coarse compaction gate here instead let one long compaction
+        // pass stall the whole persist chain (mark_durable_through, WAL prefix
+        // reclaim) until the pass finished.
+        let _replacement_guard = self.segment_replacement_gate();
         if publish_ctx.0.load(Ordering::SeqCst) {
             if let Err(err) = self.apply_known_dirty_persisted_refresh_if_pending() {
                 tracing::warn!(

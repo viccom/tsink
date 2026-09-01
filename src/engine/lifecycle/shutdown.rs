@@ -57,6 +57,16 @@ impl<'a> LifecycleShutdownContext<'a> {
     }
 }
 
+/// Per-pass outcome of a budgeted compaction drain over all compactors.
+#[derive(Debug, Default)]
+pub(in crate::engine::storage_engine) struct CompactionDrainPass {
+    pub(in crate::engine::storage_engine) changes: PendingPersistedSegmentDiff,
+    pub(in crate::engine::storage_engine) compaction_runs: usize,
+    pub(in crate::engine::storage_engine) l0_to_l1_runs: usize,
+    pub(in crate::engine::storage_engine) l1_to_l2_runs: usize,
+    pub(in crate::engine::storage_engine) backlog_remains: bool,
+}
+
 impl ChunkStorage {
     fn lifecycle_shutdown_context(&self) -> LifecycleShutdownContext<'_> {
         LifecycleShutdownContext {
@@ -70,6 +80,49 @@ impl ChunkStorage {
             persisted_index_dirty: self.persisted.persisted_index_dirty.as_ref(),
             observability: self.observability.as_ref(),
         }
+    }
+
+    /// Drains eligible compaction work: keeps taking window passes through
+    /// [`Compactor::compact_once_with_changes`] until a pass reports no work
+    /// (settled) or the lane's share of the pass time budget is spent. Each
+    /// iteration re-enters the level round-robin arbitration, so a sustained
+    /// L0 backlog cannot starve L1->L2 inside the drain. The budget gates
+    /// *starting* the next pass, so one drain always performs at least one
+    /// compaction attempt and may overshoot the budget by a single pass; the
+    /// background worker holds the compaction gate for at most
+    /// `budget + one pass`, bounding how long close/manual compaction waits.
+    /// Each lane gets its own full budget so a permanently backlogged numeric
+    /// lane cannot starve the blob lane out of its turns.
+    pub(in crate::engine::storage_engine) fn drain_compactors_with_budget(
+        numeric_compactor: Option<&Compactor>,
+        blob_compactor: Option<&Compactor>,
+        observability: Option<&StorageObservabilityCounters>,
+        time_budget: std::time::Duration,
+    ) -> Result<CompactionDrainPass> {
+        let mut pass = CompactionDrainPass::default();
+        for compactor in [numeric_compactor, blob_compactor].into_iter().flatten() {
+            let deadline = Instant::now() + time_budget;
+            loop {
+                let (changes, stats) = Self::run_compactor_pass_once(compactor, observability)?;
+                pass.changes.merge(changes);
+                if !stats.compacted {
+                    break;
+                }
+                pass.compaction_runs += 1;
+                match (stats.source_level, stats.target_level) {
+                    (Some(0), Some(1)) => pass.l0_to_l1_runs += 1,
+                    (Some(1), Some(2)) => pass.l1_to_l2_runs += 1,
+                    _ => {}
+                }
+                if Instant::now() >= deadline {
+                    // Eligible work was still being found when the budget ran
+                    // out; flag it so the worker expedites the next pass.
+                    pass.backlog_remains = true;
+                    break;
+                }
+            }
+        }
+        Ok(pass)
     }
 
     pub(in super::super) fn compact_compactors_with_changes(
@@ -91,6 +144,16 @@ impl ChunkStorage {
         compactor: &Compactor,
         observability: Option<&StorageObservabilityCounters>,
     ) -> Result<PendingPersistedSegmentDiff> {
+        Ok(Self::run_compactor_pass_once(compactor, observability)?.0)
+    }
+
+    fn run_compactor_pass_once(
+        compactor: &Compactor,
+        observability: Option<&StorageObservabilityCounters>,
+    ) -> Result<(
+        PendingPersistedSegmentDiff,
+        crate::engine::compactor::CompactionRunStats,
+    )> {
         let started = Instant::now();
         match compactor.compact_once_with_changes() {
             Ok(outcome) => {
@@ -102,7 +165,7 @@ impl ChunkStorage {
                 if stats.compacted {
                     changes.record_changes(outcome.output_roots, outcome.source_roots);
                 }
-                Ok(changes)
+                Ok((changes, stats))
             }
             Err(err) => {
                 if let Some(obs) = observability {

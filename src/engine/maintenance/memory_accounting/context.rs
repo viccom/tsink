@@ -99,12 +99,29 @@ impl<'a> PersistedSealedBudgetContext<'a> {
 impl<'a> LifecyclePublicationContext<'a> {
     pub(super) fn measured_persisted_index_memory_usage_bytes(self) -> usize {
         let persisted_index = self.persisted_index.read();
+        // The segment-map registry's structural overhead (entries, paths)
+        // is part of the included persisted-index component on both the
+        // incremental publication and this full recompute path, and so is
+        // the timestamp-index cache (structures plus resident index bytes).
         ChunkStorage::persisted_index_included_memory_usage_bytes(&persisted_index)
+            .saturating_add(self.segment_maps.structures_memory_usage_bytes())
+            .saturating_add(self.timestamp_indexes.structures_memory_usage_bytes())
+            .saturating_add(
+                usize::try_from(
+                    self.timestamp_indexes
+                        .resident_bytes()
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+                .unwrap_or(usize::MAX),
+            )
     }
 
+    /// Resident segment-map bytes straight off the registry gauge; the
+    /// gauge is maintained by every registry mutation (install, re-map,
+    /// evict, remove), so the measurement is exact per publication.
     pub(super) fn measured_persisted_mmap_memory_usage_bytes(self) -> usize {
-        let persisted_index = self.persisted_index.read();
-        ChunkStorage::persisted_index_persisted_mmap_bytes(&persisted_index)
+        usize::try_from(self.segment_maps.resident_bytes().load(Ordering::Acquire))
+            .unwrap_or(usize::MAX)
     }
 }
 

@@ -93,10 +93,11 @@ pub(in crate::engine::storage_engine) use core_impl::{
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
+pub(crate) use runtime::COMPACTION_DRAIN_TIME_BUDGET;
 use state::{
-    ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey,
-    SeriesVisibilityRangeSummary, SeriesVisibilitySummary, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT,
-    SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
+    ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, SegmentMapRegistry,
+    SeriesVisibilityRangeSummary, SeriesVisibilitySummary, TimestampIndexCache, BLOB_LANE_ROOT,
+    NUMERIC_LANE_ROOT, SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
 };
 #[cfg(test)]
 use test_hooks::{IngestCommitHook, PersistTestHooks};
@@ -108,7 +109,10 @@ const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
 const DEFAULT_FUTURE_SKEW_ALLOWANCE: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
-const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+/// Interval between background compaction passes. Exposure:
+/// `StorageBuilder::with_compaction_interval` overrides this per deployment;
+/// this constant stays the default.
+pub(crate) const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_ROLLUP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -173,6 +177,12 @@ struct VisibilityState {
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
     persisted_index: RwLock<PersistedIndexState>,
+    /// Resident segment-map cache (byte budget + LRU eviction); always
+    /// locked nested inside `persisted_index`, never the reverse.
+    segment_maps: SegmentMapRegistry,
+    /// Resident timestamp-search-index cache (byte budget + LRU eviction);
+    /// same nesting rule as `segment_maps`.
+    timestamp_indexes: TimestampIndexCache,
     persisted_index_dirty: Arc<AtomicBool>,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
@@ -234,6 +244,13 @@ struct CoordinationState {
     lifecycle: Arc<AtomicU8>,
     background_maintenance_lock: Mutex<()>,
     compaction_lock: Arc<Mutex<()>>,
+    /// Serializes compaction's segment-replacement marker operations (marker
+    /// write + source deletion) against the flush persist pipeline's registry
+    /// catalog build. This is the only mutual exclusion persist needs: taking
+    /// the whole `compaction_lock` instead let a long compaction pass (e.g. a
+    /// multi-GB window load) block persist, `mark_durable_through`, and WAL
+    /// prefix reclaim until the pass finished.
+    segment_replacement_lock: Arc<Mutex<()>>,
     data_path_process_lock: Mutex<Option<DataPathProcessLock>>,
 }
 
@@ -638,15 +655,21 @@ impl Storage for ChunkStorage {
 
 impl Drop for ChunkStorage {
     fn drop(&mut self) {
-        if self.coordination.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
-            return;
+        if self.coordination.lifecycle.load(Ordering::SeqCst) == STORAGE_OPEN {
+            // Best-effort shutdown to avoid losing in-memory active chunks on last Arc drop.
+            let _ = <Self as Storage>::close(self);
+            self.coordination
+                .lifecycle
+                .store(STORAGE_CLOSED, Ordering::SeqCst);
         }
 
-        // Best-effort shutdown to avoid losing in-memory active chunks on last Arc drop.
-        let _ = <Self as Storage>::close(self);
-        self.coordination
-            .lifecycle
-            .store(STORAGE_CLOSED, Ordering::SeqCst);
+        // A non-OPEN lifecycle skips the close pipeline, but background worker
+        // threads must never outlive the engine object: a mid-pass compaction
+        // thread keeps writing segments with this engine's allocator after
+        // drop, and a same-process reopen (tests simulate kill -9 this way)
+        // then races its own allocator against the zombie's in-flight outputs
+        // ("segment directory already exists" on publish). Joining is
+        // idempotent: `close` takes the handles first and drops see None.
         self.notify_background_threads();
         let _ = self.join_background_threads();
         self.release_data_path_process_lock();

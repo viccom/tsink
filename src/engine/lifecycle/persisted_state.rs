@@ -13,16 +13,21 @@ use super::super::tiering::{PersistedSegmentTier, SegmentLaneFamily};
 use super::{
     saturating_u64_from_usize, state, Arc, ChunkStorage, HashMap, Label,
     LifecyclePublicationContext, Ordering, Path, PathBuf, PersistedChunkRef, PersistedIndexState,
-    Result, SeriesId, SeriesRegistry, SeriesValueFamily, TsinkError,
+    PlatformMmap, Result, SeriesId, SeriesRegistry, SeriesValueFamily, TsinkError,
 };
 use crate::engine::segment::{
-    IndexedSegment, LoadedSegmentIndexes, PersistedSeries, SegmentPostingsIndex,
+    IndexedSegment, LoadedSegmentIndexes, PersistedSeries, SegmentLayout, SegmentPostingsIndex,
 };
 
 struct PreparedLoadedPersistedSegments {
     indexed_segments: Vec<IndexedSegment>,
     series: Vec<PersistedSeries>,
 }
+
+/// Slot → (chunks file, loaded mapping) pairs produced while preparing or
+/// installing segment state; applied to the resident segment-map registry
+/// under the same persisted-index write section as the state change.
+type PreparedSegmentMaps = Vec<(usize, PathBuf, Arc<PlatformMmap>)>;
 
 #[derive(Default)]
 struct PersistedSegmentsStateUpdate {
@@ -37,6 +42,7 @@ struct PersistedSegmentRemovalStateUpdate {
 
 struct PreparedPersistedIndexInstall {
     persisted_index: PersistedIndexState,
+    segment_maps: PreparedSegmentMaps,
     persisted_series_ids: Vec<SeriesId>,
     loaded_max_timestamp: Option<i64>,
     next_segment_id: u64,

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,15 +11,16 @@ use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
 use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
-    is_not_found_error, list_segment_dirs, load_segments_for_level_runtime_strict,
+    is_not_found_error, list_segment_dirs, load_segment_for_compaction,
     load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,
-    PersistedSeries, SegmentValidationContext, SegmentWriter,
+    PersistedSeries, SegmentManifest, SegmentValidationContext, SegmentWriter,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::engine::tombstone::{
     load_tombstones, timestamp_is_tombstoned, TombstoneMap, TombstoneRange, TOMBSTONES_FILE_NAME,
 };
 use crate::{Result, TsinkError};
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 #[path = "compactor/execution.rs"]
@@ -31,11 +32,39 @@ pub(in crate::engine) use self::execution::finalize_pending_compaction_replaceme
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
-const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
-const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
+/// Source window: how many same-level segments one compaction pass may merge.
+/// Raised from 8 to 16 so a single pass amortizes the per-pass fixed costs
+/// (marker directory scan, tombstone parse, full-level survey, drain-budget
+/// yield park) over twice the input. Paired with the 8M-point output budget,
+/// a full window of 16x1M-point L0 shards re-emits as 2x8M L1 segments
+/// instead of leaving half the backlog for the next pass.
+///
+/// Exposure: [`StorageBuilder::with_source_window_segments`](crate::storage::StorageBuilder::with_source_window_segments)
+/// overrides this per deployment; this constant stays the default.
+pub(crate) const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16;
+/// Point budget for one compaction output segment, independent of the chunk
+/// point cap. It used to be `chunk_point_cap * 512`, which silently shrank the
+/// budget (and multiplied the output segment / file count by the same factor)
+/// whenever chunk_points was tuned below its 2048 default (rs-iot runs
+/// chunk_points=512 and got a 4x segment amplification). It is now 8x the L0
+/// flush shard size (1M points): a budget equal to the shard size made an
+/// L0->L1 merge of 8x1M re-emit ~8x1M ("8-in-8-out"), so the level segment
+/// count never shrank. 8 x 1,048,576 = 8,388,608 points.
+///
+/// Exposure: [`StorageBuilder::with_output_segment_point_budget`](crate::storage::StorageBuilder::with_output_segment_point_budget)
+/// overrides this per deployment; this constant stays the default.
+pub(crate) const DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET: usize = 8_388_608;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Level-fair arbitration state: which level transition compacted last.
+/// `LAST_TRANSITION_L0_TO_L1` / `LAST_TRANSITION_L1_TO_L2` make the next pass
+/// prefer the other transition first, so a continuously-triggering L0->L1
+/// cannot starve L1->L2 (the 4640-segment L1 backlog root cause).
+const LAST_TRANSITION_NONE: u8 = 0;
+const LAST_TRANSITION_L0_TO_L1: u8 = 1;
+const LAST_TRANSITION_L1_TO_L2: u8 = 2;
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
@@ -58,6 +87,12 @@ pub struct CompactionRunStats {
     pub output_chunks: usize,
     pub source_points: usize,
     pub output_points: usize,
+    /// Chunks re-emitted verbatim by the non-overlap pass-through fast path
+    /// (`try_pass_through_series_chunks`); zero whenever every series took
+    /// the decode/merge path. Same accounting scope as `output_chunks`.
+    pub passthrough_chunks: usize,
+    /// Point total covered by the chunks counted in `passthrough_chunks`.
+    pub passthrough_points: usize,
 }
 
 #[allow(dead_code)]
@@ -79,9 +114,20 @@ pub enum CompactionLevel {
 pub struct Compactor {
     data_path: PathBuf,
     point_cap: usize,
+    output_segment_point_budget: usize,
+    /// How many same-level segments one pass may merge; plumbed from the
+    /// builder's `source_window_segments` knob, defaulting to
+    /// [`DEFAULT_SOURCE_WINDOW_SEGMENTS`].
+    source_window_segments: usize,
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
+    last_compacted_transition: Arc<AtomicU8>,
+    /// When wired into a live engine, serializes this compactor's
+    /// segment-replacement marker operations against the flush persist
+    /// pipeline's registry catalog build. `None` for standalone compactors
+    /// (tests, retention rewriters) that own their data path exclusively.
+    segment_replacement_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl Compactor {
@@ -89,9 +135,13 @@ impl Compactor {
         Self {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
+            output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
+            last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
+            segment_replacement_lock: None,
         }
     }
 
@@ -103,10 +153,48 @@ impl Compactor {
         Self {
             data_path: data_path.as_ref().to_path_buf(),
             point_cap: point_cap.clamp(1, u16::MAX as usize),
+            output_segment_point_budget: DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
+            last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
+            segment_replacement_lock: None,
         }
+    }
+
+    /// Overrides the per-output-segment point budget. Exposed through the
+    /// `StorageBuilder::with_output_segment_point_budget` knob for deployment
+    /// tuning (default: [`DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET`]); also kept
+    /// on the compactor for standalone/tests use.
+    pub fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
+        self.output_segment_point_budget = budget.max(1);
+        self
+    }
+
+    /// Overrides how many same-level segments one compaction pass may merge
+    /// (default: [`DEFAULT_SOURCE_WINDOW_SEGMENTS`]). Clamped to at least 2:
+    /// a window below 2 can never select a mergeable pair, which would
+    /// silently disable the level's compaction.
+    pub fn with_source_window_segments(mut self, segments: usize) -> Self {
+        self.source_window_segments = segments.max(2);
+        self
+    }
+
+    /// Wires this compactor into a live engine's segment-replacement lock so
+    /// its marker write/apply phases serialize against the flush persist
+    /// pipeline instead of forcing persist to wait out whole compaction passes.
+    pub fn with_segment_replacement_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.segment_replacement_lock = Some(lock);
+        self
+    }
+
+    /// Acquires the segment-replacement gate for the caller's next marker
+    /// operations. Returns `None` for standalone compactors without a lock.
+    fn segment_replacement_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.segment_replacement_lock
+            .as_ref()
+            .map(|lock| lock.lock())
     }
 
     pub fn compact_once(&self) -> Result<bool> {

@@ -1980,14 +1980,9 @@ fn explicit_runtime_refresh_loads_added_segment_without_decoding_chunk_payloads(
         .persisted
         .persisted_index_dirty
         .load(Ordering::SeqCst));
-    assert!(
-        storage
-            .persisted
-            .persisted_index
-            .read()
-            .chunk_timestamp_indexes
-            .values()
-            .all(|index| index.get().is_none()),
+    assert_eq!(
+        storage.persisted.timestamp_indexes.len(),
+        0,
         "runtime refresh should not eagerly build persisted timestamp search indexes",
     );
     let persisted_roots = storage

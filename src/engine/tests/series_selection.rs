@@ -2064,10 +2064,17 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -2137,7 +2144,12 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
 fn reopened_large_history_metadata_snapshots_drop_legacy_duplicate_postings_bytes() {
     let temp_dir = TempDir::new().unwrap();
     let series_count = 2_048usize;
-    let segment_count = 4usize;
+    // Stay below the L0 count trigger and keep the segments
+    // time-disjoint: close-time compaction merges triggered or overlapping
+    // L0 clusters, and since the compaction output budget was decoupled from
+    // chunk_point_cap (~1M points) a merged cluster no longer re-splits, so
+    // the multi-segment reopen fixture would collapse to one segment.
+    let segment_count = 3usize;
 
     let storage = persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Seconds, 1);
     for segment_idx in 0..segment_count {
@@ -2313,10 +2325,17 @@ fn persisted_merged_postings_update_across_segment_removal_and_re_adoption() {
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -3100,10 +3119,17 @@ fn reconcile_live_metadata_indexes_uses_timestamp_search_index_for_bounded_overl
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
+                persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+                timestamp_index_cache_budget_bytes:
+                    crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+                source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+                output_segment_point_budget:
+                    crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -4453,10 +4479,17 @@ fn retention_sweep_reconciles_live_metadata_indexes_and_shard_scoped_reads() {
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
+            persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes:
+                crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: Some(shard_count),

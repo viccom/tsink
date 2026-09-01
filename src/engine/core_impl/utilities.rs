@@ -276,6 +276,21 @@ pub(in crate::engine::storage_engine) fn persisted_chunk_payload<'a>(
 }
 
 impl ChunkStorage {
+    /// Resolves a persisted segment slot to its resident mapping,
+    /// transparently re-mapping the chunks file when the registry evicted
+    /// it under the global persisted-mmap budget. Unknown slots (segment
+    /// absent from the index) stay a corruption error.
+    pub(in crate::engine::storage_engine) fn resolve_persisted_segment_map(
+        &self,
+        slot: usize,
+    ) -> Result<Arc<PlatformMmap>> {
+        self.persisted
+            .segment_maps
+            .get_or_remap(slot)?
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(format!("missing mapped segment slot {slot}"))
+            })
+    }
     pub(in crate::engine::storage_engine) fn ensure_open(&self) -> Result<()> {
         if self
             .observability
@@ -310,6 +325,15 @@ impl ChunkStorage {
 
     pub(in crate::engine::storage_engine) fn compaction_gate(&self) -> MutexGuard<'_, ()> {
         self.coordination.compaction_lock.lock()
+    }
+
+    /// Serializes against compaction's segment-replacement marker operations
+    /// only (marker write + source segment deletion). The flush persist
+    /// pipeline takes this instead of [`Self::compaction_gate`] so a long
+    /// compaction pass cannot stall `mark_durable_through` and WAL prefix
+    /// reclaim; lock order is maintenance > compaction > segment replacement.
+    pub(in crate::engine::storage_engine) fn segment_replacement_gate(&self) -> MutexGuard<'_, ()> {
+        self.coordination.segment_replacement_lock.lock()
     }
 
     pub(in crate::engine::storage_engine) fn lock_compaction_gate(

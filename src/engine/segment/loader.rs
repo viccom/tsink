@@ -36,6 +36,54 @@ struct ParsedSegment {
     chunks_by_series: HashMap<SeriesId, Vec<Chunk>>,
 }
 
+// Test instrumentation: counts full segment-directory loads (all four payload
+// files read, verified, and rebuilt) on the current thread. Thread-local so
+// parallel tests cannot pollute each other's counts. Compaction
+// window-selection tests reset this to assert a pass fully loads at most the
+// window, not the whole level.
+#[cfg(test)]
+thread_local! {
+    static FULL_SEGMENT_DIR_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_segment_dir_load_count() {
+    FULL_SEGMENT_DIR_LOADS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_segment_dir_load_count() -> u64 {
+    FULL_SEGMENT_DIR_LOADS.with(std::cell::Cell::get)
+}
+
+/// Fully loads a single segment directory for a compaction window under the
+/// runtime-strict policy: a directory that disappeared concurrently is
+/// skipped, while any corruption fails the pass with compaction validation
+/// context. Compaction planning calls this only for the segments its window
+/// selected from manifests, never for the whole level.
+pub(crate) fn load_segment_for_compaction(root: &Path) -> Result<Option<LoadedSegment>> {
+    let segment = match load_segment_dir(root) {
+        Ok(segment) => segment,
+        Err(err) => {
+            handle_segment_dir_load_error(
+                root,
+                err,
+                SegmentLoadPolicy::FailOnInvalid(SegmentValidationContext::Compaction),
+                "Segment directory disappeared while loading compaction window; skipping",
+                "Ignoring invalid segment directory",
+            )?;
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(LoadedSegment {
+        root: segment.root,
+        manifest: segment.manifest,
+        series: segment.series,
+        chunks_by_series: segment.chunks_by_series,
+    }))
+}
+
 struct ParsedIndexedSegment {
     root: PathBuf,
     manifest: SegmentManifest,
@@ -342,17 +390,6 @@ pub fn load_segments_for_level(base: impl AsRef<Path>, level: u8) -> Result<Vec<
     load_segments_for_level_with_policy(base, level, SegmentLoadPolicy::SkipInvalid)
 }
 
-pub(crate) fn load_segments_for_level_runtime_strict(
-    base: impl AsRef<Path>,
-    level: u8,
-) -> Result<Vec<LoadedSegment>> {
-    load_segments_for_level_with_policy(
-        base,
-        level,
-        SegmentLoadPolicy::FailOnInvalid(SegmentValidationContext::Compaction),
-    )
-}
-
 fn load_segments_for_level_with_policy(
     base: impl AsRef<Path>,
     level: u8,
@@ -551,9 +588,27 @@ fn load_indexed_segment_dir_with_policy(
                     let Some(details) = segment_validation_error_message(&err) else {
                         return Err(err);
                     };
-                    Ok(IndexedSegmentLoadOutcome::Quarantined(
-                        quarantine_invalid_startup_segment(dir, &details)?,
-                    ))
+                    match quarantine_invalid_startup_segment(dir, &details) {
+                        Ok(quarantined) => Ok(IndexedSegmentLoadOutcome::Quarantined(quarantined)),
+                        Err(quarantine_err) => {
+                            // A segment replacement racing this startup scan
+                            // (e.g. a superseded engine instance finishing its
+                            // compaction marker application) can delete the
+                            // root between validation and quarantine. A
+                            // vanished root has nothing left to quarantine;
+                            // skipping matches the disappearance tolerance
+                            // above instead of failing startup.
+                            if !crate::engine::fs_utils::path_exists_no_follow(dir)? {
+                                warn!(
+                                    path = %dir.display(),
+                                    error = %quarantine_err,
+                                    "Segment root vanished during startup quarantine; skipping"
+                                );
+                                return Ok(IndexedSegmentLoadOutcome::Skipped);
+                            }
+                            Err(quarantine_err)
+                        }
+                    }
                 }
             },
         },
@@ -610,6 +665,9 @@ fn open_required_segment_file(segment_root: &Path, path: &Path) -> Result<File> 
 }
 
 fn load_segment_dir(path: &Path) -> Result<ParsedSegment> {
+    #[cfg(test)]
+    FULL_SEGMENT_DIR_LOADS.with(|count| count.set(count.get() + 1));
+
     let layout = SegmentLayout::from_root(path.to_path_buf());
 
     let manifest_bytes = read_required_segment_file(path, &layout.manifest_path)?;

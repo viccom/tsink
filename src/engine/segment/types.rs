@@ -30,7 +30,7 @@ impl SegmentLayout {
         Self::from_root(root)
     }
 
-    pub(super) fn from_root(root: PathBuf) -> Self {
+    pub(crate) fn from_root(root: PathBuf) -> Self {
         Self {
             chunks_path: root.join("chunks.bin"),
             chunk_index_path: root.join("chunk_index.bin"),

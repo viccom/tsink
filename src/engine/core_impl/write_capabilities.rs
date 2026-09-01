@@ -218,6 +218,8 @@ pub(in crate::engine::storage_engine) struct WriteCommitWalCompletionContext<'a>
 pub(in crate::engine::storage_engine) struct LifecyclePublicationContext<'a> {
     pub(in crate::engine::storage_engine) registry: &'a RwLock<SeriesRegistry>,
     pub(in crate::engine::storage_engine) persisted_index: &'a RwLock<PersistedIndexState>,
+    pub(in crate::engine::storage_engine) segment_maps: &'a SegmentMapRegistry,
+    pub(in crate::engine::storage_engine) timestamp_indexes: &'a TimestampIndexCache,
     pub(in crate::engine::storage_engine) accounting_enabled: bool,
     pub(in crate::engine::storage_engine) registry_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) persisted_index_used_bytes: &'a AtomicU64,

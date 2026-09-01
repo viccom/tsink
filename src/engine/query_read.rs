@@ -30,6 +30,7 @@ pub(super) use pagination::{RawSeriesPagination, RawSeriesScanPage};
 struct QuerySnapshotContext<'a> {
     chunks: ChunkContext<'a>,
     persisted_index: &'a RwLock<PersistedIndexState>,
+    segment_maps: &'a SegmentMapRegistry,
     visibility_fence: &'a RwLock<()>,
     partition_window: i64,
 }
@@ -94,6 +95,7 @@ impl ChunkStorage {
         QuerySnapshotContext {
             chunks: self.chunk_context(),
             persisted_index: &self.persisted.persisted_index,
+            segment_maps: &self.persisted.segment_maps,
             visibility_fence: &self.visibility.flush_visibility_lock,
             partition_window: self.runtime.partition_window,
         }

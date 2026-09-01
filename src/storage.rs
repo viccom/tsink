@@ -11,6 +11,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const DEFAULT_CHUNK_POINTS: usize = 2048;
+
+/// Default cap on resident segment-map bytes (the persisted-mmap memory
+/// component). Segment mappings are re-materialized from their chunks file
+/// on demand after eviction, so the cap bounds the commit growth seen when
+/// residency tracked total segment data. `usize::MAX` disables the cap.
+pub const DEFAULT_PERSISTED_MMAP_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Default cap on resident timestamp-search-index cache bytes. Indexes are
+/// rebuilt transparently from their chunk payload on the next visibility
+/// read after eviction, so the cap bounds the per-chunk anchor-index
+/// residency that otherwise grows with total persisted chunks. `usize::MAX`
+/// disables the cap.
+pub const DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
@@ -458,6 +471,8 @@ pub struct CompactionObservabilitySnapshot {
     pub output_chunks_total: u64,
     pub source_points_total: u64,
     pub output_points_total: u64,
+    pub passthrough_chunks_total: u64,
+    pub passthrough_points_total: u64,
     pub duration_nanos_total: u64,
 }
 
@@ -1056,6 +1071,8 @@ pub struct StorageBuilder {
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
+    persisted_mmap_budget_bytes: usize,
+    timestamp_index_cache_budget_bytes: usize,
     cardinality_limit: usize,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
@@ -1063,6 +1080,10 @@ pub struct StorageBuilder {
     wal_sync_mode: WalSyncMode,
     wal_replay_mode: WalReplayMode,
     background_fail_fast: bool,
+    compaction_interval: Duration,
+    drain_time_budget: Duration,
+    source_window_segments: usize,
+    output_segment_point_budget: usize,
     metadata_shard_count: Option<u32>,
     #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
@@ -1090,6 +1111,8 @@ impl Default for StorageBuilder {
             partition_duration: Duration::from_secs(3600),
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
+            persisted_mmap_budget_bytes: DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
+            timestamp_index_cache_budget_bytes: DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
             cardinality_limit: usize::MAX,
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
@@ -1097,6 +1120,11 @@ impl Default for StorageBuilder {
             wal_sync_mode: WalSyncMode::default(),
             wal_replay_mode: WalReplayMode::Strict,
             background_fail_fast: true,
+            compaction_interval: crate::engine::DEFAULT_COMPACTION_INTERVAL,
+            drain_time_budget: crate::engine::COMPACTION_DRAIN_TIME_BUDGET,
+            source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
+            output_segment_point_budget:
+                crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
             metadata_shard_count: None,
             #[cfg(test)]
             background_threads_enabled_override: None,
@@ -1246,6 +1274,34 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets the global byte budget for resident segment mappings
+    /// (persisted-mmap bytes). Once the resident total exceeds the budget,
+    /// the least recently used segment mappings are evicted and
+    /// transparently re-mapped from their chunks file on the next access.
+    ///
+    /// This bounds the memory component that otherwise grows monotonically
+    /// with total on-disk segment data. `usize::MAX` disables the cap;
+    /// defaults to [`DEFAULT_PERSISTED_MMAP_BUDGET_BYTES`] (4 GiB).
+    #[must_use]
+    pub fn with_persisted_mmap_budget_bytes(mut self, bytes: usize) -> Self {
+        self.persisted_mmap_budget_bytes = bytes;
+        self
+    }
+
+    /// Sets the global byte budget for resident timestamp-search-index
+    /// cache entries. Once the resident total exceeds the budget, the least
+    /// recently used indexes are evicted and transparently rebuilt from
+    /// their chunk payload on the next visibility read.
+    ///
+    /// This bounds the memory component that otherwise grows monotonically
+    /// with total persisted chunks. `usize::MAX` disables the cap; defaults
+    /// to [`DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES`] (128 MiB).
+    #[must_use]
+    pub fn with_timestamp_index_cache_budget_bytes(mut self, bytes: usize) -> Self {
+        self.timestamp_index_cache_budget_bytes = bytes;
+        self
+    }
+
     /// Sets a hard upper bound for total series cardinality.
     ///
     /// New metric+label combinations are rejected once the limit is reached.
@@ -1305,6 +1361,51 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_metadata_shard_count(mut self, shard_count: u32) -> Self {
         self.metadata_shard_count = Some(shard_count);
+        self
+    }
+
+    /// Sets the park interval between background compaction passes.
+    ///
+    /// While a pass ends budget-exhausted with eligible work still pending,
+    /// the worker temporarily parks on the shorter backlog cadence instead of
+    /// waiting out this interval. Defaults to 5s.
+    #[must_use]
+    pub fn with_compaction_interval(mut self, interval: Duration) -> Self {
+        self.compaction_interval = interval;
+        self
+    }
+
+    /// Sets the time budget one background compaction drain pass may spend
+    /// starting new window compactions before yielding the compaction gate.
+    ///
+    /// The budget gates *starting* the next pass, so a drain holds the gate
+    /// for at most `budget + one pass`. Defaults to 10s.
+    #[must_use]
+    pub fn with_drain_time_budget(mut self, budget: Duration) -> Self {
+        self.drain_time_budget = budget;
+        self
+    }
+
+    /// Sets how many same-level segments one compaction pass may merge.
+    ///
+    /// Larger windows amortize per-pass fixed costs (marker scan, tombstone
+    /// parse, level survey) over more input. Clamped to at least 2; defaults
+    /// to 16.
+    #[must_use]
+    pub fn with_source_window_segments(mut self, segments: usize) -> Self {
+        self.source_window_segments = segments;
+        self
+    }
+
+    /// Sets the point budget for one compaction output segment, independent
+    /// of the chunk point cap.
+    ///
+    /// A budget at or below the L0 flush shard size re-emits "N-in-N-out"
+    /// segment counts that never shrink a level, so keep it a multiple of the
+    /// flush shard size. Defaults to 8,388,608 points (8 x 1M).
+    #[must_use]
+    pub fn with_output_segment_point_budget(mut self, budget: usize) -> Self {
+        self.output_segment_point_budget = budget;
         self
     }
 
@@ -1395,6 +1496,30 @@ impl StorageBuilder {
 
     pub(crate) fn memory_limit_bytes(&self) -> usize {
         self.memory_limit_bytes
+    }
+
+    pub(crate) fn persisted_mmap_budget_bytes(&self) -> usize {
+        self.persisted_mmap_budget_bytes
+    }
+
+    pub(crate) fn timestamp_index_cache_budget_bytes(&self) -> usize {
+        self.timestamp_index_cache_budget_bytes
+    }
+
+    pub(crate) fn compaction_interval(&self) -> Duration {
+        self.compaction_interval
+    }
+
+    pub(crate) fn drain_time_budget(&self) -> Duration {
+        self.drain_time_budget
+    }
+
+    pub(crate) fn source_window_segments(&self) -> usize {
+        self.source_window_segments
+    }
+
+    pub(crate) fn output_segment_point_budget(&self) -> usize {
+        self.output_segment_point_budget
     }
 
     pub(crate) fn max_active_partition_heads_per_series(&self) -> usize {
