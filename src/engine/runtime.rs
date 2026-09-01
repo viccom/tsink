@@ -38,20 +38,22 @@ enum BackgroundWorkerPass<G> {
 /// Time budget for one background compaction drain pass. The budget gates
 /// *starting* the next window compaction, so a pass bounds its compaction
 /// gate hold to roughly `budget + one compaction` instead of draining an
-/// unbounded backlog in one go. 10s lets several fast passes chain within
-/// one tick while a single slow pass (16x1M-point windows) still yields the
-/// gate after finishing.
+/// unbounded backlog in one go. A 10s budget (27f69c6, reverted) held the
+/// compaction lock near-continuously and starved the persisted-refresh /
+/// maintenance gate enough to stall writers at 100k pts/s (bench bisect
+/// 2026-09-01: 10s+250ms collapsed ingest to <1k pts/s within minutes;
+/// 2s+1s held 50k+). Keep the conservative r3 pacing.
 ///
 /// Exposure: `StorageBuilder::with_drain_time_budget` overrides this per
 /// deployment; this constant stays the default.
-pub(crate) const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(10);
+pub(crate) const COMPACTION_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(2);
 
 /// Park interval between compaction passes while the previous pass stopped
-/// budget-exhausted with eligible work still pending. With 16x1M-point
-/// window passes running 15s+, a 1s park was 2-6% dead time per pass; 250ms
-/// keeps the backlog cadence effectively `pass + epsilon` and still gives
-/// the persisted-refresh / retention maintenance a chance to interleave.
-const COMPACTION_BACKLOG_PARK_INTERVAL: Duration = Duration::from_millis(250);
+/// budget-exhausted with eligible work still pending. 250ms (27f69c6,
+/// reverted) left near-zero yield windows for maintenance between long
+/// passes and contributed to the same writer stall; 1s restores the r3
+/// interleaving cadence.
+const COMPACTION_BACKLOG_PARK_INTERVAL: Duration = Duration::from_secs(1);
 
 struct BackgroundWorkerControl<'a> {
     lifecycle: &'a AtomicU8,
