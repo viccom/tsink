@@ -282,6 +282,8 @@ impl Compactor {
                     output_chunks: 0,
                     source_points,
                     output_points: 0,
+                    passthrough_chunks: 0,
+                    passthrough_points: 0,
                 },
                 source_roots,
                 output_roots: Vec::new(),
@@ -306,6 +308,8 @@ impl Compactor {
         let mut emitted_segments = 0usize;
         let mut emitted_chunks = 0usize;
         let mut emitted_points = 0usize;
+        let mut passthrough_chunks = 0usize;
+        let mut passthrough_points = 0usize;
         let mut output_roots = Vec::<PathBuf>::new();
         let write_outputs_result = (|| -> Result<()> {
             for series_def in &series {
@@ -345,7 +349,18 @@ impl Compactor {
                     retention_cutoff,
                     &mut emit_chunk,
                 )?;
-                if !passed_through {
+                if passed_through {
+                    // The fast path is all-or-nothing per series: `true` means
+                    // every chunk was emitted verbatim, so the counters can be
+                    // summed here without touching the emit closure.
+                    passthrough_chunks = passthrough_chunks.saturating_add(chunks.len());
+                    passthrough_points = passthrough_points.saturating_add(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.header.point_count as usize)
+                            .sum::<usize>(),
+                    );
+                } else {
                     stream_merge_series_chunks(
                         series_id,
                         chunks,
@@ -391,6 +406,8 @@ impl Compactor {
                     output_chunks: emitted_chunks,
                     source_points,
                     output_points: emitted_points,
+                    passthrough_chunks,
+                    passthrough_points,
                 },
                 source_roots,
                 output_roots,
@@ -418,6 +435,8 @@ impl Compactor {
                 output_chunks: emitted_chunks,
                 source_points,
                 output_points: emitted_points,
+                passthrough_chunks,
+                passthrough_points,
             },
             source_roots,
             output_roots,

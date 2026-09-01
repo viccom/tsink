@@ -980,6 +980,14 @@ fn compaction_passthrough_non_overlapping_chunks_without_decoding() {
         "pass-through must neither merge nor re-split chunks"
     );
     assert_eq!(
+        stats.passthrough_chunks, 4,
+        "every passed-through chunk must be counted in run stats"
+    );
+    assert_eq!(
+        stats.passthrough_points, 8,
+        "passed-through points must be counted in run stats"
+    );
+    assert_eq!(
         crate::engine::chunk::chunk_clone_count(),
         4,
         "only the four window-load clones may happen; pass-through emit adds none"
@@ -1049,7 +1057,16 @@ fn compaction_passthrough_falls_back_on_time_overlap() {
         .unwrap();
 
     let compactor = Compactor::new(temp_dir.path(), 8);
-    compactor.compact_once().unwrap();
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(
+        stats.passthrough_chunks, 0,
+        "an overlap-forced decode pass must not count pass-through chunks"
+    );
+    assert_eq!(
+        stats.passthrough_points, 0,
+        "an overlap-forced decode pass must not count pass-through points"
+    );
 
     let loaded = load_segments(temp_dir.path()).unwrap();
     let chunks = loaded.chunks_by_series.get(&series_id).unwrap();

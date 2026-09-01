@@ -226,6 +226,8 @@ impl From<&CompactionObservabilityCounters> for CompactionObservabilitySnapshot 
             output_chunks_total: counters.output_chunks_total.load(Ordering::Relaxed),
             source_points_total: counters.source_points_total.load(Ordering::Relaxed),
             output_points_total: counters.output_points_total.load(Ordering::Relaxed),
+            passthrough_chunks_total: counters.passthrough_chunks_total.load(Ordering::Relaxed),
+            passthrough_points_total: counters.passthrough_points_total.load(Ordering::Relaxed),
             duration_nanos_total: counters.duration_nanos_total.load(Ordering::Relaxed),
         }
     }

@@ -471,6 +471,8 @@ pub struct CompactionObservabilitySnapshot {
     pub output_chunks_total: u64,
     pub source_points_total: u64,
     pub output_points_total: u64,
+    pub passthrough_chunks_total: u64,
+    pub passthrough_points_total: u64,
     pub duration_nanos_total: u64,
 }
 

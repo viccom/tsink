@@ -87,6 +87,12 @@ pub struct CompactionRunStats {
     pub output_chunks: usize,
     pub source_points: usize,
     pub output_points: usize,
+    /// Chunks re-emitted verbatim by the non-overlap pass-through fast path
+    /// (`try_pass_through_series_chunks`); zero whenever every series took
+    /// the decode/merge path. Same accounting scope as `output_chunks`.
+    pub passthrough_chunks: usize,
+    /// Point total covered by the chunks counted in `passthrough_chunks`.
+    pub passthrough_points: usize,
 }
 
 #[allow(dead_code)]
