@@ -904,3 +904,303 @@ fn persist_small_flush_snapshot_stays_a_single_segment() {
 
     storage.close().unwrap();
 }
+
+/// Collects the formatted WARN-and-above log lines emitted inside a
+/// `tracing::subscriber::with_default` scope so tests can assert on the
+/// diagnostics the flush pipeline emits for tolerated races.
+#[derive(Clone)]
+struct CapturedWarnLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedWarnLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWarnLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Installs a WARN-level global default subscriber exactly once.
+///
+/// Static `warn!` call-sites cache their interest process-wide. When a
+/// parallel engine test evaluates such a call-site while no subscriber is
+/// active, the cached interest makes later WARN events skip even a
+/// thread-local `with_default` dispatcher, so the capture below would flake.
+/// Installing a real global default first rebuilds that interest cache in a
+/// state that accepts WARN events everywhere, making the thread-local capture
+/// deterministic (the global subscriber itself only mirrors to stderr).
+static GLOBAL_WARN_SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+
+fn ensure_global_warn_subscriber() {
+    GLOBAL_WARN_SUBSCRIBER.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::io::stderr)
+                .finish(),
+        );
+    });
+}
+
+/// N8 variant A: a concurrent compaction pass replaced a just-published root
+/// (the replacement output already carries the data, the source root is
+/// deleted, and the drained diff is merged) before flush verification read it
+/// back. The pass must tolerate the replacement — skip the root, keep
+/// advancing watermarks/eviction, and lose no points — instead of failing the
+/// whole flush pass.
+#[test]
+fn flush_pipeline_tolerates_published_root_replaced_before_verify() {
+    ensure_global_warn_subscriber();
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "flush_verify_replaced";
+
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            Some(lane_path.clone()),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    // Two sealed chunks so the persisted watermark for the series advances
+    // past the first chunk's sequence.
+    for batch in 0..2u64 {
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new((batch * 10 + 1) as i64, (batch + 1) as f64),
+                ),
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new((batch * 10 + 2) as i64, (batch + 1) as f64),
+                ),
+            ])
+            .unwrap();
+        storage.flush_all_active().unwrap();
+    }
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    let replaced_name = Arc::new(std::sync::Mutex::new(String::new()));
+    let hook_name = Arc::clone(&replaced_name);
+
+    let hook_storage = Arc::clone(&storage);
+    storage.set_persist_post_publish_hook(move |roots| {
+        // Simulate the compaction replacement: the replacement output (here a
+        // renamed copy carrying the same bytes) lands, the source root is
+        // removed, and the drained diff is merged with the persisted index
+        // marked dirty — mirroring what the runtime does after a compaction
+        // drain.
+        let replaced = roots[0].clone();
+        *hook_name.lock().unwrap() = replaced.file_name().unwrap().to_string_lossy().into_owned();
+        let segment_hex = replaced
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .strip_prefix("seg-")
+            .unwrap()
+            .to_string();
+        let replacement_id = u64::from_str_radix(&segment_hex, 16).unwrap() + 0x1000;
+        let replacement = replaced
+            .parent()
+            .unwrap()
+            .join(format!("seg-{replacement_id:016x}"));
+        std::fs::rename(&replaced, &replacement).unwrap();
+
+        hook_storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .record_changes([replacement], [replaced]);
+        hook_storage
+            .persisted
+            .persisted_index_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedWarnLogs(Arc::clone(&captured)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        storage.flush_pipeline_once().unwrap();
+    });
+    storage.clear_persist_post_publish_hook();
+
+    let watermark = storage
+        .chunks
+        .persisted_chunk_watermarks
+        .read()
+        .get(&series_id)
+        .copied();
+    assert!(
+        watermark.is_some_and(|sequence| sequence >= 1),
+        "persisted watermark must advance past the first chunk sequence: {watermark:?}"
+    );
+
+    let sealed_chunks = storage
+        .sealed_shard(series_id)
+        .read()
+        .get(&series_id)
+        .map_or(0, |chunks| chunks.len());
+    assert_eq!(
+        sealed_chunks, 0,
+        "sealed chunks for the flushed series must still be evicted"
+    );
+
+    assert_eq!(
+        storage.select(metric, &labels, 0, 100).unwrap().len(),
+        4,
+        "no points may be lost when a published root is replaced by compaction"
+    );
+
+    let logs =
+        String::from_utf8(std::mem::take(&mut *captured.lock().unwrap())).unwrap_or_default();
+    assert!(
+        logs.contains("replaced by compaction before verify"),
+        "verify must WARN about the skipped root, logs: {logs}"
+    );
+    let replaced_name = replaced_name.lock().unwrap().clone();
+    assert!(
+        logs.contains(&replaced_name),
+        "the WARN must identify the skipped root {replaced_name}, logs: {logs}"
+    );
+
+    storage.close().unwrap();
+}
+
+/// N8 variant B: the replacement deleted the published root before flush
+/// verification, but the drained diff has not been merged yet (the attribution
+/// window). The pass must still succeed and leave the persisted index dirty so
+/// the background refresh worker reconciles the vanished root via its
+/// inventory scan.
+#[test]
+fn flush_pipeline_marks_dirty_when_replacement_precedes_diff_merge() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "flush_verify_dirty_window";
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    storage.set_persist_post_publish_hook(|roots| {
+        std::fs::remove_dir_all(&roots[0]).unwrap();
+    });
+
+    storage.flush_pipeline_once().unwrap();
+    storage.clear_persist_post_publish_hook();
+
+    assert!(
+        storage
+            .persisted
+            .persisted_index_dirty
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "verify must mark the persisted index dirty when a replaced root cannot be attributed to a drained diff"
+    );
+
+    storage.close().unwrap();
+}
+
+/// N8 variant C (guardrail): corruption inside a published root must not be
+/// swallowed by the replacement-tolerance path — the pass still fails so the
+/// WAL keeps covering the unreadable segment.
+#[test]
+fn flush_pipeline_still_fails_when_verify_finds_corruption() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "flush_verify_corrupt_manifest";
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    storage.set_persist_post_publish_hook(|roots| {
+        std::fs::remove_file(roots[0].join("manifest.bin")).unwrap();
+    });
+
+    let err = storage.flush_pipeline_once().unwrap_err();
+    storage.clear_persist_post_publish_hook();
+
+    assert!(
+        matches!(
+            err,
+            TsinkError::DataCorruption(ref message) if message.contains("missing manifest.bin")
+        ),
+        "corruption must keep failing the pass instead of being tolerated, got: {err:?}"
+    );
+
+    storage.close().unwrap();
+}

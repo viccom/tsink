@@ -349,32 +349,105 @@ impl ChunkStorage {
 
     fn verify_flush_segment_publication(
         &self,
+        publish_ctx: FlushPublishContext<'_>,
         staged: StagedFlushPublish,
     ) -> Result<VerifiedFlushPublish> {
-        let mut loaded_segments = Vec::with_capacity(staged.published_segment_roots.len());
-        for root in &staged.published_segment_roots {
-            match crate::engine::segment::load_segment_index(root) {
-                Ok(segment) => loaded_segments.push(segment),
-                Err(err) => {
-                    if let Err(rollback_err) =
-                        self.rollback_published_segment_roots(&staged.published_segment_roots)
-                    {
-                        return Err(TsinkError::Other(format!(
-                            "persist published unreadable segment and rollback failed: persist={err}, rollback={rollback_err}"
-                        )));
+        let StagedFlushPublish {
+            published_segment_roots,
+            flushed_watermarks,
+            wal_highwater,
+            outcome,
+        } = staged;
+
+        let mut verified_roots = Vec::with_capacity(published_segment_roots.len());
+        let mut loaded_segments = Vec::with_capacity(published_segment_roots.len());
+        for root in published_segment_roots {
+            match crate::engine::segment::load_segment_index(&root) {
+                Ok(segment) => {
+                    loaded_segments.push(segment);
+                    verified_roots.push(root);
+                }
+                Err(err) if crate::engine::segment::is_not_found_error(&err) => {
+                    // N8: between staging this root and verifying it, a
+                    // concurrent compaction pass may legitimately replace it
+                    // (the replacement outputs already carry the chunks and
+                    // their WAL replay responsibility). Compaction only
+                    // deletes source roots inside the segment-replacement
+                    // gate, so re-check existence under that lock before
+                    // treating the root as replaced.
+                    let root_gone = {
+                        let _replacement_guard = self.segment_replacement_gate();
+                        !crate::engine::fs_utils::path_exists_no_follow(&root).unwrap_or(true)
+                    };
+                    if root_gone {
+                        tracing::warn!(
+                            root = ?root,
+                            "published root replaced by compaction before verify; \
+                             persistence responsibility transferred to replacement outputs"
+                        );
+                        // The skipped root leaves no catalog record in this
+                        // pass, so queue a persisted-index reconcile through
+                        // the same known-dirty mechanism the later stages
+                        // already consult; the skipped root stays out of the
+                        // recovery metadata and install set.
+                        publish_ctx.0.store(true, Ordering::SeqCst);
+                        continue;
                     }
-                    return Err(err);
+                    // Extreme interleave: the root survived the locked
+                    // re-check (a deletion raced the check itself). Re-read
+                    // once — a root that is still unreadable afterwards is
+                    // genuine corruption, not a replacement.
+                    match crate::engine::segment::load_segment_index(&root) {
+                        Ok(segment) => {
+                            loaded_segments.push(segment);
+                            verified_roots.push(root);
+                        }
+                        Err(retry_err) => {
+                            return Err(self.rollback_unreadable_published_root(
+                                &verified_roots,
+                                &root,
+                                retry_err,
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(self.rollback_unreadable_published_root(
+                        &verified_roots,
+                        &root,
+                        err,
+                    ));
                 }
             }
         }
 
         Ok(VerifiedFlushPublish {
-            published_segment_roots: staged.published_segment_roots,
+            published_segment_roots: verified_roots,
             loaded_segments,
-            flushed_watermarks: staged.flushed_watermarks,
-            wal_highwater: staged.wal_highwater,
-            outcome: staged.outcome,
+            flushed_watermarks,
+            wal_highwater,
+            outcome,
         })
+    }
+
+    /// Rolls back the roots this pass is still responsible for — the ones
+    /// verified so far plus the unreadable root — and returns the load error
+    /// for the caller to surface. Roots already replaced by compaction are
+    /// not this pass's responsibility and are not rolled back.
+    fn rollback_unreadable_published_root(
+        &self,
+        verified_roots: &[PathBuf],
+        unreadable_root: &Path,
+        err: TsinkError,
+    ) -> TsinkError {
+        let mut rollback_roots = verified_roots.to_vec();
+        rollback_roots.push(unreadable_root.to_path_buf());
+        if let Err(rollback_err) = self.rollback_published_segment_roots(&rollback_roots) {
+            return TsinkError::Other(format!(
+                "persist published unreadable segment and rollback failed: persist={err}, rollback={rollback_err}"
+            ));
+        }
+        err
     }
 
     fn persist_flush_recovery_metadata_stage(
@@ -629,7 +702,8 @@ impl ChunkStorage {
             let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx)? else {
                 return Ok(PersistSegmentOutcome::default());
             };
-            let verified_flush = self.verify_flush_segment_publication(staged_flush)?;
+            let verified_flush =
+                self.verify_flush_segment_publication(publish_ctx, staged_flush)?;
             self.persist_flush_recovery_metadata_stage(
                 publish_ctx,
                 &verified_flush.published_segment_roots,
