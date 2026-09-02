@@ -445,6 +445,10 @@ pub struct FlushObservabilitySnapshot {
     pub persist_success_total: u64,
     pub persist_noop_total: u64,
     pub persist_errors_total: u64,
+    /// Published flush roots skipped by verification because a concurrent
+    /// compaction pass replaced them (N8 tolerance path).
+    #[serde(default)]
+    pub replaced_published_roots_total: u64,
     pub persisted_series_total: u64,
     pub persisted_chunks_total: u64,
     pub persisted_points_total: u64,

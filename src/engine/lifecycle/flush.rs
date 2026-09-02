@@ -385,6 +385,10 @@ impl ChunkStorage {
                             "published root replaced by compaction before verify; \
                              persistence responsibility transferred to replacement outputs"
                         );
+                        self.observability
+                            .flush
+                            .replaced_published_roots_total
+                            .fetch_add(1, Ordering::Relaxed);
                         // The skipped root leaves no catalog record in this
                         // pass, so queue a persisted-index reconcile through
                         // the same known-dirty mechanism the later stages

@@ -193,6 +193,9 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             persist_success_total: counters.persist_success_total.load(Ordering::Relaxed),
             persist_noop_total: counters.persist_noop_total.load(Ordering::Relaxed),
             persist_errors_total: counters.persist_errors_total.load(Ordering::Relaxed),
+            replaced_published_roots_total: counters
+                .replaced_published_roots_total
+                .load(Ordering::Relaxed),
             persisted_series_total: counters.persisted_series_total.load(Ordering::Relaxed),
             persisted_chunks_total: counters.persisted_chunks_total.load(Ordering::Relaxed),
             persisted_points_total: counters.persisted_points_total.load(Ordering::Relaxed),

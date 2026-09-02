@@ -1098,6 +1098,15 @@ fn flush_pipeline_tolerates_published_root_replaced_before_verify() {
         "the WARN must identify the skipped root {replaced_name}, logs: {logs}"
     );
 
+    assert!(
+        storage
+            .observability_snapshot()
+            .flush
+            .replaced_published_roots_total
+            >= 1,
+        "the replaced published root must be counted in the flush counters"
+    );
+
     storage.close().unwrap();
 }
 
@@ -1151,6 +1160,15 @@ fn flush_pipeline_marks_dirty_when_replacement_precedes_diff_merge() {
         "verify must mark the persisted index dirty when a replaced root cannot be attributed to a drained diff"
     );
 
+    assert!(
+        storage
+            .observability_snapshot()
+            .flush
+            .replaced_published_roots_total
+            >= 1,
+        "a replaced root in the attribution window must still be counted in the flush counters"
+    );
+
     storage.close().unwrap();
 }
 
@@ -1200,6 +1218,15 @@ fn flush_pipeline_still_fails_when_verify_finds_corruption() {
             TsinkError::DataCorruption(ref message) if message.contains("missing manifest.bin")
         ),
         "corruption must keep failing the pass instead of being tolerated, got: {err:?}"
+    );
+
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .flush
+            .replaced_published_roots_total,
+        0,
+        "corruption failures must not be counted as replaced published roots"
     );
 
     storage.close().unwrap();

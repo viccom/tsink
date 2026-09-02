@@ -238,6 +238,7 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) persist_success_total: AtomicU64,
     pub(super) persist_noop_total: AtomicU64,
     pub(super) persist_errors_total: AtomicU64,
+    pub(super) replaced_published_roots_total: AtomicU64,
     pub(super) persisted_series_total: AtomicU64,
     pub(super) persisted_chunks_total: AtomicU64,
     pub(super) persisted_points_total: AtomicU64,
