@@ -1,3 +1,4 @@
+use super::super::PersistedChunkRef;
 use super::*;
 
 #[test]
@@ -1227,6 +1228,222 @@ fn flush_pipeline_still_fails_when_verify_finds_corruption() {
             .replaced_published_roots_total,
         0,
         "corruption failures must not be counted as replaced published roots"
+    );
+
+    storage.close().unwrap();
+}
+
+/// P3 watermark eviction: a compaction drain rewrites the persisted
+/// chunk-ref boundaries when it merges segments (two [1,2]/[11,12] chunk
+/// refs become one [1,12] merged ref), so the six-field content match
+/// against in-memory sealed chunks can never succeed again. Eviction must
+/// still happen for sealed chunks at/below the series watermark — the data
+/// is persisted in the replacement output, keeping the chunk resident is a
+/// leak. Unit-level construction: the watermark advance (single-point,
+/// post-publish) and the merged ref install are simulated directly, since
+/// driving a full compaction drain here would only re-test its own paths.
+#[test]
+fn sealed_eviction_survives_compaction_boundary_rewrite() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "evict_compaction_rewrite";
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    // Two sealed chunks (strictly increasing sequences) pending persistence.
+    for batch in 0..2u64 {
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new((batch * 10 + 1) as i64, (batch + 1) as f64),
+                ),
+                Row::with_labels(
+                    metric,
+                    labels.clone(),
+                    DataPoint::new((batch * 10 + 2) as i64, (batch + 1) as f64),
+                ),
+            ])
+            .unwrap();
+        storage.flush_all_active().unwrap();
+    }
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    let sealed_shard = storage.sealed_shard(series_id);
+    let max_sequence = sealed_shard
+        .read()
+        .get(&series_id)
+        .map(|chunks| chunks.keys().map(|key| key.sequence).max().unwrap_or(0))
+        .unwrap_or(0);
+    assert!(max_sequence >= 2, "two sealed chunks must exist");
+
+    // Simulate the successful publish: the watermark advanced past every
+    // sealed chunk sequence (the single point that advances it).
+    storage
+        .chunks
+        .persisted_chunk_watermarks
+        .write()
+        .insert(series_id, max_sequence);
+
+    // Simulate the compaction drain having installed a merged replacement
+    // whose chunk-ref boundaries differ from both in-memory sealed chunks:
+    // min_ts/max_ts/point_count no longer match either chunk's fields, but
+    // the merged data is persisted in the replacement output.
+    storage.persisted.persisted_index.write().chunk_refs.insert(
+        series_id,
+        vec![PersistedChunkRef {
+            level: 1,
+            min_ts: 1,
+            max_ts: 12,
+            point_count: 4,
+            sequence: max_sequence,
+            chunk_offset: 0,
+            chunk_len: 0,
+            lane: ValueLane::Numeric,
+            ts_codec: TimestampCodecId::DeltaVarint,
+            value_codec: ValueCodecId::GorillaXorF64,
+            segment_slot: 0,
+        }],
+    );
+
+    let evicted = storage.evict_persisted_sealed_chunks();
+    let sealed_chunks = sealed_shard
+        .read()
+        .get(&series_id)
+        .map_or(0, |chunks| chunks.len());
+    assert_eq!(
+        sealed_chunks, 0,
+        "sealed chunks at/below the watermark must be evicted even after \
+         compaction rewrote the persisted chunk-ref boundaries; evicted={evicted}"
+    );
+
+    storage.close().unwrap();
+}
+
+/// P3 watermark eviction (guardrail): when publish never succeeded (verify
+/// finds real corruption, the pass rolls back), the watermark must not
+/// advance and the sealed chunk must stay resident — eviction is gated on
+/// the watermark alone, so an unpersisted chunk is never evicted. A clean
+/// retry then advances the watermark and evicts.
+#[test]
+fn publish_rollback_keeps_sealed_until_watermark_advances() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "evict_publish_rollback";
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(metric, labels.clone(), DataPoint::new(1, 1.0)),
+            Row::with_labels(metric, labels.clone(), DataPoint::new(2, 2.0)),
+        ])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    // Inject a publish failure: corrupt the staged segment before verify so
+    // the pass fails, the roots roll back, and the watermark never advances.
+    storage.set_persist_post_publish_hook(|roots| {
+        std::fs::remove_file(roots[0].join("manifest.bin")).unwrap();
+    });
+    let err = storage.flush_pipeline_once().unwrap_err();
+    storage.clear_persist_post_publish_hook();
+    assert!(
+        matches!(err, TsinkError::DataCorruption(ref message) if message.contains("missing manifest.bin")),
+        "corruption must fail the pass, got: {err:?}"
+    );
+
+    let watermark = storage
+        .chunks
+        .persisted_chunk_watermarks
+        .read()
+        .get(&series_id)
+        .copied();
+    assert!(
+        watermark.is_none(),
+        "the watermark must not advance while publish never succeeded: {watermark:?}"
+    );
+
+    let sealed_chunks = storage
+        .sealed_shard(series_id)
+        .read()
+        .get(&series_id)
+        .map_or(0, |chunks| chunks.len());
+    assert_eq!(
+        sealed_chunks, 1,
+        "the unpersisted sealed chunk must stay resident until the watermark advances"
+    );
+
+    // Clean retry: the sealed chunk is re-snapshashed, persisted, published;
+    // only then does the watermark advance and the chunk get evicted.
+    storage.flush_pipeline_once().unwrap();
+
+    let watermark = storage
+        .chunks
+        .persisted_chunk_watermarks
+        .read()
+        .get(&series_id)
+        .copied();
+    assert!(
+        watermark.is_some_and(|sequence| sequence >= 1),
+        "the clean retry must advance the watermark: {watermark:?}"
+    );
+    let sealed_chunks = storage
+        .sealed_shard(series_id)
+        .read()
+        .get(&series_id)
+        .map_or(0, |chunks| chunks.len());
+    assert_eq!(
+        sealed_chunks, 0,
+        "the sealed chunk must be evicted once the watermark advanced past it"
+    );
+
+    assert_eq!(
+        storage.select(metric, &labels, 0, 10).unwrap().len(),
+        2,
+        "no points may be lost across the failed and retried passes"
     );
 
     storage.close().unwrap();

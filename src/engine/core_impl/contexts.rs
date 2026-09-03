@@ -205,7 +205,6 @@ impl ChunkStorage {
             has_persisted_lanes: self.persisted.numeric_lane_path.is_some()
                 || self.persisted.blob_lane_path.is_some(),
             persisted_chunk_watermarks: &self.chunks.persisted_chunk_watermarks,
-            persisted_index: &self.persisted.persisted_index,
             sealed_chunks: &self.chunks.sealed_chunks,
             flush_metrics: &self.observability.flush,
         }

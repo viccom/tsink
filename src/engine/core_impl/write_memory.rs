@@ -185,7 +185,6 @@ pub(in crate::engine::storage_engine) struct PersistedSealedBudgetContext<'a> {
     pub(in crate::engine::storage_engine) has_persisted_lanes: bool,
     pub(in crate::engine::storage_engine) persisted_chunk_watermarks:
         &'a RwLock<HashMap<SeriesId, u64>>,
-    pub(in crate::engine::storage_engine) persisted_index: &'a RwLock<PersistedIndexState>,
     pub(in crate::engine::storage_engine) sealed_chunks:
         &'a [SealedChunkShard; IN_MEMORY_SHARD_COUNT],
     pub(in crate::engine::storage_engine) flush_metrics:

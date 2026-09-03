@@ -14,21 +14,12 @@ impl<'a> BudgetEnforcementContext<'a> {
         counter.load(Ordering::Acquire).min(usize::MAX as u64) as usize
     }
 
-    fn sealed_chunk_is_present_in_persisted_chunks(
-        persisted_chunks: Option<&[PersistedChunkRef]>,
-        key: SealedChunkKey,
-        chunk: &Chunk,
-    ) -> bool {
-        persisted_chunks.is_some_and(|persisted_chunks| {
-            persisted_chunks.iter().any(|chunk_ref| {
-                chunk_ref.min_ts == key.min_ts
-                    && chunk_ref.max_ts == key.max_ts
-                    && chunk_ref.point_count == key.point_count
-                    && chunk_ref.lane == chunk.header.lane
-                    && chunk_ref.ts_codec == chunk.header.ts_codec
-                    && chunk_ref.value_codec == chunk.header.value_codec
-            })
-        })
+    /// Sealed-chunk eviction predicate (watermark-only):
+    /// evictable ⇔ sequence ≤ watermark (advanced at the single point after
+    /// a successful flush publish); compaction replacement never rewinds the
+    /// watermark — the chunk's data already lives in the replacement output.
+    fn sealed_chunk_is_persisted(persisted_sequence: u64, key: SealedChunkKey) -> bool {
+        key.sequence <= persisted_sequence
     }
 
     pub(in crate::engine::storage_engine) fn budget_value(self) -> usize {
@@ -51,25 +42,14 @@ impl<'a> BudgetEnforcementContext<'a> {
 
     fn find_oldest_evictable_sealed_chunk(self) -> Option<(usize, SeriesId, SealedChunkKey)> {
         let persisted = self.persisted_sealed.persisted_chunk_watermarks.read();
-        let persisted_index = self.persisted_sealed.persisted_index.read();
         let mut oldest = None;
 
         for (shard_idx, shard) in self.persisted_sealed.sealed_chunks.iter().enumerate() {
             let sealed = shard.read();
             for (series_id, chunks) in sealed.iter() {
                 let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                let persisted_chunks = persisted_index
-                    .chunk_refs
-                    .get(series_id)
-                    .map(|chunks| chunks.as_slice());
-                for (key, chunk) in chunks {
-                    if key.sequence > persisted_sequence
-                        || !Self::sealed_chunk_is_present_in_persisted_chunks(
-                            persisted_chunks,
-                            *key,
-                            chunk,
-                        )
-                    {
+                for key in chunks.keys() {
+                    if !Self::sealed_chunk_is_persisted(persisted_sequence, *key) {
                         continue;
                     }
                     if oldest
@@ -152,7 +132,6 @@ impl<'a> BudgetEnforcementContext<'a> {
 
     pub(in crate::engine::storage_engine) fn evict_persisted_sealed_chunks(self) -> usize {
         let persisted = self.persisted_sealed.persisted_chunk_watermarks.read();
-        let persisted_index = self.persisted_sealed.persisted_index.read();
         let mut evicted = 0usize;
 
         for (shard_idx, shard) in self.persisted_sealed.sealed_chunks.iter().enumerate() {
@@ -160,18 +139,9 @@ impl<'a> BudgetEnforcementContext<'a> {
             let mut removed_bytes = 0usize;
             sealed.retain(|series_id, chunks| {
                 let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                let persisted_chunks = persisted_index
-                    .chunk_refs
-                    .get(series_id)
-                    .map(|chunks| chunks.as_slice());
 
                 chunks.retain(|key, chunk| {
-                    let remove = key.sequence <= persisted_sequence
-                        && Self::sealed_chunk_is_present_in_persisted_chunks(
-                            persisted_chunks,
-                            *key,
-                            chunk,
-                        );
+                    let remove = Self::sealed_chunk_is_persisted(persisted_sequence, *key);
                     if remove {
                         evicted = evicted.saturating_add(1);
                         if self.persisted_sealed.memory.accounting_enabled {
