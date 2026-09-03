@@ -1,3 +1,4 @@
+use super::super::maintenance::budget_enforcement::BudgetEnforcementContext;
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -148,7 +149,7 @@ pub(in crate::engine::storage_engine) struct WritePrepareMemoryBudgetContext<'a>
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct WriteAdmissionControlContext<'a> {
     pub(in crate::engine::storage_engine) lifecycle: &'a AtomicU8,
-    pub(in crate::engine::storage_engine) budget: PersistedSealedBudgetContext<'a>,
+    pub(in crate::engine::storage_engine) budget: BudgetEnforcementContext<'a>,
     pub(in crate::engine::storage_engine) workers: WorkerWakeContext<'a>,
     pub(in crate::engine::storage_engine) observability: &'a StorageObservabilityCounters,
     pub(in crate::engine::storage_engine) write_timeout: Duration,

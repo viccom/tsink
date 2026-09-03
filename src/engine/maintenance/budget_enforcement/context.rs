@@ -118,6 +118,25 @@ impl<'a> BudgetEnforcementContext<'a> {
         removed
     }
 
+    /// Admission-path entry: unlike `enforce_memory_budget_if_needed` (which
+    /// flushes/persists before evicting), this only drains already-persisted
+    /// sealed chunks down to `budget`. Callers must not hold the
+    /// backpressure lock; it is acquired here.
+    pub(in crate::engine::storage_engine) fn evict_persisted_sealed_chunks_to_budget(
+        self,
+        budget: usize,
+    ) {
+        if budget == usize::MAX
+            || self.used_value() <= budget
+            || !self.persisted_sealed.has_persisted_lanes
+        {
+            return;
+        }
+
+        let _backpressure_guard = self.lock_backpressure();
+        self.evict_persisted_sealed_chunks_to_budget_locked(budget);
+    }
+
     pub(in crate::engine::storage_engine) fn evict_persisted_sealed_chunks_to_budget_locked(
         self,
         budget: usize,

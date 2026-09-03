@@ -3,7 +3,7 @@
 //! Stage filesystem work first and hold `flush_visibility_lock` only while
 //! swapping the visible persisted state.
 
-mod budget_enforcement;
+pub(in crate::engine::storage_engine) mod budget_enforcement;
 mod catalog_refresh;
 mod memory_accounting;
 mod post_flush;

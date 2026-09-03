@@ -155,12 +155,6 @@ pub(in crate::engine::storage_engine) struct ShardMemoryAccountingContext<'a> {
 }
 
 impl<'a> ShardMemoryAccountingContext<'a> {
-    pub(super) fn used_bytes_value(self) -> usize {
-        self.used_bytes
-            .load(Ordering::Acquire)
-            .min(usize::MAX as u64) as usize
-    }
-
     pub(in crate::engine::storage_engine) fn account_memory_delta(
         self,
         shard_idx: usize,
@@ -196,110 +190,6 @@ pub(in crate::engine::storage_engine) struct PersistedSealedBudgetContext<'a> {
         &'a [SealedChunkShard; IN_MEMORY_SHARD_COUNT],
     pub(in crate::engine::storage_engine) flush_metrics:
         &'a super::super::metrics::FlushObservabilityCounters,
-}
-
-impl<'a> PersistedSealedBudgetContext<'a> {
-    fn sealed_chunk_is_present_in_persisted_chunks(
-        persisted_chunks: Option<&[PersistedChunkRef]>,
-        key: SealedChunkKey,
-        chunk: &Chunk,
-    ) -> bool {
-        persisted_chunks.is_some_and(|persisted_chunks| {
-            persisted_chunks.iter().any(|chunk_ref| {
-                chunk_ref.min_ts == key.min_ts
-                    && chunk_ref.max_ts == key.max_ts
-                    && chunk_ref.point_count == key.point_count
-                    && chunk_ref.lane == chunk.header.lane
-                    && chunk_ref.ts_codec == chunk.header.ts_codec
-                    && chunk_ref.value_codec == chunk.header.value_codec
-            })
-        })
-    }
-
-    fn find_oldest_evictable_sealed_chunk(self) -> Option<(usize, SeriesId, SealedChunkKey)> {
-        let persisted = self.persisted_chunk_watermarks.read();
-        let persisted_index = self.persisted_index.read();
-        let mut oldest = None;
-
-        for (shard_idx, shard) in self.sealed_chunks.iter().enumerate() {
-            let sealed = shard.read();
-            for (series_id, chunks) in sealed.iter() {
-                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                let persisted_chunks = persisted_index
-                    .chunk_refs
-                    .get(series_id)
-                    .map(|chunks| chunks.as_slice());
-                for (key, chunk) in chunks {
-                    if key.sequence > persisted_sequence
-                        || !Self::sealed_chunk_is_present_in_persisted_chunks(
-                            persisted_chunks,
-                            *key,
-                            chunk,
-                        )
-                    {
-                        continue;
-                    }
-                    if oldest
-                        .map(|(_, _, current): (usize, SeriesId, SealedChunkKey)| {
-                            key.sequence < current.sequence
-                        })
-                        .unwrap_or(true)
-                    {
-                        oldest = Some((shard_idx, *series_id, *key));
-                    }
-                }
-            }
-        }
-
-        oldest
-    }
-
-    fn evict_oldest_persisted_sealed_chunk(self) -> bool {
-        let Some((shard_idx, series_id, key)) = self.find_oldest_evictable_sealed_chunk() else {
-            return false;
-        };
-
-        let mut sealed = self.sealed_chunks[shard_idx].write();
-        let Some(chunks) = sealed.get_mut(&series_id) else {
-            return false;
-        };
-        let removed_chunk = chunks.remove(&key);
-        if chunks.is_empty() {
-            sealed.remove(&series_id);
-        }
-        let removed = removed_chunk.is_some();
-        if let Some(chunk) = removed_chunk.as_ref() {
-            self.memory.account_memory_delta(
-                shard_idx,
-                MemoryDeltaBytes::from_totals(0, ChunkStorage::chunk_memory_usage_bytes(chunk)),
-            );
-        }
-        if removed {
-            self.flush_metrics
-                .evicted_sealed_chunks_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        removed
-    }
-
-    pub(in crate::engine::storage_engine) fn evict_persisted_sealed_chunks_to_budget(
-        self,
-        budget: usize,
-    ) {
-        if budget == usize::MAX
-            || self.memory.used_bytes_value() <= budget
-            || !self.has_persisted_lanes
-        {
-            return;
-        }
-
-        let _backpressure_guard = self.backpressure_lock.lock();
-        while self.memory.used_bytes_value() > budget {
-            if !self.evict_oldest_persisted_sealed_chunk() {
-                break;
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy)]

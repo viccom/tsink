@@ -325,7 +325,7 @@ impl ChunkStorage {
             },
             admission: WriteAdmissionControlContext {
                 lifecycle: self.coordination.lifecycle.as_ref(),
-                budget: self.persisted_sealed_budget_context(),
+                budget: self.budget_enforcement_context(),
                 workers: self.worker_wake_context(),
                 observability: self.observability.as_ref(),
                 write_timeout: self.runtime.write_timeout,

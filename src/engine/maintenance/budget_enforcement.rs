@@ -1,6 +1,8 @@
 #[path = "budget_enforcement/context.rs"]
 mod context;
 
+pub(in crate::engine::storage_engine) use context::BudgetEnforcementContext;
+
 use super::super::*;
 
 impl ChunkStorage {
