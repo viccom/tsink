@@ -442,6 +442,27 @@ impl ChunkStorage {
             return;
         }
 
+        // Data-safety guardrail: a watermark value is a sealed chunk sequence
+        // drawn from the in-memory allocator, so it must stay strictly below
+        // the allocator's next value. Advancing a watermark past sequences
+        // that were never sealed (e.g. an unverified-publish path) would let
+        // eviction drop unpersisted chunks, so debug builds must fail loudly.
+        // (Persisted chunk refs get their sequences reassigned from the
+        // persisted index's own allocator on install, so ref-side sequences
+        // are a separate domain and not comparable here; this is checked
+        // against the allocator the watermark values actually come from.)
+        if cfg!(debug_assertions) {
+            let next_sequence = self.chunks.next_chunk_sequence.load(Ordering::Acquire);
+            for watermark in watermarks.values() {
+                debug_assert!(
+                    *watermark < next_sequence,
+                    "watermark advance {watermark} must reference an already-sealed chunk \
+                     sequence (next_chunk_sequence={next_sequence}); unverified publishes \
+                     must not advance watermarks"
+                );
+            }
+        }
+
         let mut persisted = self.chunks.persisted_chunk_watermarks.write();
         self.with_included_memory_delta(
             &self.memory.metadata_used_bytes,
