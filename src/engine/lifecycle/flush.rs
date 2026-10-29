@@ -763,6 +763,10 @@ impl ChunkStorage {
                 }
                 if self.memory.accounting_enabled && outcome.persisted {
                     self.refresh_memory_usage();
+                    self.observability
+                        .flush
+                        .memory_reconciles_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(outcome)
             }

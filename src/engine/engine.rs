@@ -233,6 +233,12 @@ struct MemoryAccountingState {
     persisted_mmap_used_bytes: AtomicU64,
     tombstone_used_bytes: AtomicU64,
     budget_bytes: AtomicU64,
+    /// Unix-epoch milliseconds of the last full O(series) reconciliation
+    /// pass (S6). Incremental deltas stay authoritative between passes; the
+    /// flush thread's full rescan is rate-limited against this timestamp.
+    /// Bootstrap/shutdown/construction anchors refresh unconditionally and
+    /// do not consult it.
+    last_full_reconcile_ms: AtomicU64,
     backpressure_lock: Mutex<()>,
     admission_backpressure_lock: Mutex<()>,
 }

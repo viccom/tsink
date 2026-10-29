@@ -244,6 +244,10 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) persisted_points_total: AtomicU64,
     pub(super) persisted_segments_total: AtomicU64,
     pub(super) persist_duration_nanos_total: AtomicU64,
+    /// Full O(series) reconciliation passes executed by the rate-limited
+    /// flush anchor (S6); persists between anchors rely on incremental
+    /// accounting only.
+    pub(super) memory_reconciles_total: AtomicU64,
     pub(super) evicted_sealed_chunks_total: AtomicU64,
     pub(super) tier_moves_total: AtomicU64,
     pub(super) tier_move_errors_total: AtomicU64,

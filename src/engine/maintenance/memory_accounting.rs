@@ -198,6 +198,13 @@ impl ChunkStorage {
         self.memory_accounting_context().refresh_memory_usage()
     }
 
+    pub(in super::super) fn flush_memory_reconciles_total(&self) -> u64 {
+        self.observability
+            .flush
+            .memory_reconciles_total
+            .load(Ordering::Relaxed)
+    }
+
     pub(in super::super) fn memory_observability_snapshot(
         &self,
     ) -> crate::MemoryObservabilitySnapshot {

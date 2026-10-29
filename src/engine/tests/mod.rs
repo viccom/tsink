@@ -66,6 +66,7 @@ mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;
+mod memory_reconcile_gate;
 mod persisted_index_accounting;
 mod persistence_background;
 mod persistence_recovery;
