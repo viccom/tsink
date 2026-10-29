@@ -90,3 +90,26 @@ fn write_reconcile_gate_rows(storage: &ChunkStorage, base_ts: i64) {
         ])
         .unwrap();
 }
+
+/// Regression protection (not a TDD red test — it would also pass with more
+/// frequent reconciliation): while the gate skips, incremental accounting
+/// stays authoritative, and once the interval elapses the reconciliation
+/// pass lands on the same values (incremental == full recompute).
+#[test]
+fn sampled_window_keeps_incremental_authoritative_and_reconciles_equal() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = test_storage_with_memory_budget(temp_dir.path());
+    write_reconcile_gate_rows(&storage, 0);
+    storage.flush_all_active().unwrap();
+    storage.persist_segment_with_outcome().unwrap(); // gated skip (fresh window)
+    assert_engine_memory_usage_reconciled(&storage); // incremental == forced full
+    write_reconcile_gate_rows(&storage, 30); // keep writing inside the window
+    storage
+        .memory
+        .last_full_reconcile_ms
+        .store(0, Ordering::Relaxed);
+    storage.flush_all_active().unwrap();
+    storage.persist_segment_with_outcome().unwrap(); // interval elapsed -> reconcile once
+    assert_engine_memory_usage_reconciled(&storage); // still equal
+    assert!(storage.flush_memory_reconciles_total() >= 1);
+}
