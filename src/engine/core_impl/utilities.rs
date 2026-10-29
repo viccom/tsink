@@ -77,7 +77,8 @@ pub(in crate::engine::storage_engine) fn saturating_u64_from_usize(value: usize)
 ///
 /// `refresh_memory_usage()` keeps running the full recompute, so drift from
 /// any future out-of-band mutation still surfaces through the reconciliation
-/// face (reconcile tests plus the flush/bootstrap refresh snaps).
+/// face (reconcile tests plus the bootstrap/shutdown refresh snaps and the
+/// rate-limited flush reconciliation anchor).
 #[derive(Clone)]
 pub(in crate::engine::storage_engine) struct VisibilityStateMemoryBaseline {
     summaries_capacity: usize,

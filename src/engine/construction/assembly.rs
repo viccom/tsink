@@ -163,6 +163,10 @@ impl StorageStateAssembly {
             persisted_mmap_used_bytes: AtomicU64::new(0),
             tombstone_used_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(options.memory_budget_bytes),
+            // The construction-time anchor performs a full refresh right
+            // after assembly, so the gate starts out "just reconciled" and
+            // the first persist inside a fresh window stays rate-limited.
+            last_full_reconcile_ms: AtomicU64::new(current_unix_millis_u64()),
             backpressure_lock: Mutex::new(()),
             admission_backpressure_lock: Mutex::new(()),
         }

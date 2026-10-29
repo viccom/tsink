@@ -762,7 +762,7 @@ impl ChunkStorage {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 if self.memory.accounting_enabled && outcome.persisted {
-                    self.refresh_memory_usage();
+                    self.reconcile_memory_usage_rate_limited();
                 }
                 Ok(outcome)
             }

@@ -198,6 +198,62 @@ impl ChunkStorage {
         self.memory_accounting_context().refresh_memory_usage()
     }
 
+    /// Test readout for the S6 flush reconciliation counter; surfacing it
+    /// through the public observability snapshot is deliberately out of
+    /// scope (no API surface growth in S6).
+    #[cfg(test)]
+    pub(in super::super) fn flush_memory_reconciles_total(&self) -> u64 {
+        self.observability
+            .flush
+            .memory_reconciles_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Rate-limited reconciliation anchor for the flush thread (S6): bounds
+    /// how often the O(series) full rescan runs after successful persists.
+    /// Incremental deltas stay authoritative between passes; bootstrap,
+    /// shutdown, and construction anchors call `refresh_memory_usage`
+    /// directly and are not gated.
+    pub(in super::super) fn reconcile_memory_usage_rate_limited(&self) {
+        let now_ms = current_unix_millis_u64();
+        let last = self.memory.last_full_reconcile_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < DEFAULT_MEMORY_RECONCILE_INTERVAL.as_millis() as u64 {
+            return;
+        }
+        // CAS rather than a blind store: the flush thread serializes calls
+        // today, but a future concurrent caller must not double-run the full
+        // rescan.
+        if self
+            .memory
+            .last_full_reconcile_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        // Drift observability: compare the incremental authoritative value
+        // (captured before the refresh stores its result) against the full
+        // recompute. Double threshold — relative 1% AND absolute 1 MiB — so
+        // small-value jitter never fires; constants inlined, no config
+        // surface. Warn-only: the refresh above already reset `used` to the
+        // authoritative full value, so the drift is reported, not "fixed".
+        let before_incremental = self.memory_used_value();
+        let reconciled = self.refresh_memory_usage();
+        let drift = before_incremental.abs_diff(reconciled);
+        if drift > (before_incremental / 100).max(1024 * 1024) {
+            tracing::warn!(
+                incremental = before_incremental,
+                reconciled,
+                drift,
+                "memory accounting drift between incremental and full recompute"
+            );
+        }
+        self.observability
+            .flush
+            .memory_reconciles_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(in super::super) fn memory_observability_snapshot(
         &self,
     ) -> crate::MemoryObservabilitySnapshot {

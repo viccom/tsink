@@ -114,6 +114,11 @@ const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 /// this constant stays the default.
 pub(crate) const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum interval between full memory-usage reconciliation passes on the
+/// flush thread (S6). Incremental deltas stay authoritative between passes;
+/// this gate only rate-limits the O(series) full rescan. Bootstrap/shutdown
+/// anchors are NOT gated (they call refresh_memory_usage directly).
+const DEFAULT_MEMORY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_ROLLUP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_REMOTE_CATALOG_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
@@ -233,6 +238,12 @@ struct MemoryAccountingState {
     persisted_mmap_used_bytes: AtomicU64,
     tombstone_used_bytes: AtomicU64,
     budget_bytes: AtomicU64,
+    /// Unix-epoch milliseconds of the last full O(series) reconciliation
+    /// pass (S6). Incremental deltas stay authoritative between passes; the
+    /// flush thread's full rescan is rate-limited against this timestamp.
+    /// Bootstrap/shutdown/construction anchors refresh unconditionally and
+    /// do not consult it.
+    last_full_reconcile_ms: AtomicU64,
     backpressure_lock: Mutex<()>,
     admission_backpressure_lock: Mutex<()>,
 }
