@@ -91,12 +91,23 @@ impl<'a> WriteResolveContext<'a> {
             .min(usize::MAX as u64) as usize;
         let required = used.saturating_add(estimated_registry_growth);
         if required > budget {
-            self.observability.record_admission_memory_rejection(
-                estimated_registry_growth,
-                budget,
-                required,
-            );
-            return Err(TsinkError::MemoryBudgetExceeded { budget, required });
+            // 计数器显示超预算 → 先全量 reconcile 再判断（2026-10-29 归档停摆修复）：
+            // 记账漂移会把「新 series 注册」也永久拒掉（开归档白名单的新点位永远
+            // 建不出 series = 该点位无历史）。用真实全量值判断，不掩盖真实超限。
+            self.storage.refresh_memory_usage();
+            let used = self
+                .used_bytes
+                .load(Ordering::Acquire)
+                .min(usize::MAX as u64) as usize;
+            let required = used.saturating_add(estimated_registry_growth);
+            if required > budget {
+                self.observability.record_admission_memory_rejection(
+                    estimated_registry_growth,
+                    budget,
+                    required,
+                );
+                return Err(TsinkError::MemoryBudgetExceeded { budget, required });
+            }
         }
 
         Ok(())

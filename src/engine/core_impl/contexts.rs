@@ -43,6 +43,10 @@ pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) cardinality_limit: usize,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
+    /// 全量重算入口（2026-10-29 归档停摆修复）——同 WritePrepareMemoryBudgetContext：
+    /// 新 series 准入检查也必须先用真实值判断，否则记账漂移会让「新点位开归档」
+    /// 被永久拒（开白名单后新 series 注册失败 = 该点位永远没有历史）。
+    pub(in crate::engine::storage_engine) storage: &'a ChunkStorage,
 }
 
 #[derive(Clone, Copy)]
@@ -288,6 +292,7 @@ impl ChunkStorage {
             cardinality_limit: self.runtime.cardinality_limit.load(Ordering::Acquire),
             used_bytes: &self.memory.used_bytes,
             budget_bytes: &self.memory.budget_bytes,
+            storage: self,
         }
     }
 
@@ -321,6 +326,7 @@ impl ChunkStorage {
             memory_budget: WritePrepareMemoryBudgetContext {
                 used_bytes: &self.memory.used_bytes,
                 budget_bytes: &self.memory.budget_bytes,
+                storage: self,
             },
             admission: WriteAdmissionControlContext {
                 lifecycle: self.coordination.lifecycle.as_ref(),

@@ -113,3 +113,55 @@ fn sampled_window_keeps_incremental_authoritative_and_reconciles_equal() {
     assert_engine_memory_usage_reconciled(&storage); // still equal
     assert!(storage.flush_memory_reconciles_total() >= 1);
 }
+
+/// 生产故障复现（2026-10-29，rs-iot 归档停摆）：
+///
+/// 症状——rs-iot 侧 `history.stats.errors_by_kind.memory_budget` 持续增长、
+/// `written` 归零、归档完全停摆；而 `sysstatus.history.memory_used_bytes` 报出
+/// 2^64-240 的**下溢巨值**（u64 计数器被 fetch_sub 减过了头）。
+///
+/// 机制链：
+///   ① 增量记账与 prune 的**口径不对称**（写入按增量加、prune 按全量 capacity 减）
+///      → used 计数器长期 sub > add
+///   ② `fetch_sub` 非饱和 → u64 下溢成巨值
+///   ③ 预算检查 `used > budget` 恒真 → 写入被 memory_budget 全拒
+///   ④ 无数据 seal → flush 无 persist → reconcile 不执行 → used 无法自愈
+///      （死锁：used 永远停在巨值，归档永久停摆）
+///
+/// 本测试锁住两件事：
+///   A. used 计数器**不得下溢**（饱和减）——下溢会把「记账漂移」放大成「永久停摆」
+///   B. 预算拒写前必须先做一次全量 reconcile（真实值判断）——打破 ④ 的死锁
+#[test]
+fn memory_used_counter_never_underflows_into_huge_value() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = test_storage_with_memory_budget(temp_dir.path());
+    // 人为制造「sub 多于 add」的记账漂移：走受保护的 sub 路径减一个远大于当前值的量
+    let before = storage.memory.used_bytes.load(Ordering::Acquire);
+    storage
+        .sub_memory_usage_bytes(0, (before as usize).saturating_add(1_000_000));
+    // 修复后：饱和减挡住越界，值落在 0 附近而非巨值
+    let after = storage.memory.used_bytes.load(Ordering::Acquire);
+    assert!(
+        after < 1_000_000,
+        "used_bytes 下溢成巨值（{after}）——预算检查将恒真，归档永久停摆"
+    );
+}
+
+/// 预算检查的自愈：used 计数器漂移/下溢后，写入路径必须先 reconcile 再判断，
+/// 而不是拿着陈旧（巨值）计数把写入全拒。
+#[test]
+fn admission_reconciles_before_rejecting_on_memory_budget() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = test_storage_with_memory_budget(temp_dir.path());
+    // 制造记账漂移：把 used 顶到预算之上（模拟下溢后的巨值效果）
+    storage
+        .memory
+        .used_bytes
+        .store(u64::MAX - 10, Ordering::Release);
+    // 写入必须成功——准入路径先 reconcile 回真实值（远小于预算）
+    write_reconcile_gate_rows(&storage, 0);
+    storage.flush_all_active().unwrap();
+    storage
+        .persist_segment_with_outcome()
+        .expect("记账漂移不得导致写入被永久拒（归档停摆）");
+}

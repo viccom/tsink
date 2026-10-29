@@ -161,10 +161,28 @@ impl ChunkStorage {
         }
 
         let decrement = saturating_u64_from_usize(bytes);
-        self.memory.used_bytes_by_shard[shard_idx].fetch_sub(decrement, Ordering::AcqRel);
+        // 饱和减（2026-10-29，生产故障修复）：u64 计数器的 `fetch_sub` 在
+        // decrement > current 时会**下溢**成巨值（实测 2^64-240）。记账漂移
+        // （增量加 vs prune 全量减，口径不对称）长期累积必然触此下溢，而下溢后
+        // `used > budget` 恒真 → 写入被 memory_budget 全拒 → 无数据 seal →
+        // flush 无 persist → reconcile 不执行 → used 永远不自愈 = **归档永久停摆**
+        // （rs-iot 侧症状：errors_by_kind.memory_budget 持续增长、written 归零）。
+        //
+        // 这里只保证**计数器不越界**：宁可停在 0（低估）也不越界成巨值（灾难）。
+        // 真实值由准入路径的 reconcile 纠正（见 ingest_pipeline/prepare.rs）。
+        self.memory.used_bytes_by_shard[shard_idx].fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| Some(current.saturating_sub(decrement)),
+        ).ok();
         self.memory
             .used_bytes
-            .fetch_sub(decrement, Ordering::AcqRel);
+            .fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_sub(decrement)),
+            )
+            .ok();
     }
 
     pub(in super::super) fn account_memory_delta(&self, shard_idx: usize, delta: MemoryDeltaBytes) {

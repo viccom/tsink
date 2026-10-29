@@ -210,6 +210,21 @@ impl<'a> WritePrepareMemoryBudgetContext<'a> {
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
         let required = used.saturating_add(estimated_growth_bytes);
+        if required <= budget {
+            return None;
+        }
+
+        // 计数器显示超预算 → 先做一次全量 reconcile 再判断（2026-10-29 归档停摆修复）：
+        // 增量记账与 prune 的口径不对称会让计数器长期漂移；漂移过大时写入被全拒 →
+        // 无数据 seal → flush 无 persist → reconcile 永不执行 → 计数器永不纠正 = 死锁。
+        // 用真实全量值判断：既打破死锁，也不掩盖真实超限（真超限仍按原路径 evict + 拒写）。
+        self.storage.refresh_memory_usage();
+
+        let used = self
+            .used_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize;
+        let required = used.saturating_add(estimated_growth_bytes);
         (required > budget).then_some((budget, required))
     }
 }

@@ -144,6 +144,13 @@ pub(in crate::engine::storage_engine) struct WritePrepareWalContext<'a> {
 pub(in crate::engine::storage_engine) struct WritePrepareMemoryBudgetContext<'a> {
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
+    /// 全量重算入口（2026-10-29 归档停摆修复）：准入路径在用 `used_bytes`
+    /// 计数器做预算判断**之前**必须先 reconcile 一次——增量记账与 prune 的口径
+    /// 不对称会让计数器长期漂移，而漂移到「大于预算」时写入被全拒 → 无数据
+    /// seal → flush 无 persist → reconcile 永不执行 → 计数器永不纠正 = 死锁
+    /// （生产症状：rs-iot 归档停摆，written 归零）。reconcile 用**真实全量值**
+    /// 判断，既打破死锁，也不掩盖真实超限。
+    pub(in crate::engine::storage_engine) storage: &'a ChunkStorage,
 }
 
 #[derive(Clone, Copy)]
