@@ -63,33 +63,18 @@ impl ChunkStorage {
         checkpoint_path: &Path,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
     ) -> Result<()> {
-        // N9：no-op 维护拍高频进入此处，validate 的全量段 manifest 重读按
-        // sources 集合指纹短路（段不可变 → 集合不变时结果必然相同）；集合
-        // 变化（新段/compaction 替换/retention 清理）指纹即异，自动全量重建。
-        // 只缓存有效（Some）结果——validate None 意味着即将写出 catalog，
-        // 磁盘状态随之改变，None 不可缓存；写出后以实际 fingerprint 回填。
-        let fingerprint = registry_catalog::sources_fingerprint(sources);
-        let mut cache = self.persisted.catalog_validate_cache.lock();
-        if let Some((cached_fp, Some(_))) = cache.as_ref() {
-            if *cached_fp == fingerprint {
-                return Ok(());
-            }
+        // N9b：no-op 维护拍高频进入此处；validate/persist 的 entries 构建走
+        // 段级缓存（段不可变 → 每拍只读新增段），消灭万级段的 manifest 重读风暴。
+        let entry_cache = &self.persisted.catalog_validate_cache;
+        if matches!(
+            registry_catalog::validate_registry_catalog(checkpoint_path, sources, entry_cache)?,
+            Some(registry_catalog::ValidatedRegistryCatalog {
+                series_fingerprint: Some(_),
+            })
+        ) {
+            return Ok(());
         }
-        let validated = registry_catalog::validate_registry_catalog(checkpoint_path, sources)?;
-        let effective = match validated {
-            Some(
-                hit @ registry_catalog::ValidatedRegistryCatalog {
-                    series_fingerprint: Some(_),
-                },
-            ) => hit,
-            _ => registry_catalog::ValidatedRegistryCatalog {
-                series_fingerprint: registry_catalog::persist_registry_catalog(
-                    checkpoint_path,
-                    sources,
-                )?,
-            },
-        };
-        *cache = Some((fingerprint, Some(effective)));
+        registry_catalog::persist_registry_catalog(checkpoint_path, sources, entry_cache)?;
         Ok(())
     }
 

@@ -113,7 +113,7 @@ impl StorageStateAssembly {
     ) -> PersistedStorageState {
         PersistedStorageState {
             persisted_index: RwLock::new(PersistedIndexState::default()),
-            catalog_validate_cache: Mutex::new(None),
+            catalog_validate_cache: Default::default(),
             segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
             timestamp_indexes: TimestampIndexCache::new(timestamp_index_cache_budget_bytes),
             persisted_index_dirty,

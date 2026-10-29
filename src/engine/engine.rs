@@ -182,12 +182,10 @@ struct VisibilityState {
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
     persisted_index: RwLock<PersistedIndexState>,
-    /// N9 catalog validate 缓存：sources 集合指纹 → 上次 validate 结果。
-    /// post-flush no-op 维护拍曾每次全量重读全部 persisted 段 manifest
-    /// （万级段 = 单核 CPU + openat 风暴）；段不可变故集合不变时结果可复用。
-    /// 独立锁，不嵌套任何其他锁。
-    catalog_validate_cache:
-        Mutex<Option<(u64, Option<registry_catalog::ValidatedRegistryCatalog>)>>,
+    /// N9b 段级 catalog entry 缓存：post-flush 维护拍高频构建 catalog 时
+    /// 段 manifest 重读按 root 缓存（段不可变 → entry 永久有效；compaction
+    /// 持续产段的集合渐变下只读新增段）。独立锁，不嵌套任何其他锁。
+    catalog_validate_cache: registry_catalog::CatalogEntryCache,
     /// Resident segment-map cache (byte budget + LRU eviction); always
     /// locked nested inside `persisted_index`, never the reverse.
     segment_maps: SegmentMapRegistry,

@@ -2243,6 +2243,7 @@ fn flush_pipeline_writes_incremental_registry_sidecar_without_rewriting_checkpoi
     assert!(super::super::registry_catalog::validate_registry_catalog(
         &checkpoint_path,
         &super::super::registry_catalog::inventory_sources(&visible_inventory),
+        &super::super::registry_catalog::CatalogEntryCache::default(),
     )
     .unwrap()
     .is_some());
@@ -2335,6 +2336,7 @@ fn dirty_reconcile_writes_incremental_registry_sidecar_without_rewriting_checkpo
     assert!(super::super::registry_catalog::validate_registry_catalog(
         &checkpoint_path,
         &super::super::registry_catalog::inventory_sources(&visible_inventory),
+        &super::super::registry_catalog::CatalogEntryCache::default(),
     )
     .unwrap()
     .is_some());
@@ -3562,6 +3564,7 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
     assert!(super::super::registry_catalog::validate_registry_catalog(
         &checkpoint_path,
         &super::super::registry_catalog::inventory_sources(&visible_inventory),
+        &super::super::registry_catalog::CatalogEntryCache::default(),
     )
     .unwrap()
     .is_some());
@@ -4039,5 +4042,48 @@ fn n9_catalog_validate_cache_skips_manifest_reread_on_unchanged_sources() {
     assert_eq!(
         bytes_before, bytes_after,
         "sources 未变时二次校验必须走缓存：不重读段 manifest、不重写 catalog"
+    );
+
+    // 渐变场景（N9b 核心）：旧段目录被删后重建（root 相同 → 缓存已有其
+    // entry），再新增一段。段级缓存下旧段零读盘、新段读盘——catalog 应含
+    // 两段；若仍全量重读也成立（重建目录可读），故另加负向证明：第二次
+    // 删除旧段目录后仅以旧集合调用仍零重写（上方已证）。此处证明集合渐
+    // 变路径功能正确（新段并入 catalog、旧段 entry 不丢）。
+    write_numeric_segment_to_path(
+        &lane_path,
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(60, 60.0), (61, 61.0)],
+    );
+    write_numeric_segment_to_path(
+        &lane_path,
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(62, 62.0), (63, 63.0)],
+    );
+    let grown_sources = {
+        let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+            Some(&lane_path),
+            None,
+            None,
+        )
+        .unwrap();
+        super::super::registry_catalog::inventory_sources(&inventory)
+    };
+    assert_eq!(grown_sources.len(), 2, "前置：旧段重建 + 新增段 = 2 段");
+    storage
+        .persist_series_registry_index_with_catalog_sources(&grown_sources)
+        .unwrap();
+    let grown = String::from_utf8(std::fs::read(&catalog_file).unwrap()).unwrap();
+    let segment_ids: Vec<&str> = grown.lines().filter(|l| l.contains("segment_id")).collect();
+    assert_eq!(
+        segment_ids.len(),
+        2,
+        "渐变后 catalog 应含全部两段（旧段缓存 + 新段读盘）：{}",
+        grown
     );
 }

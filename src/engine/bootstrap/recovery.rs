@@ -82,7 +82,9 @@ fn validate_startup_registry_catalog(
 
     let index_path = series_index_path.expect("persisted registry requires a snapshot path");
     let catalog_sources = registry_catalog::inventory_sources(&inventory.segment_inventory);
-    match registry_catalog::validate_registry_catalog(index_path, &catalog_sources) {
+    // bootstrap 一次性校验：独立临时段级缓存（无跨拍复用价值，N9b 签参统一）
+    let entry_cache = registry_catalog::CatalogEntryCache::default();
+    match registry_catalog::validate_registry_catalog(index_path, &catalog_sources, &entry_cache) {
         Ok(Some(validated_catalog)) => Some(validated_catalog),
         Ok(None) => {
             registry.force_registry_checkpoint();

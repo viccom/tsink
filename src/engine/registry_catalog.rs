@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use xxhash_rust::xxh64::Xxh64;
@@ -62,17 +63,30 @@ pub(super) struct ValidatedRegistryCatalog {
     pub(super) series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
 }
 
-/// sources 集合身份指纹（O(n) 内存哈希、零 IO）——validate 缓存的 key。
-/// 段不可变且 segment_id 单调不复用，(lane, root) 集合唯一确定 catalog 内容；
-/// N9：post-flush no-op 拍高频调用的全量段 manifest 重读由此短路。
-pub(super) fn sources_fingerprint(sources: &[PersistedRegistryCatalogSource]) -> u64 {
-    let mut hasher = Xxh64::new(0);
-    for source in sources {
-        hasher.update(format!("{:?}", source.lane).as_bytes());
-        hasher.update(&(source.root.as_os_str().len() as u64).to_le_bytes());
-        hasher.update(source.root.to_string_lossy().as_bytes());
+/// 段级 catalog entry 缓存（N9b）：段不可变且 segment_id 单调不复用 →
+/// entry 按 root 永久有效。post-flush 维护拍高频构建 catalog 时全量重读
+/// 段 manifest 是 openat 风暴根因（万级段 = 单核 CPU）；集合指纹缓存在
+/// compaction 持续产段的实例上永不命中（实测），按段缓存后每拍只读新增段。
+/// NotFound(None) 同缓存：消失是 compaction 删除的持久结果（N1 窗口瞬态
+/// 场景下轮 sources 更新后自愈，catalog 是校验侧车不承载段数据）。
+#[derive(Default)]
+pub(super) struct CatalogEntryCache {
+    entries: Mutex<HashMap<PathBuf, Option<PersistedRegistryCatalogEntry>>>,
+}
+
+impl CatalogEntryCache {
+    fn get_or_build(
+        &self,
+        source: &PersistedRegistryCatalogSource,
+    ) -> Result<Option<PersistedRegistryCatalogEntry>> {
+        let mut guard = self.entries.lock();
+        if let Some(cached) = guard.get(&source.root) {
+            return Ok(cached.clone());
+        }
+        let built = build_catalog_entry(source)?;
+        guard.insert(source.root.clone(), built.clone());
+        Ok(built)
     }
-    hasher.digest()
 }
 
 pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
@@ -85,6 +99,7 @@ pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
 pub(super) fn validate_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
 ) -> Result<Option<ValidatedRegistryCatalog>> {
     let path = catalog_path(snapshot_path);
     if !path_exists_no_follow(&path).map_err(|source| TsinkError::IoWithPath {
@@ -94,7 +109,7 @@ pub(super) fn validate_registry_catalog(
         return Ok(None);
     }
 
-    let expected_segments = build_catalog_entries(sources)?;
+    let expected_segments = build_catalog_entries(sources, entry_cache)?;
     let actual = serde_json::from_slice::<PersistedRegistryCatalogFile>(
         &std::fs::read(&path).map_err(|source| TsinkError::IoWithPath {
             path: path.clone(),
@@ -110,14 +125,15 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
-/// 写出 catalog 并返回其 series_fingerprint（N9：供调用方回填 validate 缓存，
-/// 使写后下一拍无需读盘即可命中）。全量读段 + 写文件，仅在缓存 miss 时进入。
+/// 写出 catalog 并返回其 series_fingerprint。entries 构建走段级缓存，
+/// 集合渐变时只读新增段（N9b）。
 pub(super) fn persist_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
 ) -> Result<Option<PersistedRegistrySeriesFingerprint>> {
     let path = catalog_path(snapshot_path);
-    let catalog = build_catalog(sources)?;
+    let catalog = build_catalog(sources, entry_cache)?;
     let fingerprint = catalog.series_fingerprint.clone();
     let bytes = serde_json::to_vec_pretty(&catalog)?;
     write_file_atomically_and_sync_parent(&path, &bytes)?;
@@ -155,20 +171,22 @@ pub(super) fn validate_registry_snapshot(
 
 fn build_catalog(
     sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
 ) -> Result<PersistedRegistryCatalogFile> {
     Ok(PersistedRegistryCatalogFile {
         version: REGISTRY_CATALOG_VERSION,
-        segments: build_catalog_entries(sources)?,
+        segments: build_catalog_entries(sources, entry_cache)?,
         series_fingerprint: Some(build_series_fingerprint_from_sources(sources)?),
     })
 }
 
 fn build_catalog_entries(
     sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
 ) -> Result<Vec<PersistedRegistryCatalogEntry>> {
     let mut segments = sources
         .iter()
-        .map(build_catalog_entry)
+        .map(|source| entry_cache.get_or_build(source))
         .collect::<Result<Vec<Option<PersistedRegistryCatalogEntry>>>>()?
         .into_iter()
         .flatten()
