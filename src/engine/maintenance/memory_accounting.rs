@@ -231,7 +231,23 @@ impl ChunkStorage {
         {
             return;
         }
-        self.refresh_memory_usage();
+        // Drift observability: compare the incremental authoritative value
+        // (captured before the refresh stores its result) against the full
+        // recompute. Double threshold — relative 1% AND absolute 1 MiB — so
+        // small-value jitter never fires; constants inlined, no config
+        // surface. Warn-only: the refresh above already reset `used` to the
+        // authoritative full value, so the drift is reported, not "fixed".
+        let before_incremental = self.memory_used_value();
+        let reconciled = self.refresh_memory_usage();
+        let drift = before_incremental.abs_diff(reconciled);
+        if drift > (before_incremental / 100).max(1024 * 1024) {
+            tracing::warn!(
+                incremental = before_incremental,
+                reconciled,
+                drift,
+                "memory accounting drift between incremental and full recompute"
+            );
+        }
         self.observability
             .flush
             .memory_reconciles_total
