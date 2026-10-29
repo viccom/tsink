@@ -3965,3 +3965,79 @@ fn close_waits_for_inflight_background_refresh_before_final_persist() {
     close_thread.join().unwrap();
     assert!(scan_calls.load(Ordering::SeqCst) >= 1);
 }
+
+// N9（2026-10-29 生产实锤）：post-flush no-op 维护拍每次都全量重读全部
+// persisted 段 manifest 做 catalog 校验（12k 段 = 单核 CPU + openat 风暴）。
+// 缓解 = sources 集合指纹缓存（段不可变 → 集合不变时校验结果不变）。
+// 红形态：删光段目录后二次调用 → 无缓存会全量重建（NotFound 跳过 → entries
+// 为空 ≠ 磁盘 catalog）→ catalog 被重写为空 segments → 字节变化 → 断言失败。
+// 绿形态：指纹命中 → 零读盘零重写 → catalog 字节不变。
+#[test]
+fn n9_catalog_validate_cache_skips_manifest_reread_on_unchanged_sources() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let labels = vec![Label::new("host", "n9")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("n9_catalog_validate_cache_metric", &labels)
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(
+        &lane_path,
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(60, 60.0), (61, 61.0)],
+    );
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(lane_path.clone()),
+        None,
+        2,
+        ChunkStorageOptions::default(),
+    )
+    .unwrap();
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+
+    let sources = {
+        let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+            Some(&lane_path),
+            None,
+            None,
+        )
+        .unwrap();
+        super::super::registry_catalog::inventory_sources(&inventory)
+    };
+    assert!(!sources.is_empty(), "前置：至少一个 persisted 段源");
+    storage
+        .persist_series_registry_index_with_catalog_sources(&sources)
+        .unwrap();
+    let catalog_file = checkpoint_path
+        .parent()
+        .unwrap()
+        .join("series_index.catalog.json");
+    let bytes_before = std::fs::read(&catalog_file).unwrap();
+    assert!(
+        bytes_before.iter().any(|&b| b != b' ' && b != b'\n'),
+        "前置：catalog 文件已写出非空内容"
+    );
+
+    // 模拟"若二次校验仍读盘会发生什么"：段目录全部消失（N1 语义下 read 返回
+    // NotFound → skip）。sources 集合本身未变——缓存命中路径必须不读盘。
+    for source in &sources {
+        let _ = std::fs::remove_dir_all(&source.root);
+    }
+    storage
+        .persist_series_registry_index_with_catalog_sources(&sources)
+        .unwrap();
+    let bytes_after = std::fs::read(&catalog_file).unwrap();
+    assert_eq!(
+        bytes_before, bytes_after,
+        "sources 未变时二次校验必须走缓存：不重读段 manifest、不重写 catalog"
+    );
+}
