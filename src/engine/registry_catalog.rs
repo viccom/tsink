@@ -72,6 +72,7 @@ pub(super) struct ValidatedRegistryCatalog {
 #[derive(Default)]
 pub(super) struct CatalogEntryCache {
     entries: Mutex<HashMap<PathBuf, Option<PersistedRegistryCatalogEntry>>>,
+    series: Mutex<HashMap<PathBuf, Vec<crate::engine::segment::PersistedSeries>>>,
 }
 
 impl CatalogEntryCache {
@@ -86,6 +87,41 @@ impl CatalogEntryCache {
         let built = build_catalog_entry(source)?;
         guard.insert(source.root.clone(), built.clone());
         Ok(built)
+    }
+
+    /// 段 series 元数据（series.bin）按 root 缓存——同 entry 语义：段不可变
+    /// 永久有效；NotFound 缓存为空 Vec（compaction 删除持久；N1 瞬态窗口
+    /// 下轮 sources 更新自愈）。
+    fn get_or_load_series(
+        &self,
+        root: &Path,
+    ) -> Result<Vec<crate::engine::segment::PersistedSeries>> {
+        let mut guard = self.series.lock();
+        if let Some(cached) = guard.get(root) {
+            return Ok(cached.clone());
+        }
+        let loaded = match crate::engine::segment::load_segment_series_metadata(root) {
+            Ok(series) => series,
+            Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    root = %root.display(),
+                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
+                );
+                Vec::new()
+            }
+            Err(TsinkError::IoWithPath { path, source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                warn!(
+                    root = %path.display(),
+                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
+                );
+                Vec::new()
+            }
+            Err(err) => return Err(err),
+        };
+        guard.insert(root.to_path_buf(), loaded.clone());
+        Ok(loaded)
     }
 }
 
@@ -176,7 +212,7 @@ fn build_catalog(
     Ok(PersistedRegistryCatalogFile {
         version: REGISTRY_CATALOG_VERSION,
         segments: build_catalog_entries(sources, entry_cache)?,
-        series_fingerprint: Some(build_series_fingerprint_from_sources(sources)?),
+        series_fingerprint: Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
     })
 }
 
@@ -248,36 +284,15 @@ fn build_catalog_entry(
 
 fn build_series_fingerprint_from_sources(
     sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
 ) -> Result<PersistedRegistrySeriesFingerprint> {
     let mut series_by_id = BTreeMap::<SeriesId, crate::engine::segment::PersistedSeries>::new();
     let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
 
     for source in sources {
-        let segment_series = match crate::engine::segment::load_segment_series_metadata(
-            &source.root,
-        ) {
-            Ok(series) => series,
-            // Same tolerance as build_catalog_entry: a concurrently removed
-            // segment root (compaction replacement window) is skipped rather
-            // than failing the whole fingerprint build.
-            Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
-                    root = %source.root.display(),
-                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
-                );
-                continue;
-            }
-            Err(TsinkError::IoWithPath { path, source })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                warn!(
-                    root = %path.display(),
-                    "Persisted segment root disappeared while fingerprinting registry catalog series; skipping it"
-                );
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        // N9c：series 元数据按 root 缓存（段不可变）——validate 不命中期间
+        // 每拍 persist 的全量 series.bin 重读是 flush 线程残余负载根因。
+        let segment_series = entry_cache.get_or_load_series(&source.root)?;
         for series in segment_series {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
