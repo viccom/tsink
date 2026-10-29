@@ -62,6 +62,19 @@ pub(super) struct ValidatedRegistryCatalog {
     pub(super) series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
 }
 
+/// sources 集合身份指纹（O(n) 内存哈希、零 IO）——validate 缓存的 key。
+/// 段不可变且 segment_id 单调不复用，(lane, root) 集合唯一确定 catalog 内容；
+/// N9：post-flush no-op 拍高频调用的全量段 manifest 重读由此短路。
+pub(super) fn sources_fingerprint(sources: &[PersistedRegistryCatalogSource]) -> u64 {
+    let mut hasher = Xxh64::new(0);
+    for source in sources {
+        hasher.update(format!("{:?}", source.lane).as_bytes());
+        hasher.update(&(source.root.as_os_str().len() as u64).to_le_bytes());
+        hasher.update(source.root.to_string_lossy().as_bytes());
+    }
+    hasher.digest()
+}
+
 pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
     snapshot_path
         .parent()
@@ -97,13 +110,18 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
+/// 写出 catalog 并返回其 series_fingerprint（N9：供调用方回填 validate 缓存，
+/// 使写后下一拍无需读盘即可命中）。全量读段 + 写文件，仅在缓存 miss 时进入。
 pub(super) fn persist_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
-) -> Result<()> {
+) -> Result<Option<PersistedRegistrySeriesFingerprint>> {
     let path = catalog_path(snapshot_path);
-    let bytes = serde_json::to_vec_pretty(&build_catalog(sources)?)?;
-    write_file_atomically_and_sync_parent(&path, &bytes)
+    let catalog = build_catalog(sources)?;
+    let fingerprint = catalog.series_fingerprint.clone();
+    let bytes = serde_json::to_vec_pretty(&catalog)?;
+    write_file_atomically_and_sync_parent(&path, &bytes)?;
+    Ok(fingerprint)
 }
 
 pub(super) fn inventory_sources(
