@@ -39,13 +39,16 @@ fn topology_chunk_ref(
     }
 }
 
+/// (chunk sequence, min_ts, max_ts) per (series_id, chunks) entry.
+type SeriesChunks = Vec<(u64, Vec<(u64, i64, i64)>)>;
+
 struct TopologySegment {
     segment_slot: usize,
     root: &'static str,
     tier: PersistedSegmentTier,
     min_ts: i64,
     max_ts: i64,
-    chunks_by_series: Vec<(u64, Vec<(u64, i64, i64)>)>,
+    chunks_by_series: SeriesChunks,
 }
 
 fn topology_segments() -> Vec<TopologySegment> {
