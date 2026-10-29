@@ -132,6 +132,17 @@ impl ChunkStorage {
                             }
                         };
                         let Some(chunk) = chunk else {
+                            // `flush_partial` drops an empty partition head
+                            // even when it yields no chunk, so the state can
+                            // shrink on this path too. Record the delta here
+                            // or the decrement is lost — the every-persist
+                            // full refresh used to mask it, but S6's
+                            // rate-limited reconciliation no longer does.
+                            if account_memory {
+                                let state_bytes_after =
+                                    Self::active_state_memory_usage_bytes(state);
+                                shard_delta.record_change(state_bytes_before, state_bytes_after);
+                            }
                             break;
                         };
                         if account_memory {
