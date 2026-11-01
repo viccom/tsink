@@ -9,7 +9,10 @@ use super::*;
 enum ActiveFlushPolicy {
     All,
     BackgroundEligible,
+    /// 周期拍：当前 head 受 seal 门控（P1），只在点数/年龄/WAL 达门槛时 seal。
     BackgroundBounded,
+    /// 准入内存压力救济：必须能 seal 当前 head 才能腾出预算，故不受门控。
+    BackgroundPressureRelief,
 }
 
 impl ChunkStorage {
@@ -94,6 +97,10 @@ impl ChunkStorage {
         self.flush_active_with_policy(ActiveFlushPolicy::BackgroundBounded)
     }
 
+    pub(super) fn flush_pressure_relief_active(&self) -> Result<()> {
+        self.flush_active_with_policy(ActiveFlushPolicy::BackgroundPressureRelief)
+    }
+
     fn flush_active_with_policy(&self, policy: ActiveFlushPolicy) -> Result<()> {
         self.observability
             .flush
@@ -106,6 +113,13 @@ impl ChunkStorage {
 
         let result = (|| -> Result<()> {
             let account_memory = self.memory.accounting_enabled;
+            let now = Instant::now();
+            let unsealed_wal_bytes = self
+                .persisted
+                .wal
+                .as_ref()
+                .and_then(|wal| wal.total_size_bytes().ok())
+                .unwrap_or(0);
             for (shard_idx, shard) in self.chunks.active_builders.iter().enumerate() {
                 let mut active = shard.write();
                 let mut shard_delta = MemoryDeltaBytes::default();
@@ -123,6 +137,44 @@ impl ChunkStorage {
                                 state.flush_background_eligible_partial()?
                             }
                             ActiveFlushPolicy::BackgroundBounded => {
+                                let chunk = state.flush_background_eligible_partial()?;
+                                if chunk.is_some() {
+                                    chunk
+                                } else {
+                                    match state.current_head_seal_decision(
+                                        &self.runtime.seal_policy,
+                                        unsealed_wal_bytes,
+                                        now,
+                                    ) {
+                                        CurrentHeadSealDecision::Seal(trigger) => {
+                                            let counter = match trigger {
+                                                SealTrigger::Points => {
+                                                    &self
+                                                        .observability
+                                                        .flush
+                                                        .seal_trigger_points_total
+                                                }
+                                                SealTrigger::Age => {
+                                                    &self.observability.flush.seal_trigger_age_total
+                                                }
+                                                SealTrigger::Wal => {
+                                                    &self.observability.flush.seal_trigger_wal_total
+                                                }
+                                            };
+                                            counter.fetch_add(1, Ordering::Relaxed);
+                                            state.flush_current_partial()?
+                                        }
+                                        CurrentHeadSealDecision::Hold => {
+                                            self.observability
+                                                .flush
+                                                .seal_hold_total
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            None
+                                        }
+                                    }
+                                }
+                            }
+                            ActiveFlushPolicy::BackgroundPressureRelief => {
                                 let chunk = state.flush_background_eligible_partial()?;
                                 if chunk.is_some() {
                                     chunk

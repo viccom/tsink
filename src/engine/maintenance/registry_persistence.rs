@@ -63,24 +63,62 @@ impl ChunkStorage {
         checkpoint_path: &Path,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
     ) -> Result<()> {
-        // N9b：no-op 维护拍高频进入此处；validate/persist 的 entries 构建走
-        // 段级缓存（段不可变 → 每拍只读新增段），消灭万级段的 manifest 重读风暴。
-        let entry_cache = &self.persisted.catalog_validate_cache;
-        if matches!(
-            registry_catalog::validate_registry_catalog(checkpoint_path, sources, entry_cache)?,
-            Some(registry_catalog::ValidatedRegistryCatalog {
-                series_fingerprint: Some(_),
-            })
-        ) {
-            return Ok(());
-        }
-        registry_catalog::persist_registry_catalog(checkpoint_path, sources, entry_cache)?;
-        Ok(())
+        self.persist_series_registry_catalog_index_with_sources_mode(
+            checkpoint_path,
+            sources,
+            false,
+        )
     }
 
-    fn persist_series_registry_catalog_index(&self, checkpoint_path: &Path) -> Result<()> {
-        let sources = self.persisted_registry_catalog_sources();
-        self.persist_series_registry_catalog_index_with_sources(checkpoint_path, &sources)
+    /// checkpoint/关闭锚点：无视节流窗口强制刷新 catalog。
+    fn persist_series_registry_catalog_index_with_sources_forced(
+        &self,
+        checkpoint_path: &Path,
+        sources: &[registry_catalog::PersistedRegistryCatalogSource],
+    ) -> Result<()> {
+        self.persist_series_registry_catalog_index_with_sources_mode(checkpoint_path, sources, true)
+    }
+
+    fn persist_series_registry_catalog_index_with_sources_mode(
+        &self,
+        checkpoint_path: &Path,
+        sources: &[registry_catalog::PersistedRegistryCatalogSource],
+        force: bool,
+    ) -> Result<()> {
+        // P1：catalog 是段 manifest 的反规范化缓存。旧实现在每次 persist
+        // （低速率下 ~1.7 次/s）都「全量读 + 解析 + 逐条比对」，失配再全量
+        // pretty-JSON 重写——CPU 与写盘成本 ∝ 累计段数，随 uptime 线性上涨。
+        // 现在常规路径按 `catalog_persist_interval` 节流并用内容指纹去重；
+        // 正确性由启动时的段目录扫描兜底，checkpoint/关闭锚点强制刷新。
+        let (_, outcome) = registry_catalog::persist_registry_catalog_throttled(
+            checkpoint_path,
+            sources,
+            &self.persisted.catalog_validate_cache,
+            &self.persisted.catalog_persist_memo,
+            self.runtime.catalog_persist_interval,
+            force,
+        )?;
+        self.observability
+            .flush
+            .catalog_persist_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            registry_catalog::CatalogPersistOutcome::Persisted => {
+                self.observability
+                    .flush
+                    .catalog_persisted_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            registry_catalog::CatalogPersistOutcome::SkippedThrottled
+            | registry_catalog::CatalogPersistOutcome::SkippedUnchanged
+            | registry_catalog::CatalogPersistOutcome::SkippedValidatedFromFile => {
+                self.observability
+                    .flush
+                    .catalog_persist_skipped_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     fn checkpoint_series_registry_index_with_policy(
@@ -98,7 +136,13 @@ impl ChunkStorage {
                 &delta_path,
                 &delta_dir_path,
                 allow_invalid_catalog,
-                |checkpoint_path| self.persist_series_registry_catalog_index(checkpoint_path),
+                |checkpoint_path| {
+                    let sources = self.persisted_registry_catalog_sources();
+                    self.persist_series_registry_catalog_index_with_sources_forced(
+                        checkpoint_path,
+                        &sources,
+                    )
+                },
             )
     }
 

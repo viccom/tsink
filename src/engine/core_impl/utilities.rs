@@ -58,6 +58,18 @@ pub(in crate::engine::storage_engine) fn saturating_u64_from_usize(value: usize)
     value.min(u64::MAX as usize) as u64
 }
 
+/// 饱和减原语（BUG#3 家族收敛，2026-10-30）：`fetch_sub` 在 decrement >
+/// current 时下溢成 2^64-x 巨值（生产实测曾致归档永久停摆）。所有 u64
+/// 内存记账计数器的减法必须走这里——宁可停在 0（低估，由 reconcile 纠正）
+/// 也不越界。
+pub(in crate::engine::storage_engine) fn saturating_sub_fetch(atomic: &AtomicU64, decrement: u64) {
+    atomic
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(decrement))
+        })
+        .ok();
+}
+
 /// O(touched) baseline for incremental visibility-state memory accounting.
 ///
 /// 2026-08-29 load-test follow-up (plan Task 13): the write path used to call

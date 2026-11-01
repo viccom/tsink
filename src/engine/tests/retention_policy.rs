@@ -60,6 +60,7 @@ fn chunk_storage_at_time(now: i64, retention_window: i64) -> ChunkStorage {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: Some(now),
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap()
@@ -366,6 +367,7 @@ fn retention_sweep_reload_failure_keeps_existing_persisted_data_visible() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: Some(110),
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -639,6 +641,7 @@ fn retention_sweeper_uses_repaired_recency_after_deleting_anchor() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -832,6 +835,7 @@ fn tiered_retention_uses_repaired_recency_after_deleting_anchor() {
             }),
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();

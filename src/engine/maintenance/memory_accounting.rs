@@ -48,10 +48,8 @@ impl ChunkStorage {
         }
 
         let decrement = saturating_u64_from_usize(bytes);
-        component.fetch_sub(decrement, Ordering::AcqRel);
-        self.memory
-            .shared_used_bytes
-            .fetch_sub(decrement, Ordering::AcqRel);
+        saturating_sub_fetch(component, decrement);
+        saturating_sub_fetch(&self.memory.shared_used_bytes, decrement);
     }
 
     pub(in super::super) fn account_included_memory_component_delta_bytes(
@@ -170,19 +168,10 @@ impl ChunkStorage {
         //
         // 这里只保证**计数器不越界**：宁可停在 0（低估）也不越界成巨值（灾难）。
         // 真实值由准入路径的 reconcile 纠正（见 ingest_pipeline/prepare.rs）。
-        self.memory.used_bytes_by_shard[shard_idx].fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_sub(decrement)),
-        ).ok();
-        self.memory
-            .used_bytes
-            .fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| Some(current.saturating_sub(decrement)),
-            )
-            .ok();
+        // 原语收敛（2026-10-30）：与写路径 ShardMemoryAccountingContext 共用
+        // saturating_sub_fetch，消除"一套计数器、两套实现"的分叉。
+        saturating_sub_fetch(&self.memory.used_bytes_by_shard[shard_idx], decrement);
+        saturating_sub_fetch(&self.memory.used_bytes, decrement);
     }
 
     pub(in super::super) fn account_memory_delta(&self, shard_idx: usize, delta: MemoryDeltaBytes) {

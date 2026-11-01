@@ -49,6 +49,7 @@ fn test_options(current_time_override: Option<i64>) -> ChunkStorageOptions {
         tiered_storage: None,
         #[cfg(test)]
         current_time_override,
+        ..ChunkStorageOptions::default()
     }
 }
 

@@ -17,9 +17,12 @@ enum FlushPipelinePolicy {
     /// Explicit background wakeups that must not fragment the live head (e.g.
     /// the post-commit flush poke from `insert_rows`).
     BackgroundEligibleOnly,
-    /// Deadline-driven or admission pressure-relief flushes; may also seal the
-    /// current head so its memory becomes evictable for budget enforcement.
+    /// Deadline-driven periodic flush; seals the current head only when the
+    /// P1 seal gate (min points / head age / unsealed WAL) allows it.
     BackgroundBounded,
+    /// Admission pressure-relief flush: must be able to seal the current head so
+    /// its memory becomes evictable for budget enforcement (bypasses the gate).
+    BackgroundPressureRelief,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,14 +161,16 @@ impl FlushWorkerSchedule {
         pressure_relief: bool,
         explicit_wakeup: bool,
     ) -> Option<FlushPipelinePolicy> {
+        if pressure_relief {
+            // 救济优先（2026-10-30 审查修复）：救济请求单次消费
+            // （take_flush_pressure_relief_request），若让周期 bounded 分支先行，
+            // 恰逢 deadline 的救济会被降级成带 seal 门控的普通拍——写者正等着
+            // 低于 min_points 的活跃 head 被 seal 回收内存。救济拍是 bounded 的
+            // 严格超集；不消耗 bounded deadline（下一拍照常跑周期拍）。
+            return Some(FlushPipelinePolicy::BackgroundPressureRelief);
+        }
         if now >= self.next_bounded_flush_at {
             self.next_bounded_flush_at = now + self.interval;
-            Some(FlushPipelinePolicy::BackgroundBounded)
-        } else if pressure_relief {
-            // Admission pressure relief must run bounded: an eligible-only pass
-            // never seals the current head, which is the only memory a writer
-            // idling on a single live head can get back. Relief does not defer
-            // the periodic bounded deadline.
             Some(FlushPipelinePolicy::BackgroundBounded)
         } else if explicit_wakeup {
             Some(FlushPipelinePolicy::BackgroundEligibleOnly)
@@ -386,6 +391,15 @@ impl ChunkStorage {
                                 || storage.background_flush_eligible_pipeline_once(),
                             )
                         }
+                        FlushPipelinePolicy::BackgroundPressureRelief => {
+                            Self::run_background_worker_pass(
+                                &control,
+                                "flush",
+                                flush_interval,
+                                || storage.background_maintenance_gate(),
+                                || storage.background_flush_pressure_relief_pipeline_once(),
+                            )
+                        }
                         FlushPipelinePolicy::Foreground => unreachable!(),
                     };
 
@@ -524,6 +538,10 @@ impl ChunkStorage {
         self.flush_pipeline_once_with_policy(FlushPipelinePolicy::BackgroundBounded)
     }
 
+    pub(super) fn background_flush_pressure_relief_pipeline_once(&self) -> Result<()> {
+        self.flush_pipeline_once_with_policy(FlushPipelinePolicy::BackgroundPressureRelief)
+    }
+
     fn background_flush_eligible_pipeline_once(&self) -> Result<()> {
         self.flush_pipeline_once_with_policy(FlushPipelinePolicy::BackgroundEligibleOnly)
     }
@@ -551,6 +569,7 @@ impl ChunkStorage {
             FlushPipelinePolicy::Foreground => self.flush_all_active(),
             FlushPipelinePolicy::BackgroundEligibleOnly => self.flush_background_eligible_active(),
             FlushPipelinePolicy::BackgroundBounded => self.flush_background_bounded_active(),
+            FlushPipelinePolicy::BackgroundPressureRelief => self.flush_pressure_relief_active(),
         };
         if let Err(err) = flush_result {
             self.observability
@@ -654,17 +673,29 @@ mod tests {
         );
         assert_eq!(schedule.next_bounded_flush_at, now + interval);
 
-        // Admission pressure relief runs bounded even before the periodic
-        // deadline, without deferring that deadline, and outranks a plain
-        // explicit wakeup.
+        // Admission pressure relief must be able to seal the live head even
+        // before the periodic deadline (bypassing the P1 seal gate), without
+        // deferring that deadline, and outranks a plain explicit wakeup.
         assert_eq!(
             schedule.next_policy(now, true, false),
-            Some(FlushPipelinePolicy::BackgroundBounded)
+            Some(FlushPipelinePolicy::BackgroundPressureRelief)
         );
         assert_eq!(
             schedule.next_policy(now, true, true),
-            Some(FlushPipelinePolicy::BackgroundBounded)
+            Some(FlushPipelinePolicy::BackgroundPressureRelief)
         );
+        assert_eq!(schedule.next_bounded_flush_at, now + interval);
+
+        // 碰撞仲裁（2026-10-30 审查修复）：救济请求与周期 bounded 拍**同时到期**
+        // 时救济必须胜出——救济请求是单次消费的（take_flush_pressure_relief_request），
+        // 被 bounded 分支吞掉会降级成带 seal 门控的普通拍，恰好在写者等着回收
+        // 低于 min_points 的活跃 head 内存时失效（拒写最长 30s）。
+        let deadline = now + interval;
+        assert_eq!(
+            schedule.next_policy(deadline, true, false),
+            Some(FlushPipelinePolicy::BackgroundPressureRelief)
+        );
+        // 救济拍不消耗周期 deadline：下一拍照常跑 bounded
         assert_eq!(schedule.next_bounded_flush_at, now + interval);
 
         let bounded_at = now + interval;

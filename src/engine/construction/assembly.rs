@@ -114,6 +114,7 @@ impl StorageStateAssembly {
         PersistedStorageState {
             persisted_index: RwLock::new(PersistedIndexState::default()),
             catalog_validate_cache: Default::default(),
+            catalog_persist_memo: Default::default(),
             segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
             timestamp_indexes: TimestampIndexCache::new(timestamp_index_cache_budget_bytes),
             persisted_index_dirty,
@@ -149,6 +150,9 @@ impl StorageStateAssembly {
             cardinality_limit: AtomicUsize::new(options.cardinality_limit),
             wal_size_limit_bytes: options.wal_size_limit_bytes,
             admission_poll_interval: options.admission_poll_interval,
+            flush_interval: options.flush_interval,
+            seal_policy: options.seal_policy,
+            catalog_persist_interval: options.catalog_persist_interval,
         }
     }
 

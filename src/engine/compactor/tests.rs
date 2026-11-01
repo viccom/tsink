@@ -692,6 +692,74 @@ fn compaction_source_window_sixteen_merges_sixteen_l0_segments() {
         .all(|segment| segment.manifest.point_count <= 8_388_608 + 2048));
 }
 
+/// 全墓碑窗口（2026-10-30 审查修复）：窗口内所有点被墓碑盖住时，正确的
+/// 替换是**纯删除**（空输出 marker）。此前 execution 返回 compacted=false 且
+/// 不删源段，planning 又把标志强改 true——调用方对仍在磁盘上的源段记录幻影
+/// removed_roots（内存索引被摘除）、drain 循环每轮重选同一窗口烧光预算（活锁）。
+#[test]
+fn all_tombstoned_window_is_deleted_not_livelocked() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    let mut seg1_chunks = HashMap::new();
+    seg1_chunks.insert(
+        series_id,
+        vec![make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)])],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &seg1_chunks)
+        .unwrap();
+
+    let mut seg2_chunks = HashMap::new();
+    seg2_chunks.insert(
+        series_id,
+        vec![make_numeric_chunk(series_id, &[(15, 3.0), (30, 4.0)])],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 2)
+        .unwrap()
+        .write_segment(&registry, &seg2_chunks)
+        .unwrap();
+
+    // 全范围墓碑：两段（时间重叠，必成窗口）所有点全部被盖住
+    let mut tombstones = HashMap::new();
+    tombstones.insert(
+        series_id,
+        vec![TombstoneRange {
+            start: 0,
+            end: 1000,
+        }],
+    );
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let compactor = Compactor::new(temp_dir.path(), 8);
+    let outcome = compactor.compact_once_with_changes().unwrap();
+    assert!(
+        outcome.stats.compacted,
+        "空输出替换也是完成了一次压缩（否则调用方无从推进）"
+    );
+
+    // 源段必须真的从磁盘消失（红形态：残留 + 幻影 removed_roots + 活锁）
+    let loaded = load_segments(temp_dir.path()).unwrap();
+    assert!(
+        loaded.chunks_by_series.is_empty(),
+        "全墓碑窗口的源段应被删除，实际仍加载到 {:?}",
+        loaded.chunks_by_series.keys().collect::<Vec<_>>()
+    );
+
+    // 第二轮 pass：窗口已消失，无事可做（红形态：每轮重选同一窗口恒 true）
+    let second = compactor.compact_once_with_changes().unwrap();
+    assert!(
+        !second.stats.compacted,
+        "死窗口删除后不应再被压缩选中（活锁复现）"
+    );
+}
+
 #[test]
 fn compactor_purges_tombstoned_points() {
     let temp_dir = TempDir::new().unwrap();

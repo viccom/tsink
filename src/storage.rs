@@ -455,6 +455,22 @@ pub struct FlushObservabilitySnapshot {
     pub persisted_segments_total: u64,
     pub persist_duration_nanos_total: u64,
     pub evicted_sealed_chunks_total: u64,
+    /// P1 seal 门控触发次数（点数/年龄/WAL 三分支）与保持打开计数。
+    #[serde(default)]
+    pub seal_trigger_points_total: u64,
+    #[serde(default)]
+    pub seal_trigger_age_total: u64,
+    #[serde(default)]
+    pub seal_trigger_wal_total: u64,
+    #[serde(default)]
+    pub seal_hold_total: u64,
+    /// P1 catalog 持久化：进入路径 / 实际写盘 / 跳过（节流或内容未变）。
+    #[serde(default)]
+    pub catalog_persist_attempts_total: u64,
+    #[serde(default)]
+    pub catalog_persisted_total: u64,
+    #[serde(default)]
+    pub catalog_persist_skipped_total: u64,
     pub tier_moves_total: u64,
     pub tier_move_errors_total: u64,
     pub expired_segments_total: u64,
@@ -1072,6 +1088,11 @@ pub struct StorageBuilder {
     chunk_points: usize,
     max_writers: usize,
     write_timeout: Duration,
+    flush_interval: Duration,
+    seal_min_points: usize,
+    max_head_age: Duration,
+    max_unsealed_wal_bytes: u64,
+    catalog_persist_interval: Duration,
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
@@ -1112,6 +1133,12 @@ impl Default for StorageBuilder {
             chunk_points: DEFAULT_CHUNK_POINTS,
             max_writers: crate::cgroup::default_workers_limit(),
             write_timeout: Duration::from_secs(30),
+            flush_interval: crate::engine::storage_engine::DEFAULT_FLUSH_INTERVAL,
+            seal_min_points: 0,
+            max_head_age: crate::engine::storage_engine::DEFAULT_MAX_HEAD_AGE,
+            max_unsealed_wal_bytes: crate::engine::storage_engine::DEFAULT_MAX_UNSEALED_WAL_BYTES,
+            catalog_persist_interval:
+                crate::engine::storage_engine::DEFAULT_CATALOG_PERSIST_INTERVAL,
             partition_duration: Duration::from_secs(3600),
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
@@ -1246,6 +1273,57 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
+        self
+    }
+
+    /// Sets how often the background flush worker wakes up.
+    ///
+    /// This is the upper bound on how long sealed data or a seal-eligible active
+    /// head can wait before it is persisted; it is not a request to seal on every
+    /// tick. Default: 250 ms.
+    #[must_use]
+    pub fn with_flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = interval;
+        self
+    }
+
+    /// Sets the minimum active-head point count that lets a background flush seal
+    /// the live head before it is full. `0` (default) derives it from the chunk
+    /// point cap (`point_cap/8`, minimum 1). Explicit/foreground flushes, pressure
+    /// relief, and full-chunk rotation are never gated by this value.
+    #[must_use]
+    pub fn with_seal_min_points(mut self, points: usize) -> Self {
+        self.seal_min_points = points;
+        self
+    }
+
+    /// Sets the maximum age of an active head before a background flush force-seals
+    /// it even when it is below the minimum point count. This bounds WAL growth and
+    /// in-memory retention at low ingest rates. Default: 300 s.
+    #[must_use]
+    pub fn with_max_head_age(mut self, age: Duration) -> Self {
+        self.max_head_age = age;
+        self
+    }
+
+    /// Sets the unflushed WAL byte ceiling that force-seals the live head even when
+    /// it is below the minimum point count or age. Default: 64 MiB.
+    #[must_use]
+    pub fn with_max_unsealed_wal_bytes(mut self, bytes: u64) -> Self {
+        self.max_unsealed_wal_bytes = bytes;
+        self
+    }
+
+    /// Sets the minimum interval between full segment-registry catalog rewrites.
+    ///
+    /// The catalog is a denormalized cache of per-segment manifests: correctness
+    /// recovery never depends on it being current (startup re-derives missing
+    /// entries from the segment directories), so routine flushes only mark it dirty
+    /// and this interval coalesces the O(segments) rewrite. Shutdown/checkpoint
+    /// anchors always persist it. Default: 30 s.
+    #[must_use]
+    pub fn with_catalog_persist_interval(mut self, interval: Duration) -> Self {
+        self.catalog_persist_interval = interval;
         self
     }
 
@@ -1492,6 +1570,26 @@ impl StorageBuilder {
 
     pub(crate) fn write_timeout(&self) -> Duration {
         self.write_timeout
+    }
+
+    pub(crate) fn flush_interval(&self) -> Duration {
+        self.flush_interval
+    }
+
+    pub(crate) fn seal_min_points(&self) -> usize {
+        self.seal_min_points
+    }
+
+    pub(crate) fn max_head_age(&self) -> Duration {
+        self.max_head_age
+    }
+
+    pub(crate) fn max_unsealed_wal_bytes(&self) -> u64 {
+        self.max_unsealed_wal_bytes
+    }
+
+    pub(crate) fn catalog_persist_interval(&self) -> Duration {
+        self.catalog_persist_interval
     }
 
     pub(crate) fn partition_duration(&self) -> Duration {

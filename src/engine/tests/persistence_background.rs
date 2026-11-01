@@ -304,6 +304,7 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -394,6 +395,7 @@ fn background_compaction_refreshes_persisted_index_in_background() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1935,6 +1937,7 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
                 }),
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -2090,6 +2093,7 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
             tiered_storage: Some(tiered_storage.clone()),
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -2596,6 +2600,7 @@ fn flush_pipeline_completes_while_another_writer_permit_is_held() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -3107,6 +3112,7 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: Some(100),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -3229,6 +3235,7 @@ fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_s
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: Some(100),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -3377,6 +3384,7 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
                 }),
                 #[cfg(test)]
                 current_time_override: Some(100),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -3534,6 +3542,7 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
             tiered_storage: Some(tiered_storage.clone()),
             #[cfg(test)]
             current_time_override: Some(100),
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -3642,6 +3651,7 @@ fn flush_pipeline_returns_while_background_post_flush_maintenance_is_staged() {
                 }),
                 #[cfg(test)]
                 current_time_override: Some(100),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -4000,7 +4010,11 @@ fn n9_catalog_validate_cache_skips_manifest_reread_on_unchanged_sources() {
         Some(lane_path.clone()),
         None,
         2,
-        ChunkStorageOptions::default(),
+        ChunkStorageOptions {
+            // 该用例验证 N9b 段级缓存语义，需绕过 P1 节流窗口让每次调用都走到内容比对。
+            catalog_persist_interval: Duration::ZERO,
+            ..ChunkStorageOptions::default()
+        },
     )
     .unwrap();
     storage
@@ -4086,4 +4100,411 @@ fn n9_catalog_validate_cache_skips_manifest_reread_on_unchanged_sources() {
         "渐变后 catalog 应含全部两段（旧段缓存 + 新段读盘）：{}",
         grown
     );
+}
+
+// ── P1 低速率写放大（docs/plans/2026-10-29-low-rate-seal-catalog-amplification.md）──
+
+/// T1 红测（修复前必失败）：低速率下 bounded 后台 flush 不得「每拍 seal 一个微段」。
+/// 每拍 1 个点、连续 10 拍：head 远未到 seal 门槛（point_cap/8 与 head 年龄上限都未达），
+/// 期望 0 个段；修复前实测每拍产出 1 个只有 1 个点的段。
+#[test]
+fn low_rate_background_flush_holds_current_head_instead_of_sealing_every_tick() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "low-rate")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2048,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    for tick in 0..10i64 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "low_rate_hold",
+                labels.clone(),
+                DataPoint::new(tick, tick as f64),
+            )])
+            .unwrap();
+        storage.background_flush_pipeline_once().unwrap();
+    }
+
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert!(
+        segments.is_empty(),
+        "低速率下不应每拍 seal：期望 0 段，实际 {} 段（每段 {} 点）",
+        segments.len(),
+        segments.first().map_or(0, |s| s.manifest.point_count),
+    );
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("low_rate_hold", &labels)
+        .unwrap()
+        .series_id;
+    assert_eq!(
+        storage
+            .active_shard(series_id)
+            .read()
+            .get(&series_id)
+            .map_or(0, |state| state.point_count()),
+        10,
+        "未 seal 的 10 个点必须原样留在 active head 中",
+    );
+    assert!(
+        storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .total_size_bytes()
+            .unwrap()
+            > 0,
+        "head 未落盘时 WAL 必须仍覆盖这些点（崩溃可恢复）",
+    );
+    assert_eq!(
+        storage
+            .select("low_rate_hold", &labels, 0, 10)
+            .unwrap()
+            .len(),
+        10,
+        "延迟 seal 不得影响查询可见性（查询合并 active head）",
+    );
+
+    storage.close().unwrap();
+}
+
+/// T1 回归保护：高/中速率下 head 装满（rotate_full_if_needed）后仍必须落成段，
+/// 门控不得把「满仓 rotate」也挡住。
+#[test]
+fn full_chunk_rotation_still_persists_a_segment_under_seal_gating() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "high-rate")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let point_cap = 8usize;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        point_cap,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    for tick in 0..(point_cap as i64) {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "high_rate_rotate",
+                labels.clone(),
+                DataPoint::new(tick, tick as f64),
+            )])
+            .unwrap();
+    }
+    storage.background_flush_pipeline_once().unwrap();
+
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "满仓 rotate 产生的 sealed chunk 必须被后台 flush 落成 1 段",
+    );
+    assert_eq!(
+        segments[0].manifest.point_count, point_cap,
+        "该段应含满仓的 {} 个点",
+        point_cap
+    );
+
+    storage.close().unwrap();
+}
+
+/// T4 分支：head 年龄到期必须强制 seal（低速兜底：WAL 与内存有界）。
+#[test]
+fn seal_gate_triggers_on_head_age() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "age-gate")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2048,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            seal_policy: super::super::config::SealPolicy {
+                min_points: usize::MAX,
+                max_head_age: Duration::from_millis(30),
+                max_unsealed_wal_bytes: u64::MAX,
+            },
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "age_gate",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    // 未到年龄：保持打开。
+    storage.background_flush_pipeline_once().unwrap();
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    std::thread::sleep(Duration::from_millis(50));
+    storage.background_flush_pipeline_once().unwrap();
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(segments.len(), 1, "head 超过 max_head_age 后必须 seal");
+    assert_eq!(segments[0].manifest.point_count, 1);
+
+    storage.close().unwrap();
+}
+
+/// T4 分支：未落盘 WAL 达到上限必须强制 seal（高速率安全阀）。
+#[test]
+fn seal_gate_triggers_on_unsealed_wal_bytes() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "wal-gate")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2048,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            seal_policy: super::super::config::SealPolicy {
+                min_points: usize::MAX,
+                max_head_age: Duration::from_secs(3600),
+                max_unsealed_wal_bytes: 1,
+            },
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "wal_gate",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.background_flush_pipeline_once().unwrap();
+    assert_eq!(
+        load_segments_for_level(&lane_path, 0).unwrap().len(),
+        1,
+        "WAL 超过 max_unsealed_wal_bytes 后必须 seal",
+    );
+
+    storage.close().unwrap();
+}
+
+/// T4 逃生门：`SealPolicy::immediate()` 保留修复前的「每拍 seal」语义。
+#[test]
+fn seal_policy_immediate_preserves_legacy_seal_every_tick() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "immediate")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2048,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            seal_policy: super::super::config::SealPolicy::immediate(),
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    for tick in 0..3i64 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "immediate",
+                labels.clone(),
+                DataPoint::new(tick, tick as f64),
+            )])
+            .unwrap();
+        storage.background_flush_pipeline_once().unwrap();
+    }
+    assert_eq!(
+        load_segments_for_level(&lane_path, 0).unwrap().len(),
+        3,
+        "immediate 策略应每拍 seal 一段（历史语义逃生门）",
+    );
+
+    storage.close().unwrap();
+}
+
+/// T2 红测（修复前必失败）：catalog 是段 manifest 的反规范化缓存，常规 persist
+/// 只置脏，必须在节流窗口内合并重写；checkpoint 锚点则强制刷新。
+/// 修复前每拍 persist 都「全量读+解析校验 + 全量 pretty JSON 重写」。
+#[test]
+fn catalog_is_throttled_between_anchors_and_forced_at_checkpoint() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let catalog_file = checkpoint_path
+        .parent()
+        .unwrap()
+        .join("series_index.catalog.json");
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "catalog-throttle")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    // point_cap=2 → min_points=max(1, 2/8)=1 → 每拍都 seal 并 persist（最坏情况）。
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_throttle",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.background_flush_pipeline_once().unwrap();
+    let bytes_before = std::fs::read(&catalog_file).unwrap();
+    assert!(!bytes_before.is_empty(), "前置：首拍已写出 catalog");
+
+    for tick in 2..8i64 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "catalog_throttle",
+                labels.clone(),
+                DataPoint::new(tick, tick as f64),
+            )])
+            .unwrap();
+        storage.background_flush_pipeline_once().unwrap();
+    }
+
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(segments.len(), 7, "前置：7 拍各 seal 一段");
+    assert_eq!(
+        std::fs::read(&catalog_file).unwrap(),
+        bytes_before,
+        "节流窗口内常规 persist 不得重写 catalog（应为 0 次重写）",
+    );
+
+    // 锚点（checkpoint）必须强制把 catalog 刷成最新集合。
+    storage.checkpoint_series_registry_index().unwrap();
+    let bytes_after = std::fs::read(&catalog_file).unwrap();
+    assert_ne!(bytes_after, bytes_before, "checkpoint 必须强制刷新 catalog");
+    let text = String::from_utf8(bytes_after).unwrap();
+    assert_eq!(
+        text.matches("\"segment_id\"").count(),
+        7,
+        "checkpoint 后 catalog 必须含全部 7 段",
+    );
+
+    storage.close().unwrap();
+}
+
+/// T5：备忘命中后热路径必须零读——连段的 series.bin / postings.bin 被删除也不得报错，
+/// 且 catalog 不被重写（证明既不读 segment 元数据，也不重读 catalog 文件）。
+#[test]
+fn warm_catalog_persist_path_needs_no_segment_or_catalog_reads() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let catalog_file = checkpoint_path
+        .parent()
+        .unwrap()
+        .join("series_index.catalog.json");
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "catalog-warm")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            // 关掉节流窗口：让每次调用都走到「内容指纹」比对（热路径本身）。
+            catalog_persist_interval: Duration::ZERO,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_warm",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.background_flush_pipeline_once().unwrap();
+    let bytes_before = std::fs::read(&catalog_file).unwrap();
+    let sources = {
+        let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+            Some(&lane_path),
+            None,
+            None,
+        )
+        .unwrap();
+        super::super::registry_catalog::inventory_sources(&inventory)
+    };
+    assert_eq!(sources.len(), 1);
+
+    // 破坏段元数据文件：热路径若读它就会 DataCorruption。
+    std::fs::remove_file(sources[0].root.join("series.bin")).unwrap();
+    std::fs::remove_file(sources[0].root.join("postings.bin")).unwrap();
+
+    storage
+        .persist_series_registry_index_with_catalog_sources(&sources)
+        .expect("内容未变时必须只走内存指纹：不得读 segment 文件");
+    assert_eq!(
+        std::fs::read(&catalog_file).unwrap(),
+        bytes_before,
+        "内容未变时不得重写 catalog",
+    );
+
+    storage.close().unwrap();
 }

@@ -60,9 +60,11 @@ pub(super) fn write_compaction_replacement_marker(
     source_segments: &[PathBuf],
     output_segments: &[PathBuf],
 ) -> Result<PathBuf> {
-    if source_segments.is_empty() || output_segments.is_empty() {
+    // 空输出 = 纯删除替换（窗口内所有点被墓碑盖住，2026-10-30 审查修复）：
+    // 源段非空即可；输出列表允许为空。
+    if source_segments.is_empty() {
         return Err(TsinkError::InvalidConfiguration(
-            "compaction replacement marker requires source and output segments".to_string(),
+            "compaction replacement marker requires source segments".to_string(),
         ));
     }
 
@@ -103,9 +105,9 @@ fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacem
             marker.version
         )));
     }
-    if marker.source_segments.is_empty() || marker.output_segments.is_empty() {
+    if marker.source_segments.is_empty() {
         return Err(TsinkError::DataCorruption(
-            "compaction replacement marker has empty segment sets".to_string(),
+            "compaction replacement marker has empty source segment set".to_string(),
         ));
     }
     Ok(marker)
@@ -271,23 +273,14 @@ impl Compactor {
             .sum::<usize>();
 
         if chunks_by_series.is_empty() {
-            return Ok(CompactionOutcome {
-                stats: CompactionRunStats {
-                    compacted: false,
-                    source_level: None,
-                    target_level: Some(target_level),
-                    source_segments,
-                    output_segments: 0,
-                    source_chunks,
-                    output_chunks: 0,
-                    source_points,
-                    output_points: 0,
-                    passthrough_chunks: 0,
-                    passthrough_points: 0,
-                },
+            return self.finish_zero_output_compaction(
+                target_level,
+                source_segments,
+                source_chunks,
+                source_points,
                 source_roots,
-                output_roots: Vec::new(),
-            });
+                apply_replacement,
+            );
         }
 
         let registry = SeriesRegistry::new();
@@ -395,23 +388,15 @@ impl Compactor {
         }
 
         if emitted_segments == 0 {
-            return Ok(CompactionOutcome {
-                stats: CompactionRunStats {
-                    compacted: false,
-                    source_level: None,
-                    target_level: Some(target_level),
-                    source_segments,
-                    output_segments: emitted_segments,
-                    source_chunks,
-                    output_chunks: emitted_chunks,
-                    source_points,
-                    output_points: emitted_points,
-                    passthrough_chunks,
-                    passthrough_points,
-                },
+            // 全墓碑窗口：所有点被墓碑盖住，无输出段——正确替换是纯删除
+            return self.finish_zero_output_compaction(
+                target_level,
+                source_segments,
+                source_chunks,
+                source_points,
                 source_roots,
-                output_roots,
-            });
+                apply_replacement,
+            );
         }
 
         if apply_replacement {
@@ -440,6 +425,48 @@ impl Compactor {
             },
             source_roots,
             output_roots,
+        })
+    }
+
+    /// 零输出压缩窗口收尾（窗口无 series，或所有点被墓碑盖住）：正确替换是
+    /// **纯删除**。发布空输出 marker 让死源段真正消失——此前返回
+    /// `compacted: false` 且不删源段，而 planning 把标志强改 true，调用方
+    /// 对仍在磁盘上的源段记录幻影 removed_roots、drain 循环每轮重选同一
+    /// 窗口烧光预算（活锁，2026-10-30 审查修复）。
+    /// `apply_replacement=false`（retention staging）保持只读语义。
+    fn finish_zero_output_compaction(
+        &self,
+        target_level: u8,
+        source_segments: usize,
+        source_chunks: usize,
+        source_points: usize,
+        source_roots: Vec<PathBuf>,
+        apply_replacement: bool,
+    ) -> Result<CompactionOutcome> {
+        if apply_replacement {
+            // 与非空替换同一纪律：marker 写 + 源删除是破坏性步骤，先拿
+            // replacement gate 再动手
+            let _replacement_guard = self.segment_replacement_guard();
+            let replacement_marker_path =
+                write_compaction_replacement_marker(&self.data_path, &source_roots, &[])?;
+            apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
+        }
+        Ok(CompactionOutcome {
+            stats: CompactionRunStats {
+                compacted: apply_replacement,
+                source_level: None,
+                target_level: Some(target_level),
+                source_segments,
+                output_segments: 0,
+                source_chunks,
+                output_chunks: 0,
+                source_points,
+                output_points: 0,
+                passthrough_chunks: 0,
+                passthrough_points: 0,
+            },
+            source_roots,
+            output_roots: Vec::new(),
         })
     }
 

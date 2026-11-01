@@ -39,6 +39,7 @@ fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) 
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap()
@@ -1197,6 +1198,7 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();

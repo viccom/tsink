@@ -534,6 +534,7 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();

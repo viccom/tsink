@@ -12,7 +12,8 @@ mod snapshot;
 mod timestamp_indexes;
 
 pub(super) use active::{
-    plan_partition_head_open, ActivePartitionHead, ActiveSeriesState, PartitionHeadOpenAction,
+    plan_partition_head_open, ActivePartitionHead, ActiveSeriesState, CurrentHeadSealDecision,
+    PartitionHeadOpenAction, SealTrigger,
 };
 pub(super) use persisted::{
     PersistedChunkRef, PersistedIndexState, PersistedSegmentState, PersistedSegmentTimeBucketIndex,

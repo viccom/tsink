@@ -32,8 +32,8 @@ pub(super) fn sub_included_memory_component_bytes(
     }
 
     let decrement = saturating_u64_from_usize(bytes);
-    component.fetch_sub(decrement, Ordering::AcqRel);
-    shared_used_bytes.fetch_sub(decrement, Ordering::AcqRel);
+    saturating_sub_fetch(component, decrement);
+    saturating_sub_fetch(shared_used_bytes, decrement);
 }
 
 pub(super) fn reset_included_memory_component_bytes(
@@ -53,7 +53,7 @@ pub(super) fn reset_included_memory_component_bytes(
         shared_used_bytes.fetch_add(delta, Ordering::AcqRel);
     } else {
         let delta = previous.saturating_sub(next);
-        shared_used_bytes.fetch_sub(delta, Ordering::AcqRel);
+        saturating_sub_fetch(shared_used_bytes, delta);
     }
 }
 
@@ -172,8 +172,10 @@ impl<'a> ShardMemoryAccountingContext<'a> {
         } else {
             let decrement =
                 saturating_u64_from_usize(delta.removed_bytes.saturating_sub(delta.added_bytes));
-            self.used_bytes_by_shard[shard_idx].fetch_sub(decrement, Ordering::AcqRel);
-            self.used_bytes.fetch_sub(decrement, Ordering::AcqRel);
+            // 饱和减（BUG#3 家族收敛）：与 ChunkStorage::sub_memory_usage_bytes
+            // 同原语——计数器永不越界，真实值由准入路径 reconcile 纠正
+            saturating_sub_fetch(&self.used_bytes_by_shard[shard_idx], decrement);
+            saturating_sub_fetch(self.used_bytes, decrement);
         }
     }
 }
@@ -238,5 +240,49 @@ impl<'a> SealedChunkPublishContext<'a> {
         }
         drop(sealed);
         self.memory.account_memory_delta(shard_idx, memory_delta);
+    }
+}
+
+#[cfg(test)]
+mod saturating_tests {
+    use super::*;
+
+    /// BUG#3 家族收敛回归（2026-10-30 审查）：写路径记账上下文
+    /// （`ShardMemoryAccountingContext::account_memory_delta`）与排除域组件
+    /// 计数（`sub_included_memory_component_bytes`）曾直接 `fetch_sub`——
+    /// removed > current 时下溢成 2^64-x 巨值。必须与 flush 侧
+    /// `sub_memory_usage_bytes` 的饱和减（2026-10-29 生产修复）同语义：
+    /// 宁可停在 0（低估，由 reconcile 纠正）也不越界成巨值。
+    #[test]
+    fn accounting_subtraction_saturates_instead_of_wrapping() {
+        let used = AtomicU64::new(100);
+        let shards: [AtomicU64; IN_MEMORY_SHARD_COUNT] =
+            std::array::from_fn(|i| AtomicU64::new(if i == 0 { 100 } else { 0 }));
+        let ctx = ShardMemoryAccountingContext {
+            accounting_enabled: true,
+            used_bytes_by_shard: &shards,
+            used_bytes: &used,
+        };
+        ctx.account_memory_delta(0, MemoryDeltaBytes::from_totals(0, 240));
+        assert_eq!(
+            used.load(Ordering::Acquire),
+            0,
+            "全局 used_bytes 必须饱和到 0"
+        );
+        assert_eq!(shards[0].load(Ordering::Acquire), 0, "分片计数必须饱和到 0");
+
+        let component = AtomicU64::new(50);
+        let shared = AtomicU64::new(50);
+        sub_included_memory_component_bytes(true, &component, &shared, 90);
+        assert_eq!(
+            component.load(Ordering::Acquire),
+            0,
+            "排除域组件计数必须饱和到 0"
+        );
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            0,
+            "shared_used_bytes 必须饱和到 0"
+        );
     }
 }

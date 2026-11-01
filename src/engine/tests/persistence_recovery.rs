@@ -2236,3 +2236,54 @@ fn startup_replay_reclaims_wal_prefix_covered_by_persisted_segments() {
 
     storage.close().unwrap();
 }
+
+/// T3（P1 安全前提）：catalog 是缓存而非正确性依赖——缺失或损坏时必须靠段目录
+/// 扫描恢复（重启后可查），不得阻塞启动。
+#[test]
+fn startup_recovers_when_catalog_is_missing_or_corrupt() {
+    use crate::storage::StorageBuilder;
+    use crate::TimestampPrecision;
+
+    for corrupt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+        let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+        let metric = "catalog_recovery";
+        let labels = vec![Label::new("host", "recovery")];
+        let expected = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+
+        {
+            let storage = StorageBuilder::new()
+                .with_data_path(temp_dir.path())
+                .with_timestamp_precision(TimestampPrecision::Seconds)
+                .with_chunk_points(2)
+                .build()
+                .unwrap();
+            for point in &expected {
+                storage
+                    .insert_rows(&[Row::with_labels(metric, labels.clone(), point.clone())])
+                    .unwrap();
+            }
+            storage.close().unwrap();
+        }
+
+        if corrupt {
+            std::fs::write(&catalog_path, b"{not a catalog").unwrap();
+        } else {
+            std::fs::remove_file(&catalog_path).unwrap();
+        }
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(2)
+            .build()
+            .unwrap_or_else(|err| panic!("corrupt={corrupt} 时启动必须靠段扫描恢复：{err}"));
+        assert_eq!(
+            reopened.select(metric, &labels, 0, 10).unwrap(),
+            expected,
+            "corrupt={corrupt} 时重启后数据必须完整可查",
+        );
+        reopened.close().unwrap();
+    }
+}

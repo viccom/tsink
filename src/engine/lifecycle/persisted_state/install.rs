@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::storage_engine::saturating_sub_fetch;
 
 impl ChunkStorage {
     pub(super) fn accumulate_max_timestamp(current: &mut Option<i64>, candidate: Option<i64>) {
@@ -70,10 +71,8 @@ impl ChunkStorage {
                     .shared_used_bytes
                     .fetch_add(delta, Ordering::AcqRel);
             } else {
-                component.fetch_sub(delta, Ordering::AcqRel);
-                publication
-                    .shared_used_bytes
-                    .fetch_sub(delta, Ordering::AcqRel);
+                saturating_sub_fetch(component, delta);
+                saturating_sub_fetch(publication.shared_used_bytes, delta);
             }
         };
         account(

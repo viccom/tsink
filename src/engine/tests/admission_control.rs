@@ -98,6 +98,7 @@ fn write_limiter_respects_configured_timeout() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -156,6 +157,7 @@ fn wal_pressure_with_busy_writer_permit_returns_limit_error_not_timeout() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -212,6 +214,7 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -290,6 +293,7 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -362,6 +366,7 @@ fn memory_admission_backpressure_seals_heads_including_current_head() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap()
@@ -560,6 +565,7 @@ fn admission_pressure_relief_seals_current_head_when_no_eligible_head_exists() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap()
@@ -713,6 +719,7 @@ fn wal_admission_backpressure_rejects_without_flushing_current_head() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -852,6 +859,7 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -929,6 +937,7 @@ fn admission_estimates_new_partition_heads_by_first_snapshot_block_not_full_chun
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -982,6 +991,7 @@ fn admission_memory_rejection_exports_estimate_and_shortfall_snapshot() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -1067,6 +1077,7 @@ fn close_blocks_until_in_flight_writer_releases_permit() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),

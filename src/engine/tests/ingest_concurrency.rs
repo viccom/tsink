@@ -44,6 +44,7 @@ fn list_metrics_remains_available_while_writer_waits_on_active_lock() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -131,6 +132,7 @@ fn writer_waiting_on_one_series_shard_does_not_block_other_series_shards_for_sam
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -269,6 +271,7 @@ fn concurrent_same_metric_new_series_writers_create_one_series() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -363,6 +366,7 @@ fn concurrent_distinct_new_series_writers_same_metric_create_all_series() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -468,6 +472,7 @@ fn concurrent_distinct_new_series_writers_across_metrics_create_all_series() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -567,6 +572,7 @@ fn cached_missing_label_selector_sees_concurrent_new_series() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -677,6 +683,7 @@ fn existing_series_fanout_writers_do_not_block_on_registry_readers() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -809,6 +816,7 @@ fn concurrent_lane_mismatch_does_not_log_failed_write_to_wal() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -958,6 +966,7 @@ fn slow_merge_query_releases_same_shard_writes_and_flushes() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1150,6 +1159,7 @@ fn hot_active_merge_query_releases_same_shard_writes_during_snapshot_expansion()
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1383,6 +1393,7 @@ fn merge_query_does_not_flatten_large_active_snapshot() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1466,6 +1477,7 @@ fn append_sort_query_snapshots_only_requested_active_window() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -1550,6 +1562,7 @@ fn select_all_wide_live_metric_does_not_flatten_active_snapshots() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1640,6 +1653,7 @@ fn hot_active_append_sort_query_releases_same_shard_writes_during_snapshot_expan
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -1800,6 +1814,7 @@ fn slow_metadata_time_range_query_releases_same_shard_writes_and_flushes() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -2260,6 +2275,7 @@ fn list_metrics_racing_revival_write_does_not_prune_materialized_series() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: Some(20),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -2370,6 +2386,7 @@ fn concurrent_new_series_writers_wait_for_logical_wal_commit_before_reopen() {
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),
@@ -2512,6 +2529,7 @@ fn concurrent_current_and_late_writers_reject_late_overflow_without_churning_cur
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: None,
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap(),

@@ -47,5 +47,6 @@ pub(in crate::engine::storage_engine::tests) fn base_storage_test_options(
         tiered_storage: None,
         #[cfg(test)]
         current_time_override,
+        ..ChunkStorageOptions::default()
     }
 }

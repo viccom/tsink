@@ -137,8 +137,7 @@ fn memory_used_counter_never_underflows_into_huge_value() {
     let storage = test_storage_with_memory_budget(temp_dir.path());
     // 人为制造「sub 多于 add」的记账漂移：走受保护的 sub 路径减一个远大于当前值的量
     let before = storage.memory.used_bytes.load(Ordering::Acquire);
-    storage
-        .sub_memory_usage_bytes(0, (before as usize).saturating_add(1_000_000));
+    storage.sub_memory_usage_bytes(0, (before as usize).saturating_add(1_000_000));
     // 修复后：饱和减挡住越界，值落在 0 附近而非巨值
     let after = storage.memory.used_bytes.load(Ordering::Acquire);
     assert!(

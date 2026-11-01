@@ -31,9 +31,8 @@ impl<'a> RegistryPersistenceContext<'a> {
         }
 
         let decrement = saturating_u64_from_usize(bytes);
-        component.fetch_sub(decrement, Ordering::AcqRel);
-        self.shared_used_bytes
-            .fetch_sub(decrement, Ordering::AcqRel);
+        saturating_sub_fetch(component, decrement);
+        saturating_sub_fetch(self.shared_used_bytes, decrement);
     }
 
     fn with_included_memory_delta<T, R>(

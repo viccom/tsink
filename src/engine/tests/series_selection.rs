@@ -2083,6 +2083,7 @@ fn runtime_segment_adoption_uses_merged_persisted_postings_for_metadata_selectio
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -2344,6 +2345,7 @@ fn persisted_merged_postings_update_across_segment_removal_and_re_adoption() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: None,
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();
@@ -3138,6 +3140,7 @@ fn reconcile_live_metadata_indexes_uses_timestamp_search_index_for_bounded_overl
                 tiered_storage: None,
                 #[cfg(test)]
                 current_time_override: Some(now),
+                ..ChunkStorageOptions::default()
             },
         )
         .unwrap()
@@ -4498,6 +4501,7 @@ fn retention_sweep_reconciles_live_metadata_indexes_and_shard_scoped_reads() {
             tiered_storage: None,
             #[cfg(test)]
             current_time_override: Some(10),
+            ..ChunkStorageOptions::default()
         },
     )
     .unwrap();

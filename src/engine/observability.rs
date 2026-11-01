@@ -206,6 +206,17 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             evicted_sealed_chunks_total: counters
                 .evicted_sealed_chunks_total
                 .load(Ordering::Relaxed),
+            seal_trigger_points_total: counters.seal_trigger_points_total.load(Ordering::Relaxed),
+            seal_trigger_age_total: counters.seal_trigger_age_total.load(Ordering::Relaxed),
+            seal_trigger_wal_total: counters.seal_trigger_wal_total.load(Ordering::Relaxed),
+            seal_hold_total: counters.seal_hold_total.load(Ordering::Relaxed),
+            catalog_persist_attempts_total: counters
+                .catalog_persist_attempts_total
+                .load(Ordering::Relaxed),
+            catalog_persisted_total: counters.catalog_persisted_total.load(Ordering::Relaxed),
+            catalog_persist_skipped_total: counters
+                .catalog_persist_skipped_total
+                .load(Ordering::Relaxed),
             tier_moves_total: counters.tier_moves_total.load(Ordering::Relaxed),
             tier_move_errors_total: counters.tier_move_errors_total.load(Ordering::Relaxed),
             expired_segments_total: counters.expired_segments_total.load(Ordering::Relaxed),

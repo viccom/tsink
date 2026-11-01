@@ -16,6 +16,28 @@ pub(in crate::engine::storage_engine) struct ActivePartitionHead {
     pub(in crate::engine::storage_engine) builder_value_heap_bytes: usize,
     pub(in crate::engine::storage_engine) min_wal_highwater: Option<WalHighWatermark>,
     pub(in crate::engine::storage_engine) max_wal_highwater: WalHighWatermark,
+    /// 本 head（或 rotate 后的新 head）开始接收写入的时刻；后台 bounded flush
+    /// 用它做「head 年龄」门控（P1），避免低速现场每拍 seal 一个微段。
+    opened_at: Instant,
+}
+
+/// 当前 head 的后台 seal 判定结果（P1 门控）。
+pub(in crate::engine::storage_engine) enum CurrentHeadSealDecision {
+    /// 未达任何门槛：保持 head 打开，等下一拍。
+    Hold,
+    /// 可以 seal；携带触发原因供计数器归因。
+    Seal(SealTrigger),
+}
+
+/// seal 触发原因（计数器与诊断用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::engine::storage_engine) enum SealTrigger {
+    /// head 已攒到最小点数。
+    Points,
+    /// head 存活超过上限（低速兜底：保证 WAL 与内存有界）。
+    Age,
+    /// 未落盘 WAL 超过上限（高速安全阀）。
+    Wal,
 }
 
 pub(in crate::engine::storage_engine) enum PartitionHeadOpenAction {
@@ -77,6 +99,7 @@ impl ActivePartitionHead {
             builder_value_heap_bytes: 0,
             min_wal_highwater: None,
             max_wal_highwater: WalHighWatermark::default(),
+            opened_at: Instant::now(),
         }
     }
 
@@ -92,11 +115,13 @@ impl ActivePartitionHead {
         let builder_value_heap_bytes = std::mem::take(&mut self.builder_value_heap_bytes);
         let min_wal_highwater = self.min_wal_highwater.take();
         let max_wal_highwater = std::mem::take(&mut self.max_wal_highwater);
+        let opened_at = std::mem::replace(&mut self.opened_at, Instant::now());
         Self {
             builder,
             builder_value_heap_bytes,
             min_wal_highwater,
             max_wal_highwater,
+            opened_at,
         }
     }
 }
@@ -228,6 +253,39 @@ impl ActiveSeriesState {
             return Ok(None);
         }
         self.finalize_partition_head(partition_id)
+    }
+
+    /// 后台 bounded flush 对「当前 head」的 seal 判定（P1 门控）。
+    ///
+    /// 修复前 `flush_current_partial` 只判 `is_empty`，于是 250ms 一拍必然 seal，
+    /// 段粒度退化为「拍长 × 摄入率」（生产实测 5.9 点/段），而每次 seal 的注册表
+    /// catalog 成本 ∝ 累计段数 → CPU 随 uptime 线性上涨。门控要求满足其一才 seal：
+    /// 最小点数 / head 年龄到期 / 未落盘 WAL 达上限。
+    pub(in crate::engine::storage_engine) fn current_head_seal_decision(
+        &self,
+        policy: &SealPolicy,
+        unsealed_wal_bytes: u64,
+        now: Instant,
+    ) -> CurrentHeadSealDecision {
+        let Some(partition_id) = self.current_partition_id else {
+            return CurrentHeadSealDecision::Hold;
+        };
+        let Some(head) = self.partition_heads.get(&partition_id) else {
+            return CurrentHeadSealDecision::Hold;
+        };
+        if head.builder.is_empty() {
+            return CurrentHeadSealDecision::Hold;
+        }
+        if head.builder.len() >= policy.effective_min_points(self.point_cap) {
+            return CurrentHeadSealDecision::Seal(SealTrigger::Points);
+        }
+        if now.saturating_duration_since(head.opened_at) >= policy.max_head_age {
+            return CurrentHeadSealDecision::Seal(SealTrigger::Age);
+        }
+        if unsealed_wal_bytes >= policy.max_unsealed_wal_bytes {
+            return CurrentHeadSealDecision::Seal(SealTrigger::Wal);
+        }
+        CurrentHeadSealDecision::Hold
     }
 
     pub(in crate::engine::storage_engine) fn is_empty(&self) -> bool {

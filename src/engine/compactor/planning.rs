@@ -167,7 +167,10 @@ impl Compactor {
 
         let loaded_window = segments.iter().collect::<Vec<_>>();
         let mut outcome = self.compact_segments(target_level, &loaded_window, tombstones)?;
-        outcome.stats.compacted = true;
+        // 不强改 stats.compacted（2026-10-30 审查修复）：零输出窗口（全墓碑/
+        // 无 series）的完成语义由 execution 决定——此前强改 true 曾让调用方对
+        // 未删除的源段记录幻影 removed_roots，drain 循环每轮重选同一窗口（活锁）。
+        // 窗口既然选中并跑完，层级标注照记（drain 的 l0→l1/l1→l2 计数用）。
         outcome.stats.source_level = Some(source_level);
         outcome.stats.target_level = Some(target_level);
         Ok(Some(outcome))

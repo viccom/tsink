@@ -249,6 +249,17 @@ pub(super) struct FlushObservabilityCounters {
     /// accounting only.
     pub(super) memory_reconciles_total: AtomicU64,
     pub(super) evicted_sealed_chunks_total: AtomicU64,
+    /// P1 seal 门控：当前 head 因达到最小点数 / 年龄到期 / 未落盘 WAL 上限而 seal 的次数。
+    pub(super) seal_trigger_points_total: AtomicU64,
+    pub(super) seal_trigger_age_total: AtomicU64,
+    pub(super) seal_trigger_wal_total: AtomicU64,
+    /// P1 seal 门控：bounded 拍因未达门槛而保持 head 打开的（series × 拍）计数。
+    pub(super) seal_hold_total: AtomicU64,
+    /// P1 catalog 持久化：进入持久化路径的次数 / 实际写盘次数 / 被节流或内容未变跳过次数。
+    /// 稳态应满足 attempts ≈ skipped、persisted 只在锚点或跨窗口变更时增长。
+    pub(super) catalog_persist_attempts_total: AtomicU64,
+    pub(super) catalog_persisted_total: AtomicU64,
+    pub(super) catalog_persist_skipped_total: AtomicU64,
     pub(super) tier_moves_total: AtomicU64,
     pub(super) tier_move_errors_total: AtomicU64,
     pub(super) expired_segments_total: AtomicU64,

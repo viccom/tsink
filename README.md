@@ -186,6 +186,7 @@ tsink-server \
 
 - [Architecture overview](docs/architecture.md) — high-level system design, component interactions, data flow
 - [Storage engine internals](docs/storage-engine.md) — WAL, segments, LSM-style compaction, encoding codecs, mmap reads, write buffer
+- [OSS TSDB cache & metadata survey](docs/research/2026-10-30-oss-tsdb-cache-design-survey.md) — (中文) how VictoriaMetrics, Prometheus, InfluxDB 1.8, GreptimeDB, CnosDB and TDengine design write buffers, read caches and segment metadata, with prioritised suggestions for tsink
 - [PromQL implementation](docs/promql.md) — lexer, parser, evaluator, supported functions, aggregations, subqueries
 - [Clustering internals](docs/clustering-internals.md) — consistent hash ring, replication protocol, hinted handoff, digest repair, rebalance, distributed queries
 

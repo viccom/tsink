@@ -76,28 +76,30 @@ mod visibility;
 #[path = "write_buffer.rs"]
 mod write_buffer;
 
-use config::ChunkStorageOptions;
+use config::{ChunkStorageOptions, SealPolicy};
 pub(in crate::engine::storage_engine) use construction::{
     PendingPersistedSegmentDiff, RemoteCatalogRefreshState,
 };
 pub(in crate::engine::storage_engine) use core_impl::{
     current_unix_millis_u64, duration_to_timestamp_units, elapsed_nanos_u64, lane_for_value,
-    partition_id_for_timestamp, persisted_chunk_payload, saturating_u64_from_usize,
-    value_heap_bytes, CatalogContext, ChunkContext, LifecyclePublicationContext, MemoryDeltaBytes,
-    PersistedRefreshContext, VisibilityStateMemoryBaseline, WriteAdmissionControlContext,
-    WriteApplyContext, WriteApplyMemoryAccountingContext, WriteApplyPublicationContext,
-    WriteApplyRegistryContext, WriteApplyShardMutationContext, WriteApplyWalContext,
-    WriteCommitContext, WriteCommitStageContext, WriteCommitWalCompletionContext,
-    WritePrepareContext, WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext,
-    WritePrepareWalContext, WriteResolveContext, WriteSeriesValidationContext,
+    partition_id_for_timestamp, persisted_chunk_payload, saturating_sub_fetch,
+    saturating_u64_from_usize, value_heap_bytes, CatalogContext, ChunkContext,
+    LifecyclePublicationContext, MemoryDeltaBytes, PersistedRefreshContext,
+    VisibilityStateMemoryBaseline, WriteAdmissionControlContext, WriteApplyContext,
+    WriteApplyMemoryAccountingContext, WriteApplyPublicationContext, WriteApplyRegistryContext,
+    WriteApplyShardMutationContext, WriteApplyWalContext, WriteCommitContext,
+    WriteCommitStageContext, WriteCommitWalCompletionContext, WritePrepareContext,
+    WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext, WritePrepareWalContext,
+    WriteResolveContext, WriteSeriesValidationContext,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::DataPathProcessLock;
 pub(crate) use runtime::COMPACTION_DRAIN_TIME_BUDGET;
 use state::{
-    ActiveSeriesState, PersistedChunkRef, PersistedIndexState, SealedChunkKey, SegmentMapRegistry,
-    SeriesVisibilityRangeSummary, SeriesVisibilitySummary, TimestampIndexCache, BLOB_LANE_ROOT,
-    NUMERIC_LANE_ROOT, SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
+    ActiveSeriesState, CurrentHeadSealDecision, PersistedChunkRef, PersistedIndexState,
+    SealTrigger, SealedChunkKey, SegmentMapRegistry, SeriesVisibilityRangeSummary,
+    SeriesVisibilitySummary, TimestampIndexCache, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT,
+    SERIES_INDEX_FILE_NAME, SERIES_VISIBILITY_SUMMARY_MAX_RANGES, WAL_DIR_NAME,
 };
 #[cfg(test)]
 use test_hooks::{IngestCommitHook, PersistTestHooks};
@@ -113,7 +115,15 @@ const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 /// `StorageBuilder::with_compaction_interval` overrides this per deployment;
 /// this constant stays the default.
 pub(crate) const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// 当前 head 未达最小点数时，最长允许保持打开的时长（P1 seal 门控）。
+/// 到期强制 seal，保证低速现场 WAL 与内存也有界。
+pub(crate) const DEFAULT_MAX_HEAD_AGE: Duration = Duration::from_secs(300);
+/// 未落盘 WAL 字节上限（P1 seal 门控的安全阀）：达到即 seal 当前 head。
+pub(crate) const DEFAULT_MAX_UNSEALED_WAL_BYTES: u64 = 64 * 1024 * 1024;
+/// 段注册表 catalog 的最小持久化间隔（P1）：常规 flush 只置脏，按此节流全量重写；
+/// 关闭/checkpoint 锚点不受此限。
+pub(crate) const DEFAULT_CATALOG_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum interval between full memory-usage reconciliation passes on the
 /// flush thread (S6). Incremental deltas stay authoritative between passes;
 /// this gate only rate-limits the O(series) full rescan. Bootstrap/shutdown
@@ -186,6 +196,9 @@ struct PersistedStorageState {
     /// 段 manifest 重读按 root 缓存（段不可变 → entry 永久有效；compaction
     /// 持续产段的集合渐变下只读新增段）。独立锁，不嵌套任何其他锁。
     catalog_validate_cache: registry_catalog::CatalogEntryCache,
+    /// P1 catalog 持久化备忘：节流窗口 + 内容指纹（常规 persist 不重写，
+    /// checkpoint/关闭锚点强制刷新）。独立锁，规则同 `catalog_validate_cache`。
+    catalog_persist_memo: registry_catalog::CatalogPersistMemo,
     /// Resident segment-map cache (byte budget + LRU eviction); always
     /// locked nested inside `persisted_index`, never the reverse.
     segment_maps: SegmentMapRegistry,
@@ -228,6 +241,9 @@ struct RuntimeConfigState {
     cardinality_limit: AtomicUsize,
     wal_size_limit_bytes: u64,
     admission_poll_interval: Duration,
+    flush_interval: Duration,
+    seal_policy: SealPolicy,
+    catalog_persist_interval: Duration,
 }
 
 /// Memory-accounting counters and backpressure coordination.

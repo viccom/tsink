@@ -34,6 +34,9 @@ pub(super) struct ChunkStorageOptions {
     pub(super) max_active_partition_heads_per_series: usize,
     pub(super) max_writers: usize,
     pub(super) write_timeout: Duration,
+    pub(super) flush_interval: Duration,
+    pub(super) seal_policy: SealPolicy,
+    pub(super) catalog_persist_interval: Duration,
     pub(super) memory_budget_bytes: u64,
     pub(super) persisted_mmap_budget_bytes: usize,
     /// Global byte budget for resident timestamp-search-index cache entries.
@@ -69,6 +72,55 @@ pub(super) struct ChunkStorageOptions {
     pub(super) current_time_override: Option<i64>,
 }
 
+/// 后台 bounded flush 对「当前 partition head」的 seal 门控（P1）。
+///
+/// 背景：`BackgroundBounded` 每拍（默认 250ms）无条件 seal 非空 head，会让段粒度等于
+/// 「拍长 × 摄入率」——低速现场实测 5.9 点/段；而每次 seal 都要全量重写注册表 catalog
+/// （成本 ∝ 累计段数），导致 CPU 与写放大随 uptime 线性上涨。门控让 head 攒批：
+/// 只有满足下列任一条件才 seal。满仓 rotate、分区滚动、准入压力与显式/关闭 flush
+/// 不受此门控影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SealPolicy {
+    /// 未满仓 head 的最小 seal 点数；`0` = 由 `point_cap/8` 推导（最低 1）。
+    pub(super) min_points: usize,
+    /// head 最长存活时间；到期强制 seal（低速下也保证 WAL 与内存有界）。
+    /// `Duration::ZERO` = 立即到期（历史语义）。
+    pub(super) max_head_age: Duration,
+    /// 未落盘 WAL 字节上限；达到即 seal（高速率下的硬安全阀）。
+    pub(super) max_unsealed_wal_bytes: u64,
+}
+
+impl SealPolicy {
+    /// 关闭门控：任何非空 head 立即 seal（修复前的历史语义；测试夹具显式选用）。
+    #[cfg(test)]
+    pub(super) fn immediate() -> Self {
+        Self {
+            min_points: 1,
+            max_head_age: Duration::ZERO,
+            max_unsealed_wal_bytes: 1,
+        }
+    }
+
+    /// 实际生效的最小点数：显式值优先，否则按 point_cap/8 推导。
+    pub(super) fn effective_min_points(&self, point_cap: usize) -> usize {
+        if self.min_points == 0 {
+            (point_cap / 8).max(1)
+        } else {
+            self.min_points
+        }
+    }
+}
+
+impl Default for SealPolicy {
+    fn default() -> Self {
+        Self {
+            min_points: 0,
+            max_head_age: DEFAULT_MAX_HEAD_AGE,
+            max_unsealed_wal_bytes: DEFAULT_MAX_UNSEALED_WAL_BYTES,
+        }
+    }
+}
+
 impl Default for ChunkStorageOptions {
     fn default() -> Self {
         Self {
@@ -93,6 +145,9 @@ impl Default for ChunkStorageOptions {
                 crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             max_writers: crate::cgroup::default_workers_limit().max(1),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            flush_interval: DEFAULT_FLUSH_INTERVAL,
+            seal_policy: SealPolicy::default(),
+            catalog_persist_interval: DEFAULT_CATALOG_PERSIST_INTERVAL,
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             timestamp_index_cache_budget_bytes:
@@ -184,6 +239,13 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             max_active_partition_heads_per_series: builder.max_active_partition_heads_per_series(),
             max_writers: builder.max_writers(),
             write_timeout: builder.write_timeout(),
+            flush_interval: builder.flush_interval(),
+            seal_policy: SealPolicy {
+                min_points: builder.seal_min_points(),
+                max_head_age: builder.max_head_age(),
+                max_unsealed_wal_bytes: builder.max_unsealed_wal_bytes(),
+            },
+            catalog_persist_interval: builder.catalog_persist_interval(),
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
             persisted_mmap_budget_bytes: builder.persisted_mmap_budget_bytes(),
             timestamp_index_cache_budget_bytes: builder.timestamp_index_cache_budget_bytes(),

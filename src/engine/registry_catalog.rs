@@ -132,6 +132,157 @@ pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(REGISTRY_CATALOG_FILE_NAME))
 }
 
+/// catalog 持久化备忘（P1）：节流窗口 + 内容指纹，消灭「每次 persist 全量
+/// 读+解析+重写」的 O(段数) 往返。
+///
+/// 语义前提：catalog 是各段 `manifest.bin` 的反规范化缓存，不是正确性依赖——
+/// 启动恢复从段目录扫描补全（`bootstrap::recovery` 的 validate 失配即回退重建），
+/// 因此常规 persist 允许滞后，只有 checkpoint/关闭等一致性锚点强制刷新。
+#[derive(Default)]
+pub(super) struct CatalogPersistMemo {
+    state: Mutex<CatalogPersistMemoState>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct CatalogPersistMemoState {
+    last_persisted_at: Option<Instant>,
+    last_entries_hash: Option<u64>,
+    last_file_len: Option<u64>,
+}
+
+/// 一次 catalog 持久化的结果（调用侧用于计数器归因）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatalogPersistOutcome {
+    Persisted,
+    /// 节流窗口内：不构建、不读盘、不写盘。
+    SkippedThrottled,
+    /// 内容与上次写入一致且文件未被外部改动（备忘命中，零 IO）。
+    SkippedUnchanged,
+    /// 冷启动/备忘失效：读文件做 entries 比对，命中即采纳文件指纹（零重写，
+    /// 且不读取 segment 的 series.bin——保持「catalog 有效即可恢复」语义）。
+    SkippedValidatedFromFile,
+}
+
+/// 按「节流窗口 + 内容指纹」持久化 catalog（P1）。
+///
+/// 与旧路径的区别：不再每次 `read` + `serde_json::from_slice` 全量比对，
+/// 也不在内容未变时重写文件。`force=true` 仅用于 checkpoint/关闭锚点。
+pub(super) fn persist_registry_catalog_throttled(
+    snapshot_path: &Path,
+    sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
+    memo: &CatalogPersistMemo,
+    min_interval: Duration,
+    force: bool,
+) -> Result<(
+    Option<PersistedRegistrySeriesFingerprint>,
+    CatalogPersistOutcome,
+)> {
+    let path = catalog_path(snapshot_path);
+    let now = Instant::now();
+    {
+        let state = memo.state.lock();
+        if !force {
+            if let Some(last) = state.last_persisted_at {
+                if now.saturating_duration_since(last) < min_interval {
+                    return Ok((None, CatalogPersistOutcome::SkippedThrottled));
+                }
+            }
+        }
+    }
+
+    // entries 构建走段级缓存：集合渐变时只读新增段（N9b），无全量 manifest 重读。
+    let expected_entries = build_catalog_entries(sources, entry_cache)?;
+    let entries_hash = hash_catalog_entries(&expected_entries);
+    let file_len = std::fs::metadata(&path).map(|meta| meta.len()).ok();
+    {
+        let mut state = memo.state.lock();
+        if state.last_entries_hash == Some(entries_hash) && state.last_file_len == file_len {
+            state.last_persisted_at = Some(now);
+            return Ok((None, CatalogPersistOutcome::SkippedUnchanged));
+        }
+    }
+
+    // 冷启动 / 跨窗口：先只读文件做 entries 比对。命中则直接采纳文件的
+    // series_fingerprint ——不读任何 segment 的 series.bin（catalog 有效即
+    // 足以恢复，见 `startup_reopens_from_registry_catalog_without_segment_series_files`）。
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(actual) = serde_json::from_slice::<PersistedRegistryCatalogFile>(&bytes) {
+            if actual.segments == expected_entries {
+                let mut state = memo.state.lock();
+                state.last_persisted_at = Some(now);
+                state.last_entries_hash = Some(entries_hash);
+                state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                return Ok((
+                    actual.series_fingerprint,
+                    CatalogPersistOutcome::SkippedValidatedFromFile,
+                ));
+            }
+        }
+    }
+
+    let catalog = PersistedRegistryCatalogFile {
+        version: REGISTRY_CATALOG_VERSION,
+        segments: expected_entries,
+        series_fingerprint: Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
+    };
+    let fingerprint = catalog.series_fingerprint.clone();
+    let bytes = serde_json::to_vec_pretty(&catalog)?;
+    write_file_atomically_and_sync_parent(&path, &bytes)?;
+
+    let mut state = memo.state.lock();
+    state.last_persisted_at = Some(now);
+    state.last_entries_hash = Some(entries_hash);
+    state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    Ok((fingerprint, CatalogPersistOutcome::Persisted))
+}
+
+/// 参与内容比对的全部条目标量字段 → 单一指纹（避免序列化数 MB 字节做比较）。
+fn hash_catalog_entries(entries: &[PersistedRegistryCatalogEntry]) -> u64 {
+    let mut hasher = Xxh64::new(0);
+    hasher.update(
+        &u64::try_from(entries.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for entry in entries {
+        let lane_tag: u8 = match entry.lane {
+            SegmentLaneFamily::Numeric => 0,
+            SegmentLaneFamily::Blob => 1,
+        };
+        hasher.update(&[lane_tag, entry.level]);
+        hasher.update(&entry.segment_id.to_le_bytes());
+        hasher.update(
+            &u64::try_from(entry.chunk_count)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(
+            &u64::try_from(entry.point_count)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(
+            &u64::try_from(entry.series_count)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(&entry.min_ts.unwrap_or(i64::MIN).to_le_bytes());
+        hasher.update(&entry.max_ts.unwrap_or(i64::MIN).to_le_bytes());
+        hasher.update(&entry.wal_highwater_segment.to_le_bytes());
+        hasher.update(&entry.wal_highwater_frame.to_le_bytes());
+        hasher.update(&entry.chunks_len.to_le_bytes());
+        hasher.update(&entry.chunks_hash64.to_le_bytes());
+        hasher.update(&entry.chunk_index_len.to_le_bytes());
+        hasher.update(&entry.chunk_index_hash64.to_le_bytes());
+        hasher.update(&entry.series_len.to_le_bytes());
+        hasher.update(&entry.series_hash64.to_le_bytes());
+        hasher.update(&entry.postings_len.to_le_bytes());
+        hasher.update(&entry.postings_hash64.to_le_bytes());
+    }
+    hasher.digest()
+}
+
 pub(super) fn validate_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
@@ -161,21 +312,6 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
-/// 写出 catalog 并返回其 series_fingerprint。entries 构建走段级缓存，
-/// 集合渐变时只读新增段（N9b）。
-pub(super) fn persist_registry_catalog(
-    snapshot_path: &Path,
-    sources: &[PersistedRegistryCatalogSource],
-    entry_cache: &CatalogEntryCache,
-) -> Result<Option<PersistedRegistrySeriesFingerprint>> {
-    let path = catalog_path(snapshot_path);
-    let catalog = build_catalog(sources, entry_cache)?;
-    let fingerprint = catalog.series_fingerprint.clone();
-    let bytes = serde_json::to_vec_pretty(&catalog)?;
-    write_file_atomically_and_sync_parent(&path, &bytes)?;
-    Ok(fingerprint)
-}
-
 pub(super) fn inventory_sources(
     inventory: &super::tiering::SegmentInventory,
 ) -> Vec<PersistedRegistryCatalogSource> {
@@ -203,17 +339,6 @@ pub(super) fn validate_registry_snapshot(
     Err(TsinkError::DataCorruption(
         "persisted registry snapshot conflicts with persisted segment series metadata".to_string(),
     ))
-}
-
-fn build_catalog(
-    sources: &[PersistedRegistryCatalogSource],
-    entry_cache: &CatalogEntryCache,
-) -> Result<PersistedRegistryCatalogFile> {
-    Ok(PersistedRegistryCatalogFile {
-        version: REGISTRY_CATALOG_VERSION,
-        segments: build_catalog_entries(sources, entry_cache)?,
-        series_fingerprint: Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
-    })
 }
 
 fn build_catalog_entries(
