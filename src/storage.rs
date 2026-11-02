@@ -37,6 +37,14 @@ pub const DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY: usize = 32768;
 /// Default byte budget of the persisted-catalog per-segment series-metadata
 /// cache (`series.bin` loads; NotFound slots are empty and cost ~0 bytes).
 pub const DEFAULT_CATALOG_SERIES_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Default count of pending catalog deltas at which the delta log is
+/// consolidated into a full checkpoint.
+pub const DEFAULT_CATALOG_DELTA_MAX_COUNT: usize = 100;
+
+/// Default byte total of pending catalog deltas at which the delta log is
+/// consolidated into a full checkpoint.
+pub const DEFAULT_CATALOG_DELTA_MAX_BYTES: u64 = 1024 * 1024;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
@@ -1112,6 +1120,14 @@ pub struct StorageBuilder {
     max_head_age: Duration,
     max_unsealed_wal_bytes: u64,
     catalog_persist_interval: Duration,
+    /// W3-T4 stub: pending-delta count threshold for full checkpoint
+    /// consolidation. Stored only — the delta pipeline consumes it.
+    #[allow(dead_code)]
+    catalog_delta_max_count: usize,
+    /// W3-T4 stub: pending-delta byte threshold for full checkpoint
+    /// consolidation. Stored only — the delta pipeline consumes it.
+    #[allow(dead_code)]
+    catalog_delta_max_bytes: u64,
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
@@ -1160,6 +1176,8 @@ impl Default for StorageBuilder {
             max_unsealed_wal_bytes: crate::engine::storage_engine::DEFAULT_MAX_UNSEALED_WAL_BYTES,
             catalog_persist_interval:
                 crate::engine::storage_engine::DEFAULT_CATALOG_PERSIST_INTERVAL,
+            catalog_delta_max_count: DEFAULT_CATALOG_DELTA_MAX_COUNT,
+            catalog_delta_max_bytes: DEFAULT_CATALOG_DELTA_MAX_BYTES,
             partition_duration: Duration::from_secs(3600),
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
@@ -1347,6 +1365,30 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_catalog_persist_interval(mut self, interval: Duration) -> Self {
         self.catalog_persist_interval = interval;
+        self
+    }
+
+    /// Sets the count of pending catalog deltas at which the delta log is
+    /// consolidated into a full checkpoint. Default:
+    /// [`DEFAULT_CATALOG_DELTA_MAX_COUNT`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_COUNT)
+    /// (100).
+    ///
+    /// Retained on the builder only until the delta pipeline consumes it.
+    #[must_use]
+    pub fn with_catalog_delta_max_count(mut self, max_count: usize) -> Self {
+        self.catalog_delta_max_count = max_count;
+        self
+    }
+
+    /// Sets the byte total of pending catalog deltas at which the delta log is
+    /// consolidated into a full checkpoint. Default:
+    /// [`DEFAULT_CATALOG_DELTA_MAX_BYTES`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_BYTES)
+    /// (1 MiB).
+    ///
+    /// Retained on the builder only until the delta pipeline consumes it.
+    #[must_use]
+    pub fn with_catalog_delta_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.catalog_delta_max_bytes = max_bytes;
         self
     }
 

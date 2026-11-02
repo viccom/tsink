@@ -2759,3 +2759,380 @@ fn build_counting_series_reads(builder: StorageBuilder) -> (Arc<dyn Storage>, u6
     let reads = crate::engine::segment::startup_series_file_read_count() - before;
     (storage, reads)
 }
+
+// ---- W3-T2（红）：checkpoint 锚点与清理 --------------------------------------
+//
+// delta 数达到 `catalog_delta_max_count` 阈值（或字节量达到
+// `catalog_delta_max_bytes`）必须触发全量 checkpoint 合并；close 的强制
+// checkpoint 路径语义不回退。合并机制由 W3-T4 实现——红态失败点 = delta 目录
+// 前置断言 / `_checkpoint.json` 不存在。两个旋钮当前为 stub（存参不消费）。
+
+/// W3-T4 计划定名的合并标记文件（位于 delta 目录内，尚不存在）。
+const CATALOG_CHECKPOINT_MARKER_NAME: &str = "_checkpoint.json";
+
+/// 从 delta 文件名（`{seq:020}.delta.json`）解析序号。
+fn catalog_delta_seq(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(".delta.json")?
+        .parse()
+        .ok()
+}
+
+/// 读取 `_checkpoint.json` 里的 `checkpoint_seq`。
+fn catalog_checkpoint_marker_seq(marker: &Path) -> Option<u64> {
+    let bytes = std::fs::read(marker).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("checkpoint_seq")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// 数值 lane 各层（L0-L2）在盘段数，与 catalog 条目数对账用；缺层按 0。
+fn count_lane_segments_across_levels(lane_path: &Path) -> usize {
+    (0..=2)
+        .map(|level| count_lane_segments_at_level(lane_path, level))
+        .sum()
+}
+
+/// T2-红：delta 数达到 `catalog_delta_max_count` 阈值必须触发全量 checkpoint
+/// 合并——`_checkpoint.json` 的 `checkpoint_seq` 等于最后一个 delta 的序号，
+/// 已合并 delta 被删除，checkpoint 与在盘段数对账；重开后全窗可查；后续变更
+/// 的 delta 序号从 `checkpoint_seq + 1` 重新起算，目录不随写入无限增长。
+#[test]
+fn catalog_checkpoint_consolidates_deltas() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let marker = delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "consolidate")];
+
+    // 第一开：1 个基线 series，close 走强制全量 checkpoint。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_catalog_delta_max_count(3)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-ckpt-base", &labels, 1, 4);
+        storage.close().unwrap();
+    }
+
+    // 第二开：逐轮制造 delta（每轮一个新 series，各占一个发布拍）。阈值 3：
+    // 前两轮低于阈值，可安全观察 delta 序号；第 3 轮达阈值触发合并。compaction
+    // 拍压高，排除后台合并插入额外 delta 污染序号对账。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_catalog_delta_max_count(3)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        let before = snapshot_catalog_checkpoint(&catalog_file)
+            .expect("reopen must leave the baseline catalog checkpoint readable");
+
+        // 前两轮低于阈值：各产一个 delta 并落盘，文件名即序号。
+        for round in 0..2usize {
+            insert_catalog_delta_series(
+                &storage,
+                &format!("catalog-ckpt-{round}"),
+                &labels,
+                1 + round as i64 * 10,
+                4,
+            );
+            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+                catalog_delta_files(&delta_dir)
+                    .map(|deltas| deltas.len() > round)
+                    .unwrap_or(false)
+            });
+            assert!(
+                landed,
+                "round {round} must land as delta #{} under {} within 10s",
+                round + 1,
+                delta_dir.display()
+            );
+        }
+        let last_observed_seq = catalog_delta_files(&delta_dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| catalog_delta_seq(path))
+            .max()
+            .expect("rounds below the threshold must expose delta seqs");
+
+        // 第 3 轮达到阈值 → 全量 checkpoint 合并。
+        insert_catalog_delta_series(&storage, "catalog-ckpt-2", &labels, 21, 4);
+        let consolidated = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || marker.exists());
+        assert!(
+            consolidated,
+            "reaching catalog_delta_max_count must write {} within 10s",
+            marker.display()
+        );
+        let checkpoint_seq = catalog_checkpoint_marker_seq(&marker)
+            .expect("_checkpoint.json must carry a numeric checkpoint_seq");
+        assert_eq!(
+            checkpoint_seq,
+            last_observed_seq + 1,
+            "checkpoint_seq must equal the seq of the last delta it consolidates"
+        );
+        assert!(
+            catalog_delta_files(&delta_dir)
+                .unwrap_or_default()
+                .iter()
+                .all(|path| catalog_delta_seq(path) > Some(checkpoint_seq)),
+            "deltas with seq <= checkpoint_seq must be deleted after consolidation"
+        );
+        let consolidated_catalog = std::fs::read(&catalog_file)
+            .expect("consolidation must leave the catalog main file readable");
+        assert_ne!(
+            consolidated_catalog, before.bytes,
+            "consolidation must rewrite the catalog main file"
+        );
+        assert_eq!(
+            catalog_checkpoint_segment_count(&consolidated_catalog),
+            count_lane_segments_across_levels(&lane_path),
+            "consolidated checkpoint must carry an entry for every on-disk segment"
+        );
+        storage.close().unwrap();
+    }
+
+    // 第三开：合并后的 checkpoint 承载全部数据；再产两个变更，delta 序号从
+    // checkpoint_seq + 1 重新起算，目录不累计合并前的历史。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        assert_catalog_delta_series_window(&storage, "catalog-ckpt-base", &labels, 1, 4);
+        for round in 0..3 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-ckpt-{round}"),
+                &labels,
+                1 + round * 10,
+                4,
+            );
+        }
+        let anchor_seq = catalog_checkpoint_marker_seq(&marker)
+            .expect("reopen after consolidation must keep the checkpoint_seq anchor");
+        settle_past_catalog_persist_throttle();
+        for extra in 0..2usize {
+            insert_catalog_delta_series(
+                &storage,
+                &format!("catalog-ckpt-extra-{extra}"),
+                &labels,
+                100 + extra as i64 * 10,
+                4,
+            );
+            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+                catalog_delta_files(&delta_dir)
+                    .map(|deltas| deltas.len() > extra)
+                    .unwrap_or(false)
+            });
+            assert!(
+                landed,
+                "post-consolidation change {extra} must land as a fresh delta within 10s"
+            );
+        }
+        let deltas = catalog_delta_files(&delta_dir).unwrap_or_default();
+        assert_eq!(
+            deltas.len(),
+            2,
+            "delta dir must restart after consolidation, not accumulate the \
+             pre-consolidation history"
+        );
+        for (offset, path) in deltas.iter().enumerate() {
+            assert_eq!(
+                catalog_delta_seq(path),
+                Some(anchor_seq + 1 + offset as u64),
+                "post-consolidation delta seqs must continue from checkpoint_seq + 1"
+            );
+        }
+        storage.close().unwrap();
+    }
+
+    // 第四开：合并后新产 delta 的数据也必须完整可查。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        for extra in 0..2 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-ckpt-extra-{extra}"),
+                &labels,
+                100 + extra * 10,
+                4,
+            );
+        }
+        storage.close().unwrap();
+    }
+
+    // 字节阈值支路：`catalog_delta_max_bytes` 取极小值，首个 delta 即达字节
+    // 阈值 → 同一条合并路径（marker + 全量主文件 + delta 清理）必须生效。
+    {
+        let bytes_dir = TempDir::new().unwrap();
+        let bytes_path = bytes_dir.path();
+        let bytes_catalog = data_catalog_checkpoint_file(bytes_path);
+        let bytes_delta_dir = catalog_delta_dir(bytes_path);
+        let bytes_marker = bytes_delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+
+        let storage = catalog_delta_builder(bytes_path)
+            .with_catalog_delta_max_bytes(1)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-ckpt-bytes", &labels, 1, 4);
+        let consolidated = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || bytes_marker.exists());
+        assert!(
+            consolidated,
+            "reaching catalog_delta_max_bytes must write {} within 10s",
+            bytes_marker.display()
+        );
+        assert!(
+            catalog_delta_files(&bytes_delta_dir)
+                .unwrap_or_default()
+                .is_empty(),
+            "the byte-threshold delta must be consolidated away"
+        );
+        let bytes_catalog_file = std::fs::read(&bytes_catalog)
+            .expect("byte-threshold consolidation must leave the catalog readable");
+        assert_eq!(
+            catalog_checkpoint_segment_count(&bytes_catalog_file),
+            1,
+            "byte-threshold consolidation must carry the on-disk segment"
+        );
+        assert_catalog_delta_series_window(&storage, "catalog-ckpt-bytes", &labels, 1, 4);
+        storage.close().unwrap();
+
+        let reopened = catalog_delta_builder(bytes_path).build().unwrap();
+        assert_catalog_delta_series_window(&reopened, "catalog-ckpt-bytes", &labels, 1, 4);
+        reopened.close().unwrap();
+    }
+}
+
+/// T2-红：close 的强制 checkpoint 路径语义不回退——delta 存在时 close 必须
+/// 全量重写 catalog 主文件、写 `_checkpoint.json`（checkpoint_seq = 最后一个
+/// delta 的序号）并清掉全部已合并 delta；重开后全窗一致。
+#[test]
+fn catalog_forced_checkpoint_writes_full_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let marker = delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+    let labels = vec![Label::new("host", "forced")];
+
+    // 第一开：1 个基线 series + close（强制全量）。基线 1 段 + 第二开 2 段共
+    // 3 个 L0，低于 close 合并阈值 4——排除 close 期 compaction 插入额外
+    // remove delta 干扰 checkpoint_seq 对账。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-forced-base", &labels, 1, 4);
+        storage.close().unwrap();
+    }
+    let before = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("close must leave a catalog checkpoint on disk");
+
+    // 第二开：产 2 个 delta（默认阈值之下不触发自动合并），随后 close 走强制
+    // checkpoint 路径。
+    let last_delta_seq: Option<u64> = {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        for round in 0..2usize {
+            insert_catalog_delta_series(
+                &storage,
+                &format!("catalog-forced-delta-{round}"),
+                &labels,
+                10 + round as i64 * 10,
+                4,
+            );
+            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+                catalog_delta_files(&delta_dir)
+                    .map(|deltas| deltas.len() > round)
+                    .unwrap_or(false)
+            });
+            assert!(
+                landed,
+                "round {round} must land as delta #{} before the forced close",
+                round + 1
+            );
+        }
+        let deltas = catalog_delta_files(&delta_dir).unwrap_or_default();
+        assert!(
+            !deltas.is_empty(),
+            "precondition: deltas must exist under {} before the forced close",
+            delta_dir.display()
+        );
+        let last = deltas
+            .iter()
+            .filter_map(|path| catalog_delta_seq(path))
+            .max();
+        storage.close().unwrap();
+        last
+    };
+    let last_delta_seq = last_delta_seq.expect("deltas were observed before the forced close");
+
+    // close 后：主文件全量重写、marker 记最后 delta 序号、delta 清理。
+    {
+        let mut failures = Vec::new();
+        let after = snapshot_catalog_checkpoint(&catalog_file)
+            .expect("closed storage must leave the catalog main file in place");
+        if after == before {
+            failures.push(
+                "close must fully rewrite the catalog main file (mtime/len/bytes all unchanged)"
+                    .to_string(),
+            );
+        }
+        match catalog_checkpoint_marker_seq(&marker) {
+            None => failures.push(format!(
+                "close must write {} carrying a numeric checkpoint_seq",
+                marker.display()
+            )),
+            Some(seq) if seq != last_delta_seq => failures.push(format!(
+                "checkpoint_seq {seq} must equal the last delta seq {last_delta_seq}"
+            )),
+            Some(_) => {}
+        }
+        match catalog_delta_files(&delta_dir) {
+            Err(err) => failures.push(format!(
+                "delta dir {} must survive close: {err}",
+                delta_dir.display()
+            )),
+            Ok(deltas) if !deltas.is_empty() => failures.push(format!(
+                "close must delete the {} consolidated delta(s)",
+                deltas.len()
+            )),
+            Ok(_) => {}
+        }
+        assert!(
+            failures.is_empty(),
+            "forced checkpoint after deltas failed:\n- {}",
+            failures.join("\n- ")
+        );
+    }
+
+    // 第三开：强制 checkpoint 承载全部数据（全窗逐点校验）。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        assert_catalog_delta_series_window(&storage, "catalog-forced-base", &labels, 1, 4);
+        for round in 0..2 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-forced-delta-{round}"),
+                &labels,
+                10 + round * 10,
+                4,
+            );
+        }
+        storage.close().unwrap();
+    }
+}

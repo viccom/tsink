@@ -45,6 +45,7 @@
 | W2 边界 | ✅ | `cargo test -p tsink --no-fail-fast` 全 target：lib 603 绿+1 基线红+soak ignored，11 个集成文件全绿；fmt/clippy 0 告警 |
 | W3-T1 | ✅ | 三红测落地（断言红非超时红）：catalog 全量重写被红测实锤（mtime/len 变化）+ delta 目录缺失 + 快路径计数器自证有效（删 catalog→reads>0，有效 catalog→reads==0）。**发现例行 persist 语义**：节流跳过不重试、重试只在下一次发布拍（测试用 `settle_past_catalog_persist_throttle` 错峰）——W3-T4 实装注意。series.bin 计数器 = loader.rs `load_segment_dir_indexed` 分支 cfg(test) thread-local（启动唯一读路径）。remove 制造：3 个 L0 基线段 + 1000ms compaction 拍（50ms 会有 delta 竞态；close 路径 `compact_until_settled` 会吸收 remove 进强制 checkpoint 故不可用）。delta 数量断言（恰 1/恰 2）若 T4 做按拍合并需微调 |
 | W3-T2 | ⏳ | 未开始 |
+| W3-T2 | ✅ | 两红测落地（编译红→stub→断言红）：`catalog_checkpoint_consolidates_deltas`（阈值 3 触发合并语义：`_checkpoint.json` 的 checkpoint_seq==最后 delta seq、旧 delta 删、seq 锚点跨 reopen 存活）+ `catalog_forced_checkpoint_writes_full_file`（close 强制全量不回退）。StorageBuilder 旋钮 stub 三件套（默认常量 100/1MiB，存参不消费，`#[allow(dead_code)]` 待 T4 接线时删）。compaction 干扰隔离：delta 生产期 compaction interval=60s、段数压 3（close 期 L0 阈值 4 不吸收）。字节阈值支路只断 marker+清理+段数对账（不锁 seq，宽容两种实现序） |
 | W3-T3 | ⏳ | 未开始 |
 | W3-T4 | ⏳ | 未开始 |
 | W3-T5 | ⏳ | 未开始 |
