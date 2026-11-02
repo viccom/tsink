@@ -15,12 +15,13 @@ Sections are ordered from the highest-leverage tunables (memory, write pipeline)
 5. [Chunk and partition sizing](#5-chunk-and-partition-sizing)
 6. [Compaction tuning](#6-compaction-tuning)
 7. [Metadata sharding](#7-metadata-sharding)
-8. [Query performance](#8-query-performance)
-9. [Rollups for read-heavy workloads](#9-rollups-for-read-heavy-workloads)
-10. [Server-level concurrency limits](#10-server-level-concurrency-limits)
-11. [Cgroup-aware scheduling](#11-cgroup-aware-scheduling)
-12. [Monitoring performance](#12-monitoring-performance)
-13. [Quick-reference table](#13-quick-reference-table)
+8. [Catalog caches](#8-catalog-caches)
+9. [Query performance](#9-query-performance)
+10. [Rollups for read-heavy workloads](#10-rollups-for-read-heavy-workloads)
+11. [Server-level concurrency limits](#11-server-level-concurrency-limits)
+12. [Cgroup-aware scheduling](#12-cgroup-aware-scheduling)
+13. [Monitoring performance](#13-monitoring-performance)
+14. [Quick-reference table](#14-quick-reference-table)
 
 ---
 
@@ -127,7 +128,7 @@ let storage = StorageBuilder::new()
 tsink-server --max-writers 8
 ```
 
-The default is the cgroup-visible CPU count (see [cgroup-aware scheduling](#11-cgroup-aware-scheduling)).
+The default is the cgroup-visible CPU count (see [cgroup-aware scheduling](#12-cgroup-aware-scheduling)).
 
 ### Tuning guidance
 
@@ -306,7 +307,54 @@ When using the server, this can be tuned per deployment but is not yet exposed a
 
 ---
 
-## 8. Query performance
+## 8. Catalog caches
+
+After startup recovery and flush, the engine keeps a per-segment catalog cache so the post-flush maintenance pass can validate segment manifests and their series definitions without re-reading and re-parsing every manifest from disk. Without it, deployments at tens of thousands of segments degenerate into an `openat` storm (~2,800 syscalls/s pinning a full core) on every maintenance tick. Two independent knobs bound this cache.
+
+### Knobs
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `with_catalog_entry_cache_capacity(n)` | `32768` entries | Cached segment catalog entries, by count |
+| `with_catalog_series_cache_bytes(n)` | `33554432` (32 MiB) | Cached per-segment series definitions, by estimated bytes |
+
+```rust
+let storage = StorageBuilder::new()
+    .with_catalog_entry_cache_capacity(65536)
+    .with_catalog_series_cache_bytes(64 * 1024 * 1024)
+    .build()?
+```
+
+Both caches are LRU (touch-order refresh, bulk eviction to a 3/4 watermark), and applying removal tombstones to the persisted index invalidates the affected segments' slots immediately.
+
+### Recommended values
+
+- **Keep the defaults** — they are the tested configuration and the regression gate below runs against them.
+- **Never set `catalog_entry_cache_capacity` below your deployed segment count.** That guard is the openat-storm defense: once entries evict, every maintenance tick falls back to the full on-disk re-read path. If you run more than ~30 k segments, raise the capacity to match.
+- `0` disables the corresponding cache entirely — lookups always build or load from disk. This is a debugging escape hatch, not an operating mode.
+- The two budgets are independent: entries evict by count, series definitions by bytes. Size them for the same segment population.
+
+### Observability
+
+The flush observability snapshot carries two fields (library API via `observability_snapshot()`; the server `/metrics` exporter does not yet publish them):
+
+- `catalog_cache_entries` — currently resident slots across both maps (gauge). Must stay at or below the configured entry capacity.
+- `catalog_cache_evictions_total` — cumulative evictions across both maps (counter). Steadily climbing means the capacity is below your segment count — raise it.
+
+### Regression: long-run memory slope
+
+The `#[ignore]`d soak test (`catalog_cache_soak::catalog_cache_soak_long_run`, not in CI) asserts the property these knobs exist to guarantee: resident memory does not grow with history segment count, and the cache stays inside its bound. Run it through the driver script:
+
+```bash
+scripts/check_catalog_cache_soak.sh                    # full 2 h gate (default)
+TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # short smoke run
+```
+
+The harness writes 30 series at a total 10 points/s (the rs-iot production-matching profile) with default knobs and WAL `PerAppend`, sampling `elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_evictions_total,segment_count` every 5 min into `TSINK_SOAK_CSV` (default `/tmp/tsink-catalog-cache-soak.csv`). It drops the first 25 % of samples as warmup, fits a least-squares line to the rest, and passes only when the RSS slope is ≤ 0.5 MB/h and `catalog_cache_entries` never exceeds the capacity bound; under 4 samples (short windows) the slope judgement is skipped with a warning.
+
+---
+
+## 9. Query performance
 
 ### mmap reads
 
@@ -337,7 +385,7 @@ For dashboard-style repeated queries over long time ranges, configure [rollup po
 
 ---
 
-## 9. Rollups for read-heavy workloads
+## 10. Rollups for read-heavy workloads
 
 If the same long-range aggregation query runs repeatedly (e.g., Grafana dashboards with `rate`, `sum`, `avg`), define a rollup policy to pre-materialize the result at a lower resolution:
 
@@ -356,7 +404,7 @@ Materialized rollup series are stored as regular time series and resolved at que
 
 ---
 
-## 10. Server-level concurrency limits
+## 11. Server-level concurrency limits
 
 The tsink-server adds an HTTP-layer admission tier on top of the engine-level `max_writers` semaphore. These environment variables are read once at process startup:
 
@@ -391,7 +439,7 @@ export TSINK_SERVER_READ_RESOURCE_ACQUIRE_TIMEOUT_MS=200
 
 ---
 
-## 11. Cgroup-aware scheduling
+## 12. Cgroup-aware scheduling
 
 tsink reads container CPU and memory limits from the cgroup v2 interface (`/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max`) at startup and uses those values to size the default worker pools.
 
@@ -422,7 +470,7 @@ tsink-server --memory-limit 2684354560 --data-path ./var/tsink
 
 ---
 
-## 12. Monitoring performance
+## 13. Monitoring performance
 
 All internal counters are exposed at `GET /metrics` in Prometheus format. The most useful ones for performance diagnosis:
 
@@ -485,13 +533,14 @@ rate(tsink_query_rollup_query_plans_total[5m])
 
 ---
 
-## 13. Quick-reference table
+## 14. Quick-reference table
 
 | Goal | Parameter | Recommended change |
 |---|---|---|
 | Maximise write throughput | `wal_sync_mode` | `Periodic(500ms)` |
 | Reduce write latency at high concurrency | `max_writers` | 2× CPU count |
 | Prevent OOM on memory spike | `memory_limit` | 60–70 % of available RAM |
+| Keep catalog maintenance off disk | `with_catalog_entry_cache_capacity` | ≥ deployed segment count (default 32768) |
 | Improve compression ratio | `chunk_points` | 4096–8192 |
 | Reduce read latency on large label spaces | `metadata_shard_count` | 16–64 |
 | Reduce read latency on long time ranges | Rollup policies | 1 m / 5 m resolution |
