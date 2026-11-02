@@ -53,6 +53,10 @@
 | W3 边界 | ✅ | 全 target：lib 611 绿+基线红+soak ignored，13 个集成 target 全绿；fmt/clippy 0 告警 |
 | W4-T0 | ✅ | mmap 重映射窗口容错落地：`SegmentMapRemapResolver` 注入（`construction.rs` 构造后注入，回调按 persisted index 反查 slot→root→chunks 路径）+ remap NotFound 分支计数 `persisted_remap_not_found_total` + **恰一次重试**（重试失败抛原错误）。锁序：回调在 registry 锁外执行且只用 `try_read`（parking_lot 写者优先下阻塞式二次读会与排队写者互等死锁——try_read 失败退化为旧行为，正确性优先）。`persisted_index` Arc 化（读写语义不变）。红两段留证；residency 4 绿；lib 612 绿+基线红；crash 门禁 80 轮绿。**观测**：本任务后 1 次 lib 全量跑出现瞬态 2 failed（未捕获名字，随后 3 连跑 612+1 干净——与 W3-T4 登记的 fsync 并行抖动一致） |
 | W4-T1 | ⏳ | 未开始 |
+| W4-T2 | ⏳ | 未开始 |
+| W4-T3 | ⏳ | 未开始 |
+| W4-T4 | ⏳ | 未开始 |
+| W4-T5 | ⏳ | 未开始 |
 
 ---
 
