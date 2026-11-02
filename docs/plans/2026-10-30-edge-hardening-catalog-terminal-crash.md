@@ -53,6 +53,7 @@
 | W3 边界 | ✅ | 全 target：lib 611 绿+基线红+soak ignored，13 个集成 target 全绿；fmt/clippy 0 告警 |
 | W4-T0 | ✅ | mmap 重映射窗口容错落地：`SegmentMapRemapResolver` 注入（`construction.rs` 构造后注入，回调按 persisted index 反查 slot→root→chunks 路径）+ remap NotFound 分支计数 `persisted_remap_not_found_total` + **恰一次重试**（重试失败抛原错误）。锁序：回调在 registry 锁外执行且只用 `try_read`（parking_lot 写者优先下阻塞式二次读会与排队写者互等死锁——try_read 失败退化为旧行为，正确性优先）。`persisted_index` Arc 化（读写语义不变）。红两段留证；residency 4 绿；lib 612 绿+基线红；crash 门禁 80 轮绿。**观测**：本任务后 1 次 lib 全量跑出现瞬态 2 failed（未捕获名字，随后 3 连跑 612+1 干净——与 W3-T4 登记的 fsync 并行抖动一致） |
 | W4-T1 | ⏳ | 未开始 |
+| W4-T1 | ✅ | 三红测落地（编译红→stub→断言红）：40 段 fixture（各 100 点、ts=i*100 全局唯一、值=ts 逐点可校验）+ 终止判据（连续 3 轮无进展判静默，上限 200 pass）+ 测 3 红点钉「收敛必须发生」（level==2 对未动输入恒真）。测 2 旋钮 stub 落 **Compactor 侧**（`DEFAULT_L2_TRIGGER=32` + `l2_trigger` 字段 + `with_l2_compaction_trigger`，对齐 l0/l1_trigger 惯例；测试直构 standalone Compactor 不经 StorageBuilder，StorageBuilder 旋钮 T4 随 transition 引入）。**独立证实既有 flaky**：`persistence_recovery::catalog_*` 三测在基线 stash 下 6 轮 2 红且名字不固定（8 线程并发 poll 10s 超时，红跑 ~10.5s vs 绿 ~1.4s）——与 W3-T4/W4-T0 两处观察同因，处理前 lib 全量在 N±1 failed 间波动 |
 | W4-T2 | ⏳ | 未开始 |
 | W4-T3 | ⏳ | 未开始 |
 | W4-T4 | ⏳ | 未开始 |

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use super::{execution, finalize_pending_compaction_replacements, Compactor};
+use super::{execution, finalize_pending_compaction_replacements, CompactionRunStats, Compactor};
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
 use crate::engine::segment::{
@@ -220,6 +221,224 @@ fn l0_backlog_is_not_starved_by_level_rotation() {
     assert!(load_segments_for_level(temp_dir.path(), 0)
         .unwrap()
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// W4-T1（红）：L2 终层收敛三测。L2 目前是终层（只有 L0→L1 / L1→L2 两个
+// transition），三测的红态都源于「无 L2ToL2 transition → L2 段数不降」；
+// W4-T4 引入 `LevelTransition::L2ToL2` 后转绿（触发 = 候选 ≥ 2 且 L2 总段数
+// > l2_trigger，默认 32，0 = 关闭；候选 = point_count ≤ output_segment_point_
+// budget/8；窗口 ≤ source_window_segments）。
+// ---------------------------------------------------------------------------
+
+/// W4-T1 三测共用 fixture：在 L2 写 `count` 个小段（段 id 1..=count），每段
+/// 100 点，时间窗互不重叠（段 i 覆盖 [i*100, (i+1)*100)），值 = ts as f64
+/// （确定性，可逐点校验）。
+fn write_l2_small_segments(
+    temp_dir: &tempfile::TempDir,
+    registry: &SeriesRegistry,
+    series_id: u64,
+    count: usize,
+) {
+    for segment_index in 0..count {
+        let base_ts = segment_index as i64 * 100;
+        let points = (base_ts..base_ts + 100)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        write_level_segment(
+            temp_dir,
+            2,
+            segment_index as u64 + 1,
+            series_id,
+            registry,
+            &points,
+        );
+    }
+}
+
+/// 反复驱动 compaction 直到无进展（连续 3 轮 `compacted == false`）或达到
+/// `max_passes` 上限，返回每轮 stats。红态（无 L2ToL2）首轮即无进展；绿态
+/// （W4-T4 落地）收敛到阈值下后停。连续多轮而非单轮判停，容忍轮转仲裁下
+/// 单轮偶发的无进展 pass。
+fn drive_l2_compaction_to_quiescence(
+    compactor: &Compactor,
+    max_passes: usize,
+) -> Vec<CompactionRunStats> {
+    let mut passes = Vec::new();
+    let mut idle_rounds = 0usize;
+    for _ in 0..max_passes {
+        let stats = compactor.compact_once_with_changes().unwrap().stats;
+        if stats.compacted {
+            idle_rounds = 0;
+        } else {
+            idle_rounds += 1;
+            if idle_rounds >= 3 {
+                break;
+            }
+        }
+        passes.push(stats);
+    }
+    passes
+}
+
+/// 全量读取 base 下所有段的 `series_id` 数值点，返回 (ts, value) 对。
+/// `load_segments` 不应用墓碑文件——读到的即数据文件层实际内容（绿态判据：
+/// 墓碑点必须物理消失，而非仅被读取层过滤）。
+fn decoded_numeric_points(base: &Path, series_id: u64) -> Vec<(i64, f64)> {
+    let loaded = load_segments(base).unwrap();
+    loaded
+        .chunks_by_series
+        .get(&series_id)
+        .map(|chunks| {
+            chunks
+                .iter()
+                .flat_map(|chunk| execution::decode_chunk_points_for_compaction(chunk).unwrap())
+                .map(|point| match point.value {
+                    Value::F64(value) => (point.ts, value),
+                    other => panic!("fixture 只写数值点，读到 {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn l2_compaction_reduces_terminal_segment_count() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-terminal")])
+        .unwrap()
+        .series_id;
+
+    write_l2_small_segments(&temp_dir, &registry, series_id, 40);
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    );
+    drive_l2_compaction_to_quiescence(&compactor, 200);
+
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert!(
+        l2.len() <= 32, // W4-T4 默认触发阈值（l2_trigger = 32）
+        "40 个 L2 小段收敛后必须 ≤ 32 段（W4-T4 默认触发阈值），实际 {} 段 \
+         ——红态：L2 是终层，无 L2ToL2 transition，段数不降",
+        l2.len()
+    );
+
+    // 数据完整：40 × 100 点全量可读、时间戳无重复、值 = ts as f64。
+    let points = decoded_numeric_points(temp_dir.path(), series_id);
+    assert_eq!(points.len(), 4_000, "40 段 × 100 点必须全量可读");
+    let mut timestamps = points.iter().map(|(ts, _)| *ts).collect::<Vec<_>>();
+    timestamps.sort_unstable();
+    let expected: Vec<i64> = (0..4_000).collect();
+    assert_eq!(
+        timestamps, expected,
+        "合并后时间戳必须恰好是 0..4000 各一次（全保留且无重复）"
+    );
+    for (ts, value) in &points {
+        assert_eq!(*value, *ts as f64, "ts={ts} 的值必须保持不变");
+    }
+}
+
+#[test]
+fn l2_compaction_applies_tombstones() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-tombstone")])
+        .unwrap()
+        .series_id;
+
+    // 8 个 100 点小段（ts 0..800）。默认触发 32 下不满足「总段数 > 触发」，
+    // 本测用 W4-T4 旋钮把阈值下调到 4（stub 阶段存参不消费 → 断言红）。
+    write_l2_small_segments(&temp_dir, &registry, series_id, 8);
+
+    // 墓碑半开区间 [0, 150)：段 0 全灭（ts 0..=99）+ 段 1 前半（ts 100..=149）；
+    // ts ∈ [150, 800) 的 650 点必须保留。
+    let mut tombstones = HashMap::new();
+    tombstones.insert(series_id, vec![TombstoneRange { start: 0, end: 150 }]);
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    )
+    .with_l2_compaction_trigger(4);
+    drive_l2_compaction_to_quiescence(&compactor, 200);
+
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert!(
+        l2.len() < 8,
+        "8 个 L2 小段（> 触发阈值 4）必须收敛合并、段数必须下降，实际 {} 段 \
+         ——红态：无 L2ToL2 transition，无合并",
+        l2.len()
+    );
+
+    // 绿态判据经读取校验：墓碑点从数据文件层物理消失，其余点完整保留。
+    let points = decoded_numeric_points(temp_dir.path(), series_id);
+    let mut timestamps = points.iter().map(|(ts, _)| *ts).collect::<Vec<_>>();
+    timestamps.sort_unstable();
+    let expected: Vec<i64> = (150..800).collect();
+    assert_eq!(
+        timestamps, expected,
+        "墓碑区间 [0, 150) 的点合并后必须不可见，其余 650 点完整保留"
+    );
+    for (ts, value) in &points {
+        assert_eq!(*value, *ts as f64, "ts={ts} 的值必须保持不变");
+    }
+}
+
+#[test]
+fn l2_compaction_output_level_is_l2() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-terminal")])
+        .unwrap()
+        .series_id;
+
+    write_l2_small_segments(&temp_dir, &registry, series_id, 40);
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    );
+    let passes = drive_l2_compaction_to_quiescence(&compactor, 200);
+
+    // 前置：收敛必须真的发生过，否则 level 断言对未动的输入段空转（输入段
+    // 本来就是 level 2）。
+    assert!(
+        passes.iter().any(|stats| stats.compacted),
+        "前置：L2 收敛必须发生（红态：无 L2ToL2 transition，{} 次 pass 无一压缩）",
+        passes.len()
+    );
+
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert!(
+        !l2.is_empty(),
+        "收敛后 L2 必须仍有存活段（纯删除仅发生在全墓碑窗口，本 fixture 无墓碑）"
+    );
+    assert!(
+        l2.iter().all(|segment| segment.manifest.level == 2),
+        "L2 终层收敛的输出段必须留在 L2（manifest.level == 2），不得降级"
+    );
+    assert!(
+        load_segments_for_level(temp_dir.path(), 1)
+            .unwrap()
+            .is_empty(),
+        "终层收敛不得把输出写到 L1"
+    );
+    assert!(
+        load_segments_for_level(temp_dir.path(), 0)
+            .unwrap()
+            .is_empty(),
+        "终层收敛不得把输出写到 L0"
+    );
 }
 
 #[test]

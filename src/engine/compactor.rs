@@ -32,6 +32,10 @@ pub(in crate::engine) use self::execution::finalize_pending_compaction_replaceme
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
+/// W4-T4 planned default: L2 terminal-level convergence triggers while the L2
+/// segment count exceeds this value (0 disables convergence). Stored but not
+/// consumed until the `L2ToL2` transition lands.
+const DEFAULT_L2_TRIGGER: usize = 32;
 /// Source window: how many same-level segments one compaction pass may merge.
 /// Raised from 8 to 16 so a single pass amortizes the per-pass fixed costs
 /// (marker directory scan, tombstone parse, full-level survey, drain-budget
@@ -121,6 +125,11 @@ pub struct Compactor {
     source_window_segments: usize,
     l0_trigger: usize,
     l1_trigger: usize,
+    /// W4-T4 stub: L2 terminal-level convergence trigger (segment count).
+    /// Stored only — L2 is still terminal (no `L2ToL2` transition) and nothing
+    /// reads this until W4-T4 wires the transition.
+    #[allow(dead_code)]
+    l2_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
     last_compacted_transition: Arc<AtomicU8>,
     /// When wired into a live engine, serializes this compactor's
@@ -139,6 +148,7 @@ impl Compactor {
             source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            l2_trigger: DEFAULT_L2_TRIGGER,
             next_segment_id: None,
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
@@ -157,6 +167,7 @@ impl Compactor {
             source_window_segments: DEFAULT_SOURCE_WINDOW_SEGMENTS,
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            l2_trigger: DEFAULT_L2_TRIGGER,
             next_segment_id: Some(next_segment_id),
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
@@ -178,6 +189,17 @@ impl Compactor {
     /// silently disable the level's compaction.
     pub fn with_source_window_segments(mut self, segments: usize) -> Self {
         self.source_window_segments = segments.max(2);
+        self
+    }
+
+    /// W4-T4 stub: sets the L2 terminal-level convergence trigger (the L2
+    /// total segment count above which same-level convergence runs; 0
+    /// disables). Default: [`DEFAULT_L2_TRIGGER`] (32). Stored only for now —
+    /// L2 is still terminal, so no transition consumes it until W4-T4 lands;
+    /// the `StorageBuilder` knob is introduced together with the transition.
+    #[must_use]
+    pub fn with_l2_compaction_trigger(mut self, trigger: usize) -> Self {
+        self.l2_trigger = trigger;
         self
     }
 
