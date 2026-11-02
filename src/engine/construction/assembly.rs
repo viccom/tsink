@@ -56,6 +56,8 @@ impl StorageStateAssembly {
                 pending_persisted_segment_diff,
                 options.persisted_mmap_budget_bytes,
                 options.timestamp_index_cache_budget_bytes,
+                options.catalog_entry_cache_capacity,
+                options.catalog_series_cache_bytes,
             ),
             runtime: Self::build_runtime_config_state(options),
             memory: Self::build_memory_accounting_state(options),
@@ -110,10 +112,17 @@ impl StorageStateAssembly {
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
         persisted_mmap_budget_bytes: usize,
         timestamp_index_cache_budget_bytes: usize,
+        catalog_entry_cache_capacity: usize,
+        catalog_series_cache_bytes: usize,
     ) -> PersistedStorageState {
         PersistedStorageState {
             persisted_index: RwLock::new(PersistedIndexState::default()),
-            catalog_validate_cache: Default::default(),
+            // W2-T2：长寿 catalog 缓存按 StorageBuilder 旋钮构造（0 = 不缓存）；
+            // bootstrap 的一次性缓存不受影响。
+            catalog_validate_cache: registry_catalog::CatalogEntryCache::from_knobs(
+                catalog_entry_cache_capacity,
+                catalog_series_cache_bytes,
+            ),
             catalog_persist_memo: Default::default(),
             segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
             timestamp_indexes: TimestampIndexCache::new(timestamp_index_cache_budget_bytes),

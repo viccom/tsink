@@ -217,6 +217,10 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             catalog_persist_skipped_total: counters
                 .catalog_persist_skipped_total
                 .load(Ordering::Relaxed),
+            // W2-T2：catalog 缓存计数器活在缓存实例里（见
+            // observability_snapshot_impl 的补填），计数器快照路径恒 0。
+            catalog_cache_evictions_total: 0,
+            catalog_cache_entries: 0,
             tier_moves_total: counters.tier_moves_total.load(Ordering::Relaxed),
             tier_move_errors_total: counters.tier_move_errors_total.load(Ordering::Relaxed),
             expired_segments_total: counters.expired_segments_total.load(Ordering::Relaxed),
@@ -387,7 +391,16 @@ impl ChunkStorage {
                 recency_reference_timestamp: self.retention_recency_reference_timestamp(),
                 future_skew_window: self.runtime.future_skew_window,
             }),
-            flush: FlushObservabilitySnapshot::from(&self.observability.flush),
+            flush: {
+                // W2-T2：catalog 缓存计数器在缓存内部（不在 FlushObservabilityCounters），
+                // 计数器快照之外补填这两个字段。
+                let mut flush = FlushObservabilitySnapshot::from(&self.observability.flush);
+                let (catalog_cache_evictions_total, catalog_cache_entries) =
+                    self.persisted.catalog_validate_cache.observability_totals();
+                flush.catalog_cache_evictions_total = catalog_cache_evictions_total;
+                flush.catalog_cache_entries = catalog_cache_entries;
+                flush
+            },
             compaction: CompactionObservabilitySnapshot::from(&self.observability.compaction),
             query: QueryObservabilitySnapshot::from(&self.observability.query),
             rollups: self.rollup_observability_snapshot(),

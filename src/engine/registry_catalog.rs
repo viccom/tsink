@@ -63,13 +63,180 @@ pub(super) struct ValidatedRegistryCatalog {
     pub(super) series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
 }
 
-/// W2-T1 stub：恒 0（永不超预算）。真实估算口径（metric/labels 堆字节等）
-/// 由 W2-T2 定，届时由 `get_or_load_series` 的插入/命中路径调用并触发预算淘汰。
-#[cfg(test)]
-#[allow(dead_code)]
+/// series 缓存槽位的估算堆字节口径（W2-T2）：每条 `PersistedSeries` 计
+/// 结构体标量（含 `value_family`）+ metric String 堆字节 + labels Vec
+/// （每条计一个 Vec 头 + 每 Label 结构与 name/value 堆字节）。不含分配器
+/// 对齐/元数据开销（系统性偏差每条 ≤ 数十字节），只用于缓存淘汰预算，
+/// 不参与内存记账。
 fn estimated_series_bytes(series: &[crate::engine::segment::PersistedSeries]) -> usize {
-    let _ = series;
-    0
+    const SERIES_FIXED: usize = std::mem::size_of::<crate::engine::segment::PersistedSeries>();
+    const VEC_HEADER: usize = std::mem::size_of::<Vec<Label>>();
+    const LABEL_FIXED: usize = std::mem::size_of::<Label>();
+
+    series
+        .iter()
+        .map(|series| {
+            SERIES_FIXED
+                + VEC_HEADER
+                + series.metric.len()
+                + series
+                    .labels
+                    .iter()
+                    .map(|label| LABEL_FIXED + label.name.len() + label.value.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// 单 map 有界缓存原语：全局 touch 序（命中刷新）+ 超限批量淘汰至 3/4 水位。
+///
+/// 两层「0」语义显式区分，勿混：
+/// - 内部构造（`Default` / `with_capacity`）：limit = 0 表示**无界**——
+///   `Default` 即 (0, 0)，保持 N9b 既有无界行为不变。
+/// - StorageBuilder 旋钮：0 表示**不缓存**（disabled），由
+///   `CatalogEntryCache::from_knobs` 翻译成 `enabled = false`——既不命中
+///   也不存储，直接走盘上构建/加载。
+struct CatalogLruMap<V> {
+    /// disabled（旋钮 0）：不命中不存储。
+    enabled: bool,
+    /// 条数上限；0 = 按条数无界。
+    capacity: usize,
+    /// 估算字节预算；0 = 按字节无界。
+    budget_bytes: u64,
+    touch_seq: AtomicU64,
+    evictions_total: AtomicU64,
+    /// 当前驻留条目数（gauge；全部变更都发生在 `slots` 锁内，读侧免锁）。
+    resident: AtomicU64,
+    used_bytes: AtomicU64,
+    slots: Mutex<HashMap<PathBuf, CatalogCacheSlot<V>>>,
+}
+
+struct CatalogCacheSlot<V> {
+    value: V,
+    touch: u64,
+    approx_bytes: u64,
+}
+
+impl<V> Default for CatalogLruMap<V> {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: 0,
+            budget_bytes: 0,
+            touch_seq: AtomicU64::new(0),
+            evictions_total: AtomicU64::new(0),
+            resident: AtomicU64::new(0),
+            used_bytes: AtomicU64::new(0),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<V: Clone> CatalogLruMap<V> {
+    fn new(enabled: bool, capacity: usize, budget_bytes: usize) -> Self {
+        Self {
+            enabled,
+            capacity,
+            budget_bytes: saturating_u64_from_usize(budget_bytes),
+            ..Default::default()
+        }
+    }
+
+    fn get(&self, root: &Path) -> Option<V> {
+        if !self.enabled {
+            return None;
+        }
+        let mut slots = self.slots.lock();
+        let slot = slots.get_mut(root)?;
+        slot.touch = self.touch_seq.fetch_add(1, Ordering::Relaxed);
+        Some(slot.value.clone())
+    }
+
+    fn insert(&self, root: PathBuf, value: V, approx_bytes: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut slots = self.slots.lock();
+        let touch = self.touch_seq.fetch_add(1, Ordering::Relaxed);
+        match slots.get_mut(&root) {
+            Some(slot) => {
+                // 并发双 miss 双构建的罕见竞态：覆盖值、字节差量对账、touch 刷新。
+                let previous_bytes = slot.approx_bytes;
+                slot.value = value;
+                slot.touch = touch;
+                slot.approx_bytes = approx_bytes;
+                self.adjust_used_bytes(previous_bytes, approx_bytes);
+            }
+            None => {
+                slots.insert(
+                    root,
+                    CatalogCacheSlot {
+                        value,
+                        touch,
+                        approx_bytes,
+                    },
+                );
+                self.resident.fetch_add(1, Ordering::Relaxed);
+                self.used_bytes.fetch_add(approx_bytes, Ordering::Relaxed);
+            }
+        }
+        self.evict_over_limit(&mut slots);
+    }
+
+    fn remove(&self, root: &Path) {
+        if !self.enabled {
+            return;
+        }
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots.remove(root) {
+            self.resident.fetch_sub(1, Ordering::Relaxed);
+            saturating_sub_fetch(&self.used_bytes, slot.approx_bytes);
+        }
+    }
+
+    fn adjust_used_bytes(&self, previous: u64, current: u64) {
+        if current > previous {
+            self.used_bytes
+                .fetch_add(current - previous, Ordering::Relaxed);
+        } else if current < previous {
+            saturating_sub_fetch(&self.used_bytes, previous - current);
+        }
+    }
+
+    /// 超限批量淘汰（插入路径调用）：一次按 touch 升序扫描，同时朝
+    /// count `capacity * 3/4` 与 bytes `budget * 3/4` 两个水位收敛；摊还
+    /// O(1)/插入。任何时刻至少保留 1 条（touch 最新的刚插入条目不淘汰）——
+    /// 单条目超预算时宁可越界也不全清，全清会让下次读取必然 miss，重演
+    /// N9 修掉的重读风暴。
+    fn evict_over_limit(&self, slots: &mut HashMap<PathBuf, CatalogCacheSlot<V>>) {
+        let count_over = self.capacity > 0 && slots.len() > self.capacity;
+        let bytes_over =
+            self.budget_bytes > 0 && self.used_bytes.load(Ordering::Relaxed) > self.budget_bytes;
+        if !count_over && !bytes_over {
+            return;
+        }
+        let count_water_mark = (self.capacity / 4 * 3).max(1);
+        let bytes_water_mark = self.budget_bytes / 4 * 3;
+        let mut used_bytes = self.used_bytes.load(Ordering::Relaxed);
+        let mut by_touch = slots
+            .iter()
+            .map(|(root, slot)| (root.clone(), slot.touch))
+            .collect::<Vec<_>>();
+        by_touch.sort_unstable_by_key(|(_, touch)| *touch);
+        for (root, _) in by_touch {
+            let count_satisfied = !count_over || slots.len() <= count_water_mark;
+            let bytes_satisfied = !bytes_over || used_bytes <= bytes_water_mark;
+            if (count_satisfied && bytes_satisfied) || slots.len() <= 1 {
+                break;
+            }
+            if let Some(slot) = slots.remove(&root) {
+                used_bytes = used_bytes.saturating_sub(slot.approx_bytes);
+                self.resident.fetch_sub(1, Ordering::Relaxed);
+                saturating_sub_fetch(&self.used_bytes, slot.approx_bytes);
+                self.evictions_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// 段级 catalog entry 缓存（N9b）：段不可变且 segment_id 单调不复用 →
@@ -78,75 +245,101 @@ fn estimated_series_bytes(series: &[crate::engine::segment::PersistedSeries]) ->
 /// compaction 持续产段的实例上永不命中（实测），按段缓存后每拍只读新增段。
 /// NotFound(None) 同缓存：消失是 compaction 删除的持久结果（N1 窗口瞬态
 /// 场景下轮 sources 更新后自愈，catalog 是校验侧车不承载段数据）。
+///
+/// W2-T2：`Default`（无界）之外新增有界语义——`from_knobs` 接 StorageBuilder
+/// 旋钮（0 = 不缓存），entries 按条数、series 按估算字节独立淘汰；removed_roots
+/// 实际应用到持久化索引后必须 `invalidate`（删除打破「段不可变 → 永久有效」
+/// 前提，不失效会让陈旧指纹与已删段的 series 元数据一直存活到重启）。
 #[derive(Default)]
 pub(super) struct CatalogEntryCache {
-    entries: Mutex<HashMap<PathBuf, Option<PersistedRegistryCatalogEntry>>>,
-    series: Mutex<HashMap<PathBuf, Vec<crate::engine::segment::PersistedSeries>>>,
-    // W2-T1 stub 占位字段：容量参数（`0` = 无界，故 `Default` 语义不变）。
-    // 仅测试可见；W2-T2 接线淘汰逻辑时去 cfg 并实现真实消费。
-    #[cfg(test)]
-    #[allow(dead_code)]
-    entry_capacity: usize,
-    #[cfg(test)]
-    #[allow(dead_code)]
-    series_budget_bytes: usize,
+    entries: CatalogLruMap<Option<PersistedRegistryCatalogEntry>>,
+    series: CatalogLruMap<Vec<crate::engine::segment::PersistedSeries>>,
 }
 
-impl CatalogEntryCache {
-    // ---- W2-T1 stubs（断言红）：真实淘汰/失效实现归 W2-T2 ----
+/// entries 槽位的估算字节（该 map 无字节预算，仅 used_bytes 观测口径）：
+/// 条目结构 + key PathBuf 的近似堆占用。
+const CATALOG_ENTRY_SLOT_ESTIMATED_BYTES: u64 = (std::mem::size_of::<
+    Option<PersistedRegistryCatalogEntry>,
+>() + std::mem::size_of::<PathBuf>()
+    + 16) as u64;
 
-    /// W2-T1 stub：仅存容量参数，无任何淘汰逻辑。契约：`0` 表示无界——
-    /// `Default`（0, 0）因此保持既有无界行为不变。W2-T2 实现真实淘汰：
-    /// entries 插入后 len > capacity 时按 touch（最近命中）序淘汰至
-    /// `capacity * 3/4`；series 按估算字节预算独立淘汰最旧。
+impl CatalogEntryCache {
+    /// 内部构造：`0` = 无界（`Default`（0, 0）即既有无界行为）。
     #[cfg(test)]
     fn with_capacity(entry_capacity: usize, series_budget_bytes: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            series: Mutex::new(HashMap::new()),
-            entry_capacity,
-            series_budget_bytes,
+            entries: CatalogLruMap::new(true, entry_capacity, 0),
+            series: CatalogLruMap::new(true, 0, series_budget_bytes),
         }
     }
 
-    /// W2-T1 stub（语义不完整即 stub）：只清 entries、不清 series——
-    /// W2-T2 收口为两个 map 同时移除该 root（含 None/空 Vec 槽）。
-    #[cfg(test)]
-    fn invalidate(&self, root: &Path) {
-        self.entries.lock().remove(root);
+    /// StorageBuilder 旋钮构造：旋钮 `0` = 不缓存（disabled——既不命中也不
+    /// 存储，直接走盘上构建/加载）；非 0 旋钮 = 对应 map 有界。与内部
+    /// `with_capacity` 的「0 = 无界」是两层语义。
+    pub(super) fn from_knobs(entry_capacity: usize, series_budget_bytes: usize) -> Self {
+        Self {
+            entries: CatalogLruMap::new(entry_capacity > 0, entry_capacity, 0),
+            series: CatalogLruMap::new(series_budget_bytes > 0, 0, series_budget_bytes),
+        }
     }
 
-    // `#[cfg(test)]` 观测访问器：红阶段钉断言用，W2-T2 落地后按需保留。
+    /// removed_roots 已实际应用到持久化索引后调用：双 map 齐删该 root
+    /// （含 None/空 Vec 槽）。见结构体文档的失效前提。
+    pub(super) fn invalidate(&self, root: &Path) {
+        self.entries.remove(root);
+        self.series.remove(root);
+    }
+
+    pub(super) fn invalidate_roots(&self, roots: &[PathBuf]) {
+        for root in roots {
+            self.invalidate(root);
+        }
+    }
+
+    /// （累计淘汰条数, 当前驻留条目数）——entries 与 series 两 map 合计。
+    pub(super) fn observability_totals(&self) -> (u64, u64) {
+        (
+            self.entries.evictions_total.load(Ordering::Relaxed)
+                + self.series.evictions_total.load(Ordering::Relaxed),
+            self.entries.resident.load(Ordering::Relaxed)
+                + self.series.resident.load(Ordering::Relaxed),
+        )
+    }
+
+    // `#[cfg(test)]` 观测访问器：W2-T1 红阶段钉断言用，保留供缓存语义测试。
     #[cfg(test)]
     fn entries_len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.slots.lock().len()
     }
 
     #[cfg(test)]
     fn series_len(&self) -> usize {
-        self.series.lock().len()
+        self.series.slots.lock().len()
     }
 
     #[cfg(test)]
     fn entries_contains(&self, root: &Path) -> bool {
-        self.entries.lock().contains_key(root)
+        self.entries.slots.lock().contains_key(root)
     }
 
     #[cfg(test)]
     fn series_contains(&self, root: &Path) -> bool {
-        self.series.lock().contains_key(root)
+        self.series.slots.lock().contains_key(root)
     }
 
     fn get_or_build(
         &self,
         source: &PersistedRegistryCatalogSource,
     ) -> Result<Option<PersistedRegistryCatalogEntry>> {
-        let mut guard = self.entries.lock();
-        if let Some(cached) = guard.get(&source.root) {
-            return Ok(cached.clone());
+        if let Some(cached) = self.entries.get(&source.root) {
+            return Ok(cached);
         }
         let built = build_catalog_entry(source)?;
-        guard.insert(source.root.clone(), built.clone());
+        self.entries.insert(
+            source.root.clone(),
+            built.clone(),
+            CATALOG_ENTRY_SLOT_ESTIMATED_BYTES,
+        );
         Ok(built)
     }
 
@@ -157,9 +350,8 @@ impl CatalogEntryCache {
         &self,
         root: &Path,
     ) -> Result<Vec<crate::engine::segment::PersistedSeries>> {
-        let mut guard = self.series.lock();
-        if let Some(cached) = guard.get(root) {
-            return Ok(cached.clone());
+        if let Some(cached) = self.series.get(root) {
+            return Ok(cached);
         }
         let loaded = match crate::engine::segment::load_segment_series_metadata(root) {
             Ok(series) => series,
@@ -181,7 +373,9 @@ impl CatalogEntryCache {
             }
             Err(err) => return Err(err),
         };
-        guard.insert(root.to_path_buf(), loaded.clone());
+        let approx_bytes = saturating_u64_from_usize(estimated_series_bytes(&loaded));
+        self.series
+            .insert(root.to_path_buf(), loaded.clone(), approx_bytes);
         Ok(loaded)
     }
 }
@@ -648,6 +842,63 @@ mod catalog_entry_cache_tests {
             assert_eq!(left_series.labels, right_series.labels);
             assert_eq!(left_series.value_family, right_series.value_family);
         }
+    }
+
+    /// W2-T2 新增：命中刷新 touch 序 → 淘汰序改变。capacity=4 插 A B C D，
+    /// 多次命中 A，再插 E 触发淘汰：A 必须存活，未命中的最旧者（B、C）出局。
+    #[test]
+    fn catalog_entry_cache_hit_refreshes_touch_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join("numeric");
+        let registry = SeriesRegistry::new();
+        let labels = vec![Label::new("host", "touch-order")];
+        let series_id = resolve_one_series("catalog_cache_touch_metric", &labels, &registry);
+
+        let roots = (1..=5u64)
+            .map(|segment_id| {
+                write_numeric_segment(
+                    &lane_path,
+                    &registry,
+                    series_id,
+                    segment_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let sources = roots
+            .iter()
+            .map(|root| numeric_source(root.clone()))
+            .collect::<Vec<_>>();
+
+        let cache = CatalogEntryCache::with_capacity(4, 0);
+        for source in &sources[..4] {
+            cache
+                .get_or_build(source)
+                .unwrap()
+                .expect("real segment root must build an entry");
+        }
+        // 命中 A（roots[0]）两次：A 的 touch 序刷新到最新。
+        cache.get_or_build(&sources[0]).unwrap();
+        cache.get_or_build(&sources[0]).unwrap();
+        // 第 5 次插入触发淘汰至 3：最旧的两个未命中者（B、C）出局。
+        cache.get_or_build(&sources[4]).unwrap();
+
+        assert!(
+            cache.entries_contains(&roots[0]),
+            "touched root must survive eviction (touch order refreshed by hits)"
+        );
+        assert!(
+            !cache.entries_contains(&roots[1]),
+            "untouched oldest root must be evicted first"
+        );
+        assert!(!cache.entries_contains(&roots[2]));
+        assert!(cache.entries_contains(&roots[3]));
+        assert!(cache.entries_contains(&roots[4]));
+        assert_eq!(
+            cache.entries_len(),
+            3,
+            "eviction must stop at the capacity * 3/4 watermark"
+        );
     }
 
     /// 目标语义（W2-T2 钉死）：capacity=4 时第 5 次插入触发淘汰至 3（最旧

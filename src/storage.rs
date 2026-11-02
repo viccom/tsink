@@ -24,6 +24,19 @@ pub const DEFAULT_PERSISTED_MMAP_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// residency that otherwise grows with total persisted chunks. `usize::MAX`
 /// disables the cap.
 pub const DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// Default entry-count capacity of the per-instance persisted-catalog entry
+/// cache. Must stay well above the steady-state segment count (production
+/// reference 2026-10: ~15.9k segments) so the rate-limited catalog build (N9)
+/// keeps hitting cached manifests — with capacity below the segment count,
+/// every throttled persist would re-read manifests beyond capacity, re-creating
+/// the openat storm N9 fixed. LRU eviction is only the last line of defense;
+/// removed-root invalidation and segment-count convergence do the real work.
+pub const DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY: usize = 32768;
+
+/// Default byte budget of the persisted-catalog per-segment series-metadata
+/// cache (`series.bin` loads; NotFound slots are empty and cost ~0 bytes).
+pub const DEFAULT_CATALOG_SERIES_CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
@@ -471,6 +484,12 @@ pub struct FlushObservabilitySnapshot {
     pub catalog_persisted_total: u64,
     #[serde(default)]
     pub catalog_persist_skipped_total: u64,
+    /// W2-T2 catalog 缓存：entries+series 双 map 累计淘汰条数，以及当前
+    /// 驻留条目数（gauge，快照采集时读取）。
+    #[serde(default)]
+    pub catalog_cache_evictions_total: u64,
+    #[serde(default)]
+    pub catalog_cache_entries: u64,
     pub tier_moves_total: u64,
     pub tier_move_errors_total: u64,
     pub expired_segments_total: u64,
@@ -1098,6 +1117,8 @@ pub struct StorageBuilder {
     memory_limit_bytes: usize,
     persisted_mmap_budget_bytes: usize,
     timestamp_index_cache_budget_bytes: usize,
+    catalog_entry_cache_capacity: usize,
+    catalog_series_cache_bytes: usize,
     cardinality_limit: usize,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
@@ -1144,6 +1165,8 @@ impl Default for StorageBuilder {
             memory_limit_bytes: usize::MAX,
             persisted_mmap_budget_bytes: DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             timestamp_index_cache_budget_bytes: DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
+            catalog_entry_cache_capacity: DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY,
+            catalog_series_cache_bytes: DEFAULT_CATALOG_SERIES_CACHE_BYTES,
             cardinality_limit: usize::MAX,
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
@@ -1324,6 +1347,34 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_catalog_persist_interval(mut self, interval: Duration) -> Self {
         self.catalog_persist_interval = interval;
+        self
+    }
+
+    /// Sets the entry-count capacity of the persisted-catalog entry cache.
+    ///
+    /// The cache holds per-segment manifest fingerprints read while building or
+    /// validating the registry catalog; evicted entries are transparently
+    /// rebuilt from disk. `0` disables catalog caching entirely (no hits, no
+    /// stores — every build reads the manifests). Default:
+    /// [`DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY`](crate::storage::DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY)
+    /// (32768), deliberately far above the steady-state segment count so the
+    /// rate-limited persist keeps hitting cached entries; do not lower it below
+    /// the deployed segment count.
+    #[must_use]
+    pub fn with_catalog_entry_cache_capacity(mut self, capacity: usize) -> Self {
+        self.catalog_entry_cache_capacity = capacity;
+        self
+    }
+
+    /// Sets the byte budget of the persisted-catalog per-segment
+    /// series-metadata cache (`series.bin` loads used for catalog
+    /// fingerprinting). Evicted segments are transparently reloaded from disk.
+    /// `0` disables that cache. Default:
+    /// [`DEFAULT_CATALOG_SERIES_CACHE_BYTES`](crate::storage::DEFAULT_CATALOG_SERIES_CACHE_BYTES)
+    /// (32 MiB).
+    #[must_use]
+    pub fn with_catalog_series_cache_bytes(mut self, bytes: usize) -> Self {
+        self.catalog_series_cache_bytes = bytes;
         self
     }
 
@@ -1590,6 +1641,14 @@ impl StorageBuilder {
 
     pub(crate) fn catalog_persist_interval(&self) -> Duration {
         self.catalog_persist_interval
+    }
+
+    pub(crate) fn catalog_entry_cache_capacity(&self) -> usize {
+        self.catalog_entry_cache_capacity
+    }
+
+    pub(crate) fn catalog_series_cache_bytes(&self) -> usize {
+        self.catalog_series_cache_bytes
     }
 
     pub(crate) fn partition_duration(&self) -> Duration {

@@ -87,6 +87,13 @@ impl ChunkStorage {
         }
 
         let state_update = self.apply_segment_root_removal_state_update(roots)?;
+        // W2-T2：removed_roots 已实际应用到持久化索引——同点失效 catalog
+        // 缓存中这些 root 的 entry/series 槽。删除打破「段不可变 → 条目
+        // 永久有效」前提；不失效会让陈旧 manifest 指纹与已删段的 series
+        // 元数据一直存活（这正是 N9 无界增长的删除侧补口）。
+        self.persisted
+            .catalog_validate_cache
+            .invalidate_roots(roots);
         self.install_visible_persisted_state(PersistedVisibleStateInstall {
             refresh_series_ids: state_update.affected_series,
             mark_refreshed_series_materialized: false,

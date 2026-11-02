@@ -43,6 +43,14 @@ pub(super) struct ChunkStorageOptions {
     /// Default:
     /// [`DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES`](crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES).
     pub(super) timestamp_index_cache_budget_bytes: usize,
+    /// Entry-count capacity of the persisted-catalog entry cache; `0`
+    /// disables catalog caching (no hits, no stores). Default:
+    /// [`DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY`](crate::storage::DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY).
+    pub(super) catalog_entry_cache_capacity: usize,
+    /// Byte budget of the persisted-catalog per-segment series-metadata cache;
+    /// `0` disables it. Default:
+    /// [`DEFAULT_CATALOG_SERIES_CACHE_BYTES`](crate::storage::DEFAULT_CATALOG_SERIES_CACHE_BYTES).
+    pub(super) catalog_series_cache_bytes: usize,
     pub(super) cardinality_limit: usize,
     pub(super) wal_size_limit_bytes: u64,
     pub(super) admission_poll_interval: Duration,
@@ -152,6 +160,8 @@ impl Default for ChunkStorageOptions {
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             timestamp_index_cache_budget_bytes:
                 crate::storage::DEFAULT_TIMESTAMP_INDEX_CACHE_BUDGET_BYTES,
+            catalog_entry_cache_capacity: crate::storage::DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY,
+            catalog_series_cache_bytes: crate::storage::DEFAULT_CATALOG_SERIES_CACHE_BYTES,
             cardinality_limit: usize::MAX,
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
@@ -249,6 +259,8 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
             persisted_mmap_budget_bytes: builder.persisted_mmap_budget_bytes(),
             timestamp_index_cache_budget_bytes: builder.timestamp_index_cache_budget_bytes(),
+            catalog_entry_cache_capacity: builder.catalog_entry_cache_capacity(),
+            catalog_series_cache_bytes: builder.catalog_series_cache_bytes(),
             cardinality_limit: builder.cardinality_limit(),
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
