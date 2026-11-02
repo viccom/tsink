@@ -49,7 +49,8 @@
 | W3-T3 | ✅ | 三红测落地（缺失/截断/ stale 锚点幂等）。崩溃窗手法：「实时制造 + 就地捕获字节 + close 后回卷重放」（close 必然强制合并清 delta、Drop 触发完整 close、mem::forget 被 flock 挡——三路都堵死，回卷是唯一出路；对 T4 delta 字节格式零耦合，marker JSON 形状由计划钉死）。绿态判据已钉：回退必须删残留 delta、stale 锚点重放后 catalog 主文件字节不变（`SkippedValidatedFromFile` 原地验证语义；T4 若要顺带修 marker 需主动放宽）。`catalog_delta_apply_fallback_total` 计数接线属 T4 |
 | W3-T4 | ⏳ | 未开始 |
 | W3-T4 | ✅ | 8 红全绿（断言零改动，13/13 稳定）。核心：`{seq:020}.delta.json`（version/seq/added/removed/series_fingerprint，removed 口径同 compaction marker）+ `_checkpoint.json` 锚点 + 启动重构比对（验证强度不降：seq 连续性/版本/内容三重校验，失配即回退重建+清 delta）。指纹取最后已应用 delta，缺失关快路径并计数。强制 checkpoint 重置判据：主文件从未承载段条目→整体重置增量状态，否则常规合并（marker 跨 close/reopen 存活）。**计划偏差两处（已裁决接受）**：① delta 追加不做节流（节流本为约束 O(段数) 全量重建；追加 O(变更)，且节流跳过无重试拍会饿死变更——W3-T1 实证）；② 主文件缺失首拍回退全量写（delta 须锚定已存在 checkpoint）。**fsync 抖动观测**：8 线程并行下 8 测偶发 10s 轮询超时（1-2/10 轮），gdb+外部探针定位=ext4 journal 多实例 fsync 排队放大（非本实现缺陷，无数据不一致）；单线程/threads≤4 确定性稳。lib 611 绿+基线红（threads=4 与默认各验一次）+ N9 45 绿 + crash 门禁 80 轮绿 + fmt/clippy 净 |
-| W3-T5 | ⏳ | 未开始 |
+| W3-T5 | ✅ 已部署 / ⏳ 24h 判据待收 | 2026-11-03 部署：rs-iot release 重编（单 `-p rs-iot`，tsink path 依赖带入 027b81b）→ 回滚备份 `target/release/rs-iot.pre-w3.bak-20261103` → warden `dev-rs-iot` 重启（新 pid 172029，旧 1040）→ 健康核验过（warden health ok/4 服务 0 失败、rs-iot 登录 OK）；field 栈未动（1041 持旧 inode，现场模拟不跟开发迭代）。监测：dev-history-monitor 已启动（60s×24h，CSV `rs-iot/logs/history_monitor.csv`）。**判据生效前置**：dev 栈数据流在部署前 ~36h 已停止（catalog mtime 11-01 21:34，非本次部署所致）——delta 目录将在恢复数据流后的首个发布拍出现；恢复手段（仓内 `scripts/meter_*` lua 实例 + `mock_modbus_tcp_2002.py` 或任意写路径）超出本次部署授权未执行。`proc_write_bytes` 采样列未加（需改 rs-iot 仓脚本，超授权）——手工观察命令：`cat /proc/<dev-rs-iot pid>/io`（write_bytes 差分/h）。文档部分已提交（027b81b） |
+| W3 边界 | ✅ | 全 target：lib 611 绿+基线红+soak ignored，13 个集成 target 全绿；fmt/clippy 0 告警 |
 | W4-T0..T5 | ⏳ | 未开始 |
 
 ---
