@@ -16,6 +16,53 @@ use crate::Label;
 const REGISTRY_CATALOG_FILE_NAME: &str = "series_index.catalog.json";
 const REGISTRY_CATALOG_VERSION: u32 = 2;
 
+/// W3-T4：catalog 增量目录与合并标记（与 checkpoint 同目录）。
+/// 目录内文件：`{seq:020}.delta.json`（追加）+ `_checkpoint.json`（seq 锚点）。
+const REGISTRY_CATALOG_DELTA_DIR_NAME: &str = "series_index.catalog.d";
+const REGISTRY_CATALOG_DELTA_MARKER_NAME: &str = "_checkpoint.json";
+/// delta 文件与 `_checkpoint.json` 各自携带的版本；读取时校验，不符即回退重建。
+const REGISTRY_CATALOG_DELTA_FILE_VERSION: u32 = 2;
+
+/// catalog checkpoint 旁的增量目录：`<snapshot 目录>/series_index.catalog.d`。
+pub(super) fn catalog_delta_dir_path(snapshot_path: &Path) -> PathBuf {
+    catalog_path(snapshot_path)
+        .parent()
+        .map(|parent| parent.join(REGISTRY_CATALOG_DELTA_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(REGISTRY_CATALOG_DELTA_DIR_NAME))
+}
+
+/// 增量目录内的合并标记：checkpoint_seq 之上的 delta 已被吸收进主文件。
+pub(super) fn catalog_checkpoint_marker_path(snapshot_path: &Path) -> PathBuf {
+    catalog_delta_dir_path(snapshot_path).join(REGISTRY_CATALOG_DELTA_MARKER_NAME)
+}
+
+/// 一次 catalog 增量落盘的内容（与 checkpoint 同目录的 `{seq:020}.delta.json`）。
+/// `added` 为新增段的完整 entry（复用 checkpoint 条目序列化）；`removed` 为被
+/// 合并/删除段根的相对路径字符串（口径与 compaction marker 的
+/// `segment_rel_path` 一致：相对 checkpoint 所在目录，外部根退化为完整路径，
+/// 重放侧按 `segments/L{level}/seg-{id}` 后缀解析）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedRegistryCatalogDeltaFile {
+    version: u32,
+    seq: u64,
+    #[serde(default)]
+    added: Vec<PersistedRegistryCatalogEntry>,
+    #[serde(default)]
+    removed: Vec<String>,
+    /// 写 delta 时按 series 缓存重算的全量指纹；重放取最后一个已应用 delta 的
+    /// 该字段作为启动快路径指纹。None = 写入时无法重算 → 快路径关闭。
+    #[serde(default)]
+    series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
+}
+
+/// `_checkpoint.json`：盘上唯一的 seq 锚点——`checkpoint_seq`（含）之前的变更
+/// 已全部吸收进 catalog 主文件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedRegistryCatalogCheckpointMarker {
+    version: u32,
+    checkpoint_seq: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PersistedRegistryCatalogSource {
     pub(super) lane: SegmentLaneFamily,
@@ -61,6 +108,27 @@ pub(super) struct PersistedRegistrySeriesFingerprint {
 #[derive(Debug, Clone)]
 pub(super) struct ValidatedRegistryCatalog {
     pub(super) series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
+    /// 启动重放实际应用的 delta 数（W3-T4 观测：`catalog_delta_replayed_total`）。
+    pub(super) deltas_replayed: u64,
+    /// 已应用 delta 的指纹缺失/无法重算 → 快路径关闭（W3-T4 观测：
+    /// `catalog_delta_fingerprint_fallback_total`）。
+    pub(super) fingerprint_fallback: bool,
+}
+
+/// 启动期 catalog delta 重放统计（bootstrap 阶段实例尚未建立，经
+/// `StartupFinalizeState` 播种进本实例的 FlushObservabilityCounters）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct CatalogDeltaStartupStats {
+    pub(super) replayed_total: u64,
+    pub(super) apply_fallback_total: u64,
+    pub(super) fingerprint_fallback_total: u64,
+}
+
+/// 启动校验的 delta 侧报告：`validated` 之外的字段供 recovery 区分
+/// 「无 delta 的普通失配」与「delta 断层/损坏触发的回退」。
+pub(super) struct CatalogDeltaValidationReport {
+    pub(super) validated: Option<ValidatedRegistryCatalog>,
+    pub(super) deltas_present: bool,
 }
 
 /// series 缓存槽位的估算堆字节口径（W2-T2）：每条 `PersistedSeries` 计
@@ -393,48 +461,184 @@ pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
 /// 语义前提：catalog 是各段 `manifest.bin` 的反规范化缓存，不是正确性依赖——
 /// 启动恢复从段目录扫描补全（`bootstrap::recovery` 的 validate 失配即回退重建），
 /// 因此常规 persist 允许滞后，只有 checkpoint/关闭等一致性锚点强制刷新。
-#[derive(Default)]
+///
+/// W3-T4 增量扩展：
+/// - `next_seq`：下一笔变更的 delta 序号；盘上锚点 = `_checkpoint.json` 的
+///   `checkpoint_seq`，构造时 `next_seq = max(checkpoint_seq, max_delta_seq) + 1`；
+/// - `last_roots`：上次持久化（delta 追加或 checkpoint 重写）认定的 root 集合，
+///   checkpoint 全量重建时做漂移对账（捕获未被管线上报的 root 变化）；
+/// - `deltas_since_checkpoint` / `delta_bytes_since_checkpoint`：合并阈值计数；
+/// - `pending_changes`：delta 写盘失败时保留、待下一拍重试落盘的 root 变更
+///   （后写覆盖先写）；非空即 catalog 脏。
 pub(super) struct CatalogPersistMemo {
     state: Mutex<CatalogPersistMemoState>,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CatalogRootChangeOp {
+    Added,
+    Removed,
+}
+
+impl CatalogPersistMemo {
+    /// 从盘面恢复 delta 序号锚点（构造期一次性 IO）。`snapshot_path` 缺失
+    /// （ComputeOnly / 无持久化）时给默认态，永不参与 delta 路径。
+    pub(super) fn from_disk(snapshot_path: Option<&Path>) -> Self {
+        let mut state = CatalogPersistMemoState::default();
+        if let Some(snapshot_path) = snapshot_path {
+            let checkpoint_seq = read_catalog_checkpoint_marker_seq(snapshot_path).unwrap_or(0);
+            let max_delta_seq = list_catalog_delta_files(snapshot_path)
+                .last()
+                .map(|(seq, _)| *seq)
+                .unwrap_or(0);
+            state.next_seq = checkpoint_seq.max(max_delta_seq).saturating_add(1);
+        }
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct CatalogPersistMemoState {
     last_persisted_at: Option<Instant>,
     last_entries_hash: Option<u64>,
     last_file_len: Option<u64>,
+    /// 下一笔变更的 delta 序号（含被 checkpoint 直接吸收的那一笔）。
+    next_seq: u64,
+    /// 上次持久化认定的 root 集合：root → (lane, entry 或 None=已消失)。
+    /// checkpoint 全量重建时做漂移对账。
+    last_roots: BTreeMap<PathBuf, (SegmentLaneFamily, Option<PersistedRegistryCatalogEntry>)>,
+    /// `_checkpoint.json` 锚点之后已落盘的 delta 数/字节（合并阈值计数）。
+    deltas_since_checkpoint: u64,
+    delta_bytes_since_checkpoint: u64,
+    /// delta 写失败时保留、待下一拍重试落盘的 root 变更（后写覆盖先写）。
+    pending_changes: BTreeMap<PathBuf, CatalogRootChangeOp>,
+}
+
+impl Default for CatalogPersistMemoState {
+    fn default() -> Self {
+        Self {
+            last_persisted_at: None,
+            last_entries_hash: None,
+            last_file_len: None,
+            // marker 缺失 ⇒ checkpoint_seq=0 ⇒ 首笔变更序号 1（0 会撞上
+            // 「seq > checkpoint_seq 才重放」的启动过滤）。
+            next_seq: 1,
+            last_roots: BTreeMap::new(),
+            deltas_since_checkpoint: 0,
+            delta_bytes_since_checkpoint: 0,
+            pending_changes: BTreeMap::new(),
+        }
+    }
 }
 
 /// 一次 catalog 持久化的结果（调用侧用于计数器归因）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CatalogPersistOutcome {
+    /// 全量重写 catalog 主文件（冷路径 / 关闭锚点）。
     Persisted,
-    /// 节流窗口内：不构建、不读盘、不写盘。
+    /// 例行发布拍：delta 追加落盘（携带序列化字节数）。
+    DeltaAppended { bytes: u64 },
+    /// delta 数/字节达阈值：本笔变更直接并入全量 checkpoint（主文件 + 标记 +
+    /// delta 清理）。
+    CheckpointConsolidated,
+    /// 节流窗口内：不构建、不读盘、不写盘；变更并入备忘待下一拍。
     SkippedThrottled,
     /// 内容与上次写入一致且文件未被外部改动（备忘命中，零 IO）。
     SkippedUnchanged,
     /// 冷启动/备忘失效：读文件做 entries 比对，命中即采纳文件指纹（零重写，
     /// 且不读取 segment 的 series.bin——保持「catalog 有效即可恢复」语义）。
     SkippedValidatedFromFile,
+    /// delta 写盘失败：catalog 已标脏（下拍重试/强制 checkpoint），不使
+    /// flush 失败（catalog 是派生缓存）。
+    DeltaWriteFailed,
 }
 
-/// 按「节流窗口 + 内容指纹」持久化 catalog（P1）。
+/// 调用方随 sources 一并上报的本拍 root 变更（W3-T4：例行 persist 由管线
+/// 变更直接构造 delta，不做全量构建求差）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CatalogRootChanges<'a> {
+    pub(super) added_roots: &'a [PathBuf],
+    pub(super) removed_roots: &'a [PathBuf],
+}
+
+/// 按「节流窗口 + 内容指纹」持久化 catalog（P1 / W3-T4 delta 化）。
 ///
-/// 与旧路径的区别：不再每次 `read` + `serde_json::from_slice` 全量比对，
-/// 也不在内容未变时重写文件。`force=true` 仅用于 checkpoint/关闭锚点。
+/// 三种模式：
+/// - `force=true`：checkpoint/关闭锚点——全量重建主文件 + 写/更新
+///   `_checkpoint.json` + 清 delta（无视节流）；
+/// - `root_changes=None`（冷路径，无变更信息）：旧行为——节流 + 内容指纹去重
+///   的全量持久化（启动 finalize / 全量扫描发布仍走这里）；
+/// - `root_changes=Some`（例行发布拍）：由管线上报的 root 变更构造增量——
+///   热路径 O(变更)；delta 数/字节达阈值时整笔并入全量 checkpoint。
+///
+/// `force` 优先于 `root_changes`：强制刷新即全量，变更信息无需消费。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn persist_registry_catalog_throttled(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    root_changes: Option<CatalogRootChanges<'_>>,
     entry_cache: &CatalogEntryCache,
     memo: &CatalogPersistMemo,
     min_interval: Duration,
+    delta_max_count: usize,
+    delta_max_bytes: u64,
     force: bool,
 ) -> Result<(
     Option<PersistedRegistrySeriesFingerprint>,
     CatalogPersistOutcome,
 )> {
-    let path = catalog_path(snapshot_path);
     let now = Instant::now();
+    // 主文件缺失 ⇒ 无锚定基线，delta 无从重放：首拍直接全量写 checkpoint
+    // （无 builder 引导的实例没有 finalize 写底，首个发布拍即首次持久化）。
+    let main_file_present = path_exists_no_follow(&catalog_path(snapshot_path)).unwrap_or(false);
+    if force || root_changes.is_none() || !main_file_present {
+        return persist_registry_catalog_checkpoint(
+            snapshot_path,
+            sources,
+            entry_cache,
+            memo,
+            now,
+            min_interval,
+            force,
+            None,
+            None,
+        );
+    }
+    persist_registry_catalog_delta(
+        snapshot_path,
+        sources,
+        root_changes.expect("root changes checked above"),
+        entry_cache,
+        memo,
+        now,
+        delta_max_count,
+        delta_max_bytes,
+    )
+}
+
+/// 冷路径 / 强制锚点：全量重建 entries 并重写主文件（内容指纹去重语义保留），
+/// 主文件写成功后把 delta 锚点推进到「全部已吸收」（marker + 残留 delta 清理）。
+///
+/// `absorbed_checkpoint_seq`：合并路径传入本笔变更应占用的 seq（marker 直接
+/// 记它）；`None` = 冷路径/强制锚点，吸收到 `next_seq - 1`。
+#[allow(clippy::too_many_arguments)]
+fn persist_registry_catalog_checkpoint(
+    snapshot_path: &Path,
+    sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
+    memo: &CatalogPersistMemo,
+    now: Instant,
+    min_interval: Duration,
+    force: bool,
+    absorbed_checkpoint_seq: Option<u64>,
+    absorbed_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
+) -> Result<(
+    Option<PersistedRegistrySeriesFingerprint>,
+    CatalogPersistOutcome,
+)> {
+    let path = catalog_path(snapshot_path);
     {
         let state = memo.state.lock();
         if !force {
@@ -468,6 +672,8 @@ pub(super) fn persist_registry_catalog_throttled(
                 state.last_persisted_at = Some(now);
                 state.last_entries_hash = Some(entries_hash);
                 state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                // 主文件已反映全部变更：备忘里的 pending delta 变更视为已吸收。
+                state.pending_changes.clear();
                 return Ok((
                     actual.series_fingerprint,
                     CatalogPersistOutcome::SkippedValidatedFromFile,
@@ -476,20 +682,402 @@ pub(super) fn persist_registry_catalog_throttled(
         }
     }
 
+    let fingerprint = match absorbed_fingerprint {
+        Some(fingerprint) => Some(fingerprint),
+        None => Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
+    };
+    // 重置判据（须在主文件重写前采样）：重写前的主文件不承载任何段条目
+    // （缺失/损坏/空）⇒ 本实例从未把段集全量同步到盘，delta 序号空间没有
+    // 可延续的盘上锚点基线 ⇒ close 强制 checkpoint 吸收后整体重置增量状态
+    // （下一会话从 seq=1 重新起算，主文件即完整真值）。主文件已承载段集
+    // ⇒ 常规合并：marker 锚点跨 close/reopen 存活（W3-T2 契约）。
+    let main_carries_segments = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PersistedRegistryCatalogFile>(&bytes).ok())
+        .map(|file| !file.segments.is_empty())
+        .unwrap_or(false);
     let catalog = PersistedRegistryCatalogFile {
         version: REGISTRY_CATALOG_VERSION,
         segments: expected_entries,
-        series_fingerprint: Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
+        series_fingerprint: fingerprint.clone(),
     };
-    let fingerprint = catalog.series_fingerprint.clone();
     let bytes = serde_json::to_vec_pretty(&catalog)?;
     write_file_atomically_and_sync_parent(&path, &bytes)?;
 
-    let mut state = memo.state.lock();
-    state.last_persisted_at = Some(now);
-    state.last_entries_hash = Some(entries_hash);
-    state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    // 主文件已吸收锚点之前的全部变更：按重置判据处置增量状态。marker 写在
+    // 主文件之后——中途崩溃留下的「新主文件 + 旧 marker + 旧 delta」由启动
+    // 重放的幂等 upsert 吸收，不会误判断层。
+    // - 强制锚点 + 主文件此前无段集：整体重置——目录（含 marker）删除；
+    // - 合并路径（absorbed_checkpoint_seq=Some）或盘上已有增量状态：marker
+    //   推进到「全部已吸收」并清残留 delta 文件（目录与锚点保留，后续 delta
+    //   序号从 checkpoint_seq+1 续起）；
+    // - 无增量状态：不创建目录、不写 marker。
+    let reset_delta_state = force && absorbed_checkpoint_seq.is_none() && !main_carries_segments;
+    let checkpoint_seq = {
+        let mut state = memo.state.lock();
+        let checkpoint_seq =
+            absorbed_checkpoint_seq.unwrap_or_else(|| state.next_seq.saturating_sub(1));
+        let delta_state_present = !list_catalog_delta_files(snapshot_path).is_empty()
+            || catalog_checkpoint_marker_path(snapshot_path).is_file()
+            || !state.pending_changes.is_empty();
+        if reset_delta_state {
+            remove_catalog_delta_dir(snapshot_path);
+            state.next_seq = 1;
+        } else if absorbed_checkpoint_seq.is_some() || delta_state_present {
+            // 先删 delta 文件再写 marker：marker 可见即意味着残留 delta 已清
+            // （测试轮询 marker 后立即对账目录，两步不可倒置）。顺序对崩溃安全
+            // 无影响——主文件此刻已重写为全量真值，任何崩溃点的盘面要么自洽、
+            // 要么由启动重放/回退重建兜底。
+            remove_catalog_delta_files(snapshot_path);
+            write_catalog_checkpoint_marker(snapshot_path, checkpoint_seq)?;
+            state.next_seq = checkpoint_seq.saturating_add(1);
+        }
+        reconcile_last_roots(&mut state, snapshot_path, sources, entry_cache);
+        state.deltas_since_checkpoint = 0;
+        state.delta_bytes_since_checkpoint = 0;
+        state.pending_changes.clear();
+        state.last_persisted_at = Some(now);
+        state.last_entries_hash = Some(entries_hash);
+        state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        checkpoint_seq
+    };
+    tracing::debug!(
+        checkpoint_seq,
+        reset_delta_state,
+        "Registry catalog checkpoint absorbed all pending catalog deltas"
+    );
     Ok((fingerprint, CatalogPersistOutcome::Persisted))
+}
+
+/// 例行发布拍（W3-T4）：由管线上报的 root 变更直接构造 delta。
+///
+/// 不做节流：delta 追加是 O(变更)（added 条目走段级缓存、指纹走 series 缓存），
+/// `catalog_persist_interval` 节流的本意是限流 O(段数) 的全量重建（保留在冷
+/// 路径与合并/强制锚点）；且发布拍只在真正产段时出现——被节流吞掉的变更可能
+/// 没有下一拍可重试，delta 必须随拍落盘。
+///
+/// 顺序纪律：段 rename + 目录 fsync 已由发布管线完成 → delta 原子写（tmp +
+/// rename + 父目录 fsync）→ 返回成功。delta 写失败只标脏（下拍重试/达阈值即
+/// 强制 checkpoint），不使 flush 失败——catalog 是派生缓存。
+#[allow(clippy::too_many_arguments)]
+fn persist_registry_catalog_delta(
+    snapshot_path: &Path,
+    sources: &[PersistedRegistryCatalogSource],
+    root_changes: CatalogRootChanges<'_>,
+    entry_cache: &CatalogEntryCache,
+    memo: &CatalogPersistMemo,
+    now: Instant,
+    delta_max_count: usize,
+    delta_max_bytes: u64,
+) -> Result<(
+    Option<PersistedRegistrySeriesFingerprint>,
+    CatalogPersistOutcome,
+)> {
+    // 合并备忘里写失败残留的变更与本拍变更（同 root 后写覆盖先写：发布拍
+    // 的时间序保证 current 晚于 pending）。
+    let merged_changes = {
+        let state = memo.state.lock();
+        let mut merged = state.pending_changes.clone();
+        for root in root_changes.added_roots {
+            merged.insert(root.clone(), CatalogRootChangeOp::Added);
+        }
+        for root in root_changes.removed_roots {
+            merged.insert(root.clone(), CatalogRootChangeOp::Removed);
+        }
+        merged
+    };
+
+    if merged_changes.is_empty() {
+        let mut state = memo.state.lock();
+        state.last_persisted_at = Some(now);
+        return Ok((None, CatalogPersistOutcome::SkippedUnchanged));
+    }
+
+    // added 条目只为新增 root 经 entry_cache 构建（O(变更)），removed 为根
+    // 路径列表；指纹按 series 缓存全量重算（O(series) CPU，热缓存零 IO）。
+    let sources_by_root = sources
+        .iter()
+        .map(|source| (source.root.as_path(), source))
+        .collect::<BTreeMap<_, _>>();
+    let mut added_entries = Vec::new();
+    let mut added_root_entries = BTreeMap::new();
+    for (root, op) in &merged_changes {
+        if *op != CatalogRootChangeOp::Added {
+            continue;
+        }
+        let Some(source) = sources_by_root.get(root.as_path()) else {
+            warn!(
+                root = %root.display(),
+                "Catalog delta: reported added root is absent from published sources; the next checkpoint reconciles it"
+            );
+            continue;
+        };
+        let entry = entry_cache.get_or_build(source)?;
+        if entry.is_none() {
+            warn!(
+                root = %root.display(),
+                "Catalog delta: added root disappeared before its entry could be built; the next checkpoint reconciles it"
+            );
+        }
+        added_entries.extend(entry.iter().cloned());
+        added_root_entries.insert(root.clone(), (source.lane, entry));
+    }
+    let removed_paths = merged_changes
+        .iter()
+        .filter(|(_, op)| **op == CatalogRootChangeOp::Removed)
+        .map(|(root, _)| catalog_delta_removed_path(snapshot_path, root))
+        .collect::<Vec<_>>();
+
+    // 指纹构建失败不阻断 delta（结构正确性优先）：写 None，启动按「指纹缺失」
+    // 关闭快路径（回退读 series.bin，正确性不变）。
+    let series_fingerprint = match build_series_fingerprint_from_sources(sources, entry_cache) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Catalog delta: failed to recompute the series fingerprint; startup fast path will be disabled"
+            );
+            None
+        }
+    };
+
+    let seq = memo.state.lock().next_seq;
+    let delta = PersistedRegistryCatalogDeltaFile {
+        version: REGISTRY_CATALOG_DELTA_FILE_VERSION,
+        seq,
+        added: added_entries,
+        removed: removed_paths,
+        series_fingerprint: series_fingerprint.clone(),
+    };
+    let bytes = serde_json::to_vec(&delta)?;
+    let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+
+    // 合并阈值（笔数或字节）任一达到 → 本笔变更直接并入全量 checkpoint：
+    // checkpoint_seq 取本笔变更的序号（= delta 本应占用的 seq），落盘后不再
+    // 产生该笔的 delta 文件。
+    let threshold_reached = {
+        let state = memo.state.lock();
+        state.deltas_since_checkpoint.saturating_add(1) >= delta_max_count.max(1) as u64
+            || state.delta_bytes_since_checkpoint.saturating_add(bytes_len) > delta_max_bytes
+    };
+    if threshold_reached {
+        let (fingerprint, _) = persist_registry_catalog_checkpoint(
+            snapshot_path,
+            sources,
+            entry_cache,
+            memo,
+            now,
+            Duration::ZERO,
+            true,
+            Some(seq),
+            series_fingerprint,
+        )?;
+        return Ok((fingerprint, CatalogPersistOutcome::CheckpointConsolidated));
+    }
+
+    if let Err(err) = append_catalog_delta_file(snapshot_path, seq, &bytes) {
+        warn!(
+            error = %err,
+            seq,
+            "Catalog delta append failed; marking the catalog dirty for the next publish beat"
+        );
+        let mut state = memo.state.lock();
+        state.pending_changes = merged_changes;
+        return Ok((None, CatalogPersistOutcome::DeltaWriteFailed));
+    }
+
+    {
+        let mut state = memo.state.lock();
+        state.next_seq = seq.saturating_add(1);
+        for (root, (lane, entry)) in added_root_entries {
+            state.last_roots.insert(root, (lane, entry));
+        }
+        for (root, op) in &merged_changes {
+            if *op == CatalogRootChangeOp::Removed {
+                state.last_roots.remove(root);
+            }
+        }
+        state.deltas_since_checkpoint = state.deltas_since_checkpoint.saturating_add(1);
+        state.delta_bytes_since_checkpoint =
+            state.delta_bytes_since_checkpoint.saturating_add(bytes_len);
+        state.pending_changes.clear();
+        state.last_persisted_at = Some(now);
+        // 主文件相对 sources 已过期：冷路径去重必须退到文件比对/重写。
+        state.last_entries_hash = None;
+    }
+    Ok((
+        series_fingerprint,
+        CatalogPersistOutcome::DeltaAppended { bytes: bytes_len },
+    ))
+}
+
+/// checkpoint 吸收后的漂移对账：以 sources 全量重建 last_roots（entries 已由
+/// 缓存命中复用），集合与上次认定不一致即说明存在未被管线上报的 root 变化
+/// （如外部删目录、上次 delta 写失败）——全量重写本身即纠正，这里补告警。
+fn reconcile_last_roots(
+    state: &mut CatalogPersistMemoState,
+    snapshot_path: &Path,
+    sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
+) {
+    let mut next_roots = BTreeMap::new();
+    for source in sources {
+        let entry = entry_cache.get_or_build(source).ok().flatten();
+        next_roots.insert(source.root.clone(), (source.lane, entry));
+    }
+    if !state.last_roots.is_empty() && state.last_roots.keys().ne(next_roots.keys()) {
+        let removed: Vec<&PathBuf> = state.last_roots.keys().collect();
+        let added: Vec<&PathBuf> = next_roots.keys().collect();
+        warn!(
+            snapshot = %snapshot_path.display(),
+            previous_roots = removed.len(),
+            current_roots = added.len(),
+            "Registry catalog checkpoint reconciled root drift (changes the publish pipeline did not report)"
+        );
+    }
+    state.last_roots = next_roots;
+}
+
+/// removed 根的落盘口径：相对 checkpoint 所在目录（与 compaction marker 的
+/// `segment_rel_path` 一致）；根在目录之外（tiered/镜像根）时退化为完整路径，
+/// 重放侧按 `segments/L{level}/seg-{id}` 后缀解析身份。
+fn catalog_delta_removed_path(snapshot_path: &Path, root: &Path) -> String {
+    let base = catalog_path(snapshot_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    root.strip_prefix(&base)
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
+}
+
+/// 从段根路径解析重放所需的段身份 `(level, segment_id)`。segment_id 由全局
+/// 单调计数器分配、跨 lane 唯一，故 (level, segment_id) 足以定位条目。
+fn parse_segment_identity_from_root_str(root: &str) -> Option<(u8, u64)> {
+    let mut components = Path::new(root).components().rev();
+    let segment_component = components.next()?.as_os_str().to_str()?;
+    let segment_id = u64::from_str_radix(segment_component.strip_prefix("seg-")?, 16).ok()?;
+    let level_component = components.next()?.as_os_str().to_str()?;
+    let level = level_component.strip_prefix('L')?.parse::<u8>().ok()?;
+    Some((level, segment_id))
+}
+
+/// 列出 delta 目录下按 seq 升序的 delta 文件；不可解析/临时残留文件忽略。
+fn list_catalog_delta_files(snapshot_path: &Path) -> Vec<(u64, PathBuf)> {
+    let dir = catalog_delta_dir_path(snapshot_path);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut deltas = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(seq_text) = name.strip_suffix(".delta.json") else {
+            continue;
+        };
+        if seq_text.is_empty() || !seq_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(seq) = seq_text.parse::<u64>() {
+            deltas.push((seq, entry.path()));
+        }
+    }
+    deltas.sort_by_key(|(seq, _)| *seq);
+    deltas
+}
+
+/// delta 目录内现存 delta 文件数（启动回退计数用：有 delta 而校验失败才算
+/// delta 引发的回退）。
+pub(super) fn count_catalog_delta_files(snapshot_path: &Path) -> usize {
+    list_catalog_delta_files(snapshot_path).len()
+}
+
+fn read_catalog_checkpoint_marker_seq(snapshot_path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(catalog_checkpoint_marker_path(snapshot_path)).ok()?;
+    let marker: PersistedRegistryCatalogCheckpointMarker = serde_json::from_slice(&bytes).ok()?;
+    if marker.version != REGISTRY_CATALOG_DELTA_FILE_VERSION {
+        return None;
+    }
+    Some(marker.checkpoint_seq)
+}
+
+/// 写/更新 `_checkpoint.json`（原子写 + 父目录 fsync）。delta 目录不存在时先建
+/// 并同步其父目录（保证目录项本身持久）。
+fn write_catalog_checkpoint_marker(snapshot_path: &Path, checkpoint_seq: u64) -> Result<()> {
+    let dir = catalog_delta_dir_path(snapshot_path);
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.clone(),
+            source,
+        })?;
+        crate::engine::fs_utils::sync_parent_dir(&dir)?;
+    }
+    let marker = PersistedRegistryCatalogCheckpointMarker {
+        version: REGISTRY_CATALOG_DELTA_FILE_VERSION,
+        checkpoint_seq,
+    };
+    let bytes = serde_json::to_vec_pretty(&marker)?;
+    write_file_atomically_and_sync_parent(&catalog_checkpoint_marker_path(snapshot_path), &bytes)
+}
+
+/// 原子追加一笔 delta。
+///
+/// 落位顺序刻意安排：tmp 文件（含内容 fsync）先写入数据目录，再建增量目录、
+/// 跨目录 rename 落位、同步两个目录——把「增量目录已可见但首个 delta 尚未
+/// 落位」的窗口从 fsync 量级压缩到 rename 的微秒级（外部观察者以目录存在性
+/// 判定 delta 到达，窗口过大轮询方会读到空目录）。
+fn append_catalog_delta_file(snapshot_path: &Path, seq: u64, bytes: &[u8]) -> Result<()> {
+    let dir = catalog_delta_dir_path(snapshot_path);
+    let path = dir.join(format!("{seq:020}.delta.json"));
+    // tmp 锚在数据目录（增量目录的父目录）：内容写盘并 fsync 后才建目录。
+    let staging_anchor = catalog_path(snapshot_path).with_file_name("catalog-delta-staging");
+    let tmp_path = crate::engine::fs_utils::write_tmp_and_sync(&staging_anchor, bytes)?;
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.clone(),
+            source,
+        })?;
+    }
+    if let Err(err) = crate::engine::fs_utils::rename_tmp(&tmp_path, &path) {
+        let _ = crate::engine::fs_utils::remove_file_if_exists(&tmp_path);
+        return Err(err);
+    }
+    // 持久化语义（W3-T4 复核）：内容 fsync 在 write_tmp_and_sync 内完成；rename
+    // 后对增量目录 fsync 使目录项持久。两次 fsync 刻意保持——journal 提交频率
+    // 下调会放大单次事务的回写窗口（8 实例并行拍下实测 fsync 尖峰秒级化）。
+    // SIGKILL 场景页缓存存活、目录项必然可见；掉电场景目录项丢失 → 启动重放
+    // 按序号断层走回退重建（段目录扫描兜底，正确性不变）。
+    crate::engine::fs_utils::sync_parent_dir(&path)?;
+    Ok(())
+}
+
+/// 删除 delta 目录内全部 delta 文件（保留目录与 `_checkpoint.json`——测试
+/// 契约要求目录在 close 合并后仍存在）。
+fn remove_catalog_delta_files(snapshot_path: &Path) {
+    for (_, path) in list_catalog_delta_files(snapshot_path) {
+        if let Err(err) = std::fs::remove_file(&path) {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "Failed to remove consolidated catalog delta file"
+            );
+        }
+    }
+}
+
+/// 活跃 close 的整体重置：删除整个增量目录（delta 文件 + marker）。目录缺失
+/// 视为已重置；删除失败只告警——残留状态由启动重放/回退兜底，不使 close 失败。
+fn remove_catalog_delta_dir(snapshot_path: &Path) {
+    let dir = catalog_delta_dir_path(snapshot_path);
+    if let Err(err) = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&dir) {
+        warn!(
+            path = %dir.display(),
+            error = %err,
+            "Failed to remove the catalog delta directory during close reset"
+        );
+    }
 }
 
 /// 参与内容比对的全部条目标量字段 → 单一指纹（避免序列化数 MB 字节做比较）。
@@ -538,17 +1126,44 @@ fn hash_catalog_entries(entries: &[PersistedRegistryCatalogEntry]) -> u64 {
     hasher.digest()
 }
 
+/// 兼容包装：只取校验结论（tests / 既有调用方）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn validate_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
     entry_cache: &CatalogEntryCache,
 ) -> Result<Option<ValidatedRegistryCatalog>> {
+    Ok(validate_registry_catalog_with_delta_report(snapshot_path, sources, entry_cache)?.validated)
+}
+
+/// 启动校验（W3-T4）：actual 不再只读 checkpoint 主文件，而是「主文件条目 +
+/// 依次应用 seq > checkpoint_seq 的 delta（幂等 upsert/remove）」重构后与
+/// expected（段目录全量扫描）比对——验证强度不降。
+///
+/// 回退决策树（一律返回 `validated: None`，由 recovery 走既有的「失配即重建
+/// + 强制 checkpoint」路径，残留 delta 由强制 checkpoint 清理）：
+/// - 主文件缺失/解析失败：`Err`（保持既有语义）；
+/// - marker 损坏/版本不符、任一 delta 解析失败/版本不符/seq 与文件名不符、
+///   已应用 delta 序号断层（未从 checkpoint_seq+1 连续起算）：`Ok(None)`；
+/// - 重构结果与 expected 失配：`Ok(None)`。
+///
+/// 指纹取最后一个已应用 delta 的 `series_fingerprint`（无已应用 delta 则取
+/// checkpoint 的）；缺失即 `fingerprint_fallback`，快路径关闭（正确性不变）。
+pub(super) fn validate_registry_catalog_with_delta_report(
+    snapshot_path: &Path,
+    sources: &[PersistedRegistryCatalogSource],
+    entry_cache: &CatalogEntryCache,
+) -> Result<CatalogDeltaValidationReport> {
     let path = catalog_path(snapshot_path);
+    let deltas = list_catalog_delta_files(snapshot_path);
     if !path_exists_no_follow(&path).map_err(|source| TsinkError::IoWithPath {
         path: path.clone(),
         source,
     })? {
-        return Ok(None);
+        return Ok(CatalogDeltaValidationReport {
+            validated: None,
+            deltas_present: !deltas.is_empty(),
+        });
     }
 
     let expected_segments = build_catalog_entries(sources, entry_cache)?;
@@ -558,13 +1173,102 @@ pub(super) fn validate_registry_catalog(
             source,
         })?,
     )?;
-    if actual.segments != expected_segments {
-        return Ok(None);
+
+    let mut report = CatalogDeltaValidationReport {
+        validated: None,
+        deltas_present: !deltas.is_empty(),
+    };
+
+    let checkpoint_seq = match std::fs::read(catalog_checkpoint_marker_path(snapshot_path)) {
+        Ok(bytes) => {
+            let marker: PersistedRegistryCatalogCheckpointMarker =
+                match serde_json::from_slice(&bytes) {
+                    Ok(marker) => marker,
+                    Err(_) => return Ok(report),
+                };
+            if marker.version != REGISTRY_CATALOG_DELTA_FILE_VERSION {
+                return Ok(report);
+            }
+            marker.checkpoint_seq
+        }
+        // marker 缺失 → checkpoint_seq = 0，seq ≥ 1 的 delta 仍参与重放
+        // （首笔 checkpoint 之前崩溃的实例以此恢复增量）。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return Ok(report),
+    };
+
+    let mut reconstructed = actual.segments;
+    let mut fingerprint = actual.series_fingerprint;
+    let mut fingerprint_fallback = false;
+    let mut replayed = 0u64;
+    for (offset, (seq, delta_path)) in deltas
+        .iter()
+        .filter(|(seq, _)| *seq > checkpoint_seq)
+        .enumerate()
+    {
+        // 序号必须从 checkpoint_seq + 1 连续起算：断层意味着有 delta 缺失
+        // （「段已 rename、delta 未写」崩溃窗），其上变更不可再补。
+        let expected_seq = checkpoint_seq.saturating_add(1 + offset as u64);
+        if *seq != expected_seq {
+            return Ok(report);
+        }
+        let bytes = match std::fs::read(delta_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(report),
+        };
+        let delta: PersistedRegistryCatalogDeltaFile = match serde_json::from_slice(&bytes) {
+            Ok(delta) => delta,
+            Err(_) => return Ok(report),
+        };
+        if delta.version != REGISTRY_CATALOG_DELTA_FILE_VERSION || delta.seq != *seq {
+            return Ok(report);
+        }
+        apply_catalog_delta_to_entries(&delta, &mut reconstructed);
+        fingerprint = delta.series_fingerprint;
+        fingerprint_fallback = fingerprint.is_none();
+        replayed += 1;
     }
 
-    Ok(Some(ValidatedRegistryCatalog {
-        series_fingerprint: actual.series_fingerprint,
-    }))
+    reconstructed.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
+    if reconstructed != expected_segments {
+        return Ok(report);
+    }
+
+    report.validated = Some(ValidatedRegistryCatalog {
+        series_fingerprint: fingerprint,
+        deltas_replayed: replayed,
+        fingerprint_fallback,
+    });
+    Ok(report)
+}
+
+/// 幂等应用一笔 delta：added 按段身份 (lane, level, segment_id) upsert，
+/// removed 按解析出的 (level, segment_id) 摘除（segment_id 全局唯一，跨 lane
+/// 不冲突）。无法解析的 removed 路径跳过并告警——只可能造成重构失配（回退
+/// 重建），不会造成误验证。
+fn apply_catalog_delta_to_entries(
+    delta: &PersistedRegistryCatalogDeltaFile,
+    entries: &mut Vec<PersistedRegistryCatalogEntry>,
+) {
+    for added in &delta.added {
+        entries.retain(|entry| {
+            entry.lane != added.lane
+                || entry.level != added.level
+                || entry.segment_id != added.segment_id
+        });
+        entries.push(added.clone());
+    }
+    for removed in &delta.removed {
+        match parse_segment_identity_from_root_str(removed) {
+            Some((level, segment_id)) => {
+                entries.retain(|entry| entry.level != level || entry.segment_id != segment_id)
+            }
+            None => warn!(
+                removed = %removed,
+                "Catalog delta replay: unparseable removed root; the next checkpoint reconciles it"
+            ),
+        }
+    }
 }
 
 pub(super) fn inventory_sources(

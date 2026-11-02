@@ -244,6 +244,9 @@ struct RuntimeConfigState {
     flush_interval: Duration,
     seal_policy: SealPolicy,
     catalog_persist_interval: Duration,
+    /// W3-T4：pending delta 数/字节合并阈值（发布拍 delta 路径消费）。
+    catalog_delta_max_count: usize,
+    catalog_delta_max_bytes: u64,
 }
 
 /// Memory-accounting counters and backpressure coordination.

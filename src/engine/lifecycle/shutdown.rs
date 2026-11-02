@@ -209,11 +209,10 @@ impl ChunkStorage {
         }
         self.persist_tombstones_index()?;
         if deferred_dirty_refresh {
-            self.checkpoint_series_registry_index_allow_invalid_catalog()?;
+            self.checkpoint_series_registry_index_allow_invalid_catalog()
         } else {
-            self.checkpoint_series_registry_index()?;
+            self.checkpoint_series_registry_index()
         }
-        Ok(())
     }
 
     pub(in super::super) fn close_impl(&self) -> Result<()> {

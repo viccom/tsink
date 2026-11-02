@@ -6,6 +6,8 @@ pub(super) struct StartupFinalizePhase;
 pub(super) struct StartupFinalizeState {
     pub(super) force_registry_checkpoint_after_startup: bool,
     pub(super) reconcile_registry_with_persisted: bool,
+    /// W3-T4：启动期 catalog delta 重放统计（recovery 产生，run 内播种）。
+    pub(super) catalog_delta_stats: registry_catalog::CatalogDeltaStartupStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,9 @@ impl StartupFinalizePhase {
         background_fail_fast: bool,
     ) -> Result<()> {
         let actions = finalize_state.actions(background_threads_enabled, background_fail_fast);
+        // W3-T4：启动期 delta 重放/回退统计并入实例观测（先播种再执行
+        // registry 持久化，保证首个观测快照已包含启动期数字）。
+        storage.seed_catalog_delta_startup_stats(finalize_state.catalog_delta_stats);
 
         if actions.run_sync_maintenance {
             storage.sweep_expired_persisted_segments()?;

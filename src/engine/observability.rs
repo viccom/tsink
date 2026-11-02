@@ -221,6 +221,22 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             // observability_snapshot_impl 的补填），计数器快照路径恒 0。
             catalog_cache_evictions_total: 0,
             catalog_cache_entries: 0,
+            // W3-T4 catalog 增量持久化：运行期三项随计数器读取；启动重放三项
+            // 由 StartupFinalizePhase 播种进计数器后照常读取。
+            catalog_delta_appended_total: counters
+                .catalog_delta_appended_total
+                .load(Ordering::Relaxed),
+            catalog_delta_bytes_total: counters.catalog_delta_bytes_total.load(Ordering::Relaxed),
+            catalog_checkpoint_total: counters.catalog_checkpoint_total.load(Ordering::Relaxed),
+            catalog_delta_replayed_total: counters
+                .catalog_delta_replayed_total
+                .load(Ordering::Relaxed),
+            catalog_delta_apply_fallback_total: counters
+                .catalog_delta_apply_fallback_total
+                .load(Ordering::Relaxed),
+            catalog_delta_fingerprint_fallback_total: counters
+                .catalog_delta_fingerprint_fallback_total
+                .load(Ordering::Relaxed),
             tier_moves_total: counters.tier_moves_total.load(Ordering::Relaxed),
             tier_move_errors_total: counters.tier_move_errors_total.load(Ordering::Relaxed),
             expired_segments_total: counters.expired_segments_total.load(Ordering::Relaxed),

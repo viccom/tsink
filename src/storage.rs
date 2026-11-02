@@ -498,6 +498,22 @@ pub struct FlushObservabilitySnapshot {
     pub catalog_cache_evictions_total: u64,
     #[serde(default)]
     pub catalog_cache_entries: u64,
+    /// W3-T4 catalog 增量持久化：delta 追加笔数 / 累计 delta 字节 / 全量
+    /// checkpoint 写入次数（冷路径重写与合并/强制锚点合计）。
+    #[serde(default)]
+    pub catalog_delta_appended_total: u64,
+    #[serde(default)]
+    pub catalog_delta_bytes_total: u64,
+    #[serde(default)]
+    pub catalog_checkpoint_total: u64,
+    /// W3-T4 启动重放：应用的 delta 数 / delta 断层损坏触发的回退重建次数 /
+    /// 指纹缺失导致快路径关闭次数（启动期产生，构造后播种）。
+    #[serde(default)]
+    pub catalog_delta_replayed_total: u64,
+    #[serde(default)]
+    pub catalog_delta_apply_fallback_total: u64,
+    #[serde(default)]
+    pub catalog_delta_fingerprint_fallback_total: u64,
     pub tier_moves_total: u64,
     pub tier_move_errors_total: u64,
     pub expired_segments_total: u64,
@@ -1120,13 +1136,9 @@ pub struct StorageBuilder {
     max_head_age: Duration,
     max_unsealed_wal_bytes: u64,
     catalog_persist_interval: Duration,
-    /// W3-T4 stub: pending-delta count threshold for full checkpoint
-    /// consolidation. Stored only — the delta pipeline consumes it.
-    #[allow(dead_code)]
+    /// W3-T4：pending delta 数达到该阈值即全量 checkpoint 合并。
     catalog_delta_max_count: usize,
-    /// W3-T4 stub: pending-delta byte threshold for full checkpoint
-    /// consolidation. Stored only — the delta pipeline consumes it.
-    #[allow(dead_code)]
+    /// W3-T4：pending delta 字节达到该阈值即全量 checkpoint 合并。
     catalog_delta_max_bytes: u64,
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
@@ -1373,7 +1385,9 @@ impl StorageBuilder {
     /// [`DEFAULT_CATALOG_DELTA_MAX_COUNT`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_COUNT)
     /// (100).
     ///
-    /// Retained on the builder only until the delta pipeline consumes it.
+    /// The delta count consumed by a consolidation includes the change that
+    /// reaches the threshold, so `3` means the third pending change is
+    /// absorbed by a full checkpoint instead of becoming a third delta file.
     #[must_use]
     pub fn with_catalog_delta_max_count(mut self, max_count: usize) -> Self {
         self.catalog_delta_max_count = max_count;
@@ -1385,7 +1399,9 @@ impl StorageBuilder {
     /// [`DEFAULT_CATALOG_DELTA_MAX_BYTES`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_BYTES)
     /// (1 MiB).
     ///
-    /// Retained on the builder only until the delta pipeline consumes it.
+    /// The threshold check includes the serialized size of the change that
+    /// would exceed it, so the smallest possible value consolidates every
+    /// change straight into a full checkpoint.
     #[must_use]
     pub fn with_catalog_delta_max_bytes(mut self, max_bytes: u64) -> Self {
         self.catalog_delta_max_bytes = max_bytes;
@@ -1683,6 +1699,14 @@ impl StorageBuilder {
 
     pub(crate) fn catalog_persist_interval(&self) -> Duration {
         self.catalog_persist_interval
+    }
+
+    pub(crate) fn catalog_delta_max_count(&self) -> usize {
+        self.catalog_delta_max_count
+    }
+
+    pub(crate) fn catalog_delta_max_bytes(&self) -> u64 {
+        self.catalog_delta_max_bytes
     }
 
     pub(crate) fn catalog_entry_cache_capacity(&self) -> usize {

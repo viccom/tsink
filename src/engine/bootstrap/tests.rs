@@ -244,6 +244,7 @@ fn finalize_state_actions_cover_checkpoint_persist_and_maintenance_modes() {
     let rebuild_actions = StartupFinalizeState {
         force_registry_checkpoint_after_startup: true,
         reconcile_registry_with_persisted: false,
+        catalog_delta_stats: Default::default(),
     }
     .actions(false, false);
     assert_eq!(
@@ -257,6 +258,7 @@ fn finalize_state_actions_cover_checkpoint_persist_and_maintenance_modes() {
     let reconciled_actions = StartupFinalizeState {
         force_registry_checkpoint_after_startup: false,
         reconcile_registry_with_persisted: true,
+        catalog_delta_stats: Default::default(),
     }
     .actions(true, false);
     assert_eq!(
@@ -270,6 +272,7 @@ fn finalize_state_actions_cover_checkpoint_persist_and_maintenance_modes() {
     let fail_fast_actions = StartupFinalizeState {
         force_registry_checkpoint_after_startup: false,
         reconcile_registry_with_persisted: true,
+        catalog_delta_stats: Default::default(),
     }
     .actions(true, true);
     assert!(fail_fast_actions.run_sync_maintenance);

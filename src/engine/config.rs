@@ -37,6 +37,13 @@ pub(super) struct ChunkStorageOptions {
     pub(super) flush_interval: Duration,
     pub(super) seal_policy: SealPolicy,
     pub(super) catalog_persist_interval: Duration,
+    /// W3-T4：pending delta 数达到该阈值即全量 checkpoint 合并（含达阈值的那
+    /// 笔变更）。默认
+    /// [`DEFAULT_CATALOG_DELTA_MAX_COUNT`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_COUNT)。
+    pub(super) catalog_delta_max_count: usize,
+    /// W3-T4：pending delta 字节达到该阈值即全量 checkpoint 合并。默认
+    /// [`DEFAULT_CATALOG_DELTA_MAX_BYTES`](crate::storage::DEFAULT_CATALOG_DELTA_MAX_BYTES)。
+    pub(super) catalog_delta_max_bytes: u64,
     pub(super) memory_budget_bytes: u64,
     pub(super) persisted_mmap_budget_bytes: usize,
     /// Global byte budget for resident timestamp-search-index cache entries.
@@ -156,6 +163,8 @@ impl Default for ChunkStorageOptions {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             seal_policy: SealPolicy::default(),
             catalog_persist_interval: DEFAULT_CATALOG_PERSIST_INTERVAL,
+            catalog_delta_max_count: crate::storage::DEFAULT_CATALOG_DELTA_MAX_COUNT,
+            catalog_delta_max_bytes: crate::storage::DEFAULT_CATALOG_DELTA_MAX_BYTES,
             memory_budget_bytes: u64::MAX,
             persisted_mmap_budget_bytes: crate::storage::DEFAULT_PERSISTED_MMAP_BUDGET_BYTES,
             timestamp_index_cache_budget_bytes:
@@ -256,6 +265,8 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
                 max_unsealed_wal_bytes: builder.max_unsealed_wal_bytes(),
             },
             catalog_persist_interval: builder.catalog_persist_interval(),
+            catalog_delta_max_count: builder.catalog_delta_max_count(),
+            catalog_delta_max_bytes: builder.catalog_delta_max_bytes(),
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
             persisted_mmap_budget_bytes: builder.persisted_mmap_budget_bytes(),
             timestamp_index_cache_budget_bytes: builder.timestamp_index_cache_budget_bytes(),

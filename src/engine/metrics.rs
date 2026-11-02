@@ -260,6 +260,15 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) catalog_persist_attempts_total: AtomicU64,
     pub(super) catalog_persisted_total: AtomicU64,
     pub(super) catalog_persist_skipped_total: AtomicU64,
+    /// W3-T4 catalog 增量持久化：delta 追加笔数 / 累计 delta 字节 / 全量
+    /// checkpoint 写入次数。启动重放三项（replayed / apply_fallback /
+    /// fingerprint_fallback）发生在实例构造之前，由 StartupFinalizePhase 播种。
+    pub(super) catalog_delta_appended_total: AtomicU64,
+    pub(super) catalog_delta_bytes_total: AtomicU64,
+    pub(super) catalog_checkpoint_total: AtomicU64,
+    pub(super) catalog_delta_replayed_total: AtomicU64,
+    pub(super) catalog_delta_apply_fallback_total: AtomicU64,
+    pub(super) catalog_delta_fingerprint_fallback_total: AtomicU64,
     pub(super) tier_moves_total: AtomicU64,
     pub(super) tier_move_errors_total: AtomicU64,
     pub(super) expired_segments_total: AtomicU64,

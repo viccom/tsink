@@ -481,9 +481,11 @@ impl ChunkStorage {
 
         let registry_catalog_sources = self
             .persisted_registry_catalog_sources_with_root_changes(published_segment_roots, &[])?;
-        if let Err(err) =
-            self.persist_series_registry_index_with_catalog_sources(&registry_catalog_sources)
-        {
+        if let Err(err) = self.persist_series_registry_index_with_catalog_sources_and_root_changes(
+            &registry_catalog_sources,
+            published_segment_roots,
+            &[],
+        ) {
             if let Err(rollback_err) =
                 self.rollback_published_segment_roots(published_segment_roots)
             {

@@ -16,6 +16,8 @@ pub(super) struct StartupRecoveryState {
     pub(super) registry: StartupRegistryState,
     pub(super) loaded_segments: LoadedSegmentIndexes,
     pub(super) startup_quarantined: Vec<StartupQuarantinedSegment>,
+    /// W3-T4：启动期 catalog delta 重放统计（实例构造前产生，经 finalize 播种）。
+    pub(super) catalog_delta_stats: registry_catalog::CatalogDeltaStartupStats,
 }
 
 impl StartupRecoveryPhase {
@@ -28,7 +30,7 @@ impl StartupRecoveryPhase {
             mut inventory,
         } = discovered;
 
-        let validated_catalog = validate_startup_registry_catalog(
+        let (validated_catalog, catalog_delta_stats) = validate_startup_registry_catalog(
             plan.paths().series_index_path.as_deref(),
             &mut registry,
             &inventory,
@@ -52,6 +54,7 @@ impl StartupRecoveryPhase {
             registry,
             loaded_segments,
             startup_quarantined: inventory.startup_quarantined,
+            catalog_delta_stats,
         })
     }
 }
@@ -63,6 +66,7 @@ impl StartupRecoveryState {
                 .registry
                 .force_registry_checkpoint_after_startup,
             reconcile_registry_with_persisted: self.registry.reconcile_registry_with_persisted,
+            catalog_delta_stats: self.catalog_delta_stats,
         }
     }
 
@@ -71,24 +75,54 @@ impl StartupRecoveryState {
     }
 }
 
+/// 启动校验入口：返回校验结论与 W3-T4 delta 重放统计。
+///
+/// 统计口径：
+/// - `replayed_total` / `fingerprint_fallback_total`：校验成功时取自报告
+///   （重放条数 / 已应用 delta 的指纹缺失）；
+/// - `apply_fallback_total`：盘上存在 delta 但未能干净应用（缺失/损坏/断层/
+///   重构失配）→ 丢弃全部 delta 走「失配即重建 + 强制 checkpoint」并计数。
 fn validate_startup_registry_catalog(
     series_index_path: Option<&Path>,
     registry: &mut StartupRegistryState,
     inventory: &StartupInventoryState,
-) -> Option<registry_catalog::ValidatedRegistryCatalog> {
+) -> (
+    Option<registry_catalog::ValidatedRegistryCatalog>,
+    registry_catalog::CatalogDeltaStartupStats,
+) {
     if !registry.reconcile_registry_with_persisted {
-        return None;
+        return (None, registry_catalog::CatalogDeltaStartupStats::default());
     }
 
     let index_path = series_index_path.expect("persisted registry requires a snapshot path");
     let catalog_sources = registry_catalog::inventory_sources(&inventory.segment_inventory);
     // bootstrap 一次性校验：独立临时段级缓存（无跨拍复用价值，N9b 签参统一）
     let entry_cache = registry_catalog::CatalogEntryCache::default();
-    match registry_catalog::validate_registry_catalog(index_path, &catalog_sources, &entry_cache) {
-        Ok(Some(validated_catalog)) => Some(validated_catalog),
-        Ok(None) => {
-            registry.force_registry_checkpoint();
-            None
+    match registry_catalog::validate_registry_catalog_with_delta_report(
+        index_path,
+        &catalog_sources,
+        &entry_cache,
+    ) {
+        Ok(report) => {
+            let stats = registry_catalog::CatalogDeltaStartupStats {
+                replayed_total: report
+                    .validated
+                    .as_ref()
+                    .map(|validated| validated.deltas_replayed)
+                    .unwrap_or(0),
+                apply_fallback_total: u64::from(
+                    report.deltas_present && report.validated.is_none(),
+                ),
+                fingerprint_fallback_total: report
+                    .validated
+                    .as_ref()
+                    .map(|validated| u64::from(validated.fingerprint_fallback))
+                    .unwrap_or(0),
+            };
+            if report.validated.is_none() {
+                registry.force_registry_checkpoint();
+            }
+            (report.validated, stats)
         }
         Err(err) => {
             warn!(
@@ -97,7 +131,15 @@ fn validate_startup_registry_catalog(
                 "Failed to validate persisted registry catalog sidecar; rebuilding startup metadata from segments"
             );
             registry.force_registry_checkpoint();
-            None
+            (
+                None,
+                registry_catalog::CatalogDeltaStartupStats {
+                    apply_fallback_total: u64::from(
+                        registry_catalog::count_catalog_delta_files(index_path) > 0,
+                    ),
+                    ..registry_catalog::CatalogDeltaStartupStats::default()
+                },
+            )
         }
     }
 }
@@ -149,6 +191,7 @@ fn reconcile_startup_registry_snapshot(
         Some(loaded_registry),
         Some(registry_catalog::ValidatedRegistryCatalog {
             series_fingerprint: Some(series_fingerprint),
+            ..
         }),
     ) = (registry.persisted_registry.as_ref(), validated_catalog)
     else {
@@ -192,6 +235,7 @@ fn should_load_segment_series(
         validated_catalog,
         Some(registry_catalog::ValidatedRegistryCatalog {
             series_fingerprint: Some(_),
+            ..
         })
     )
 }

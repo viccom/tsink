@@ -80,6 +80,16 @@ impl ChunkStorage {
         self.add_persisted_segments_from_loaded(transition.loaded_segments)?;
         self.remove_persisted_segment_roots(&transition.removed_roots)?;
 
+        // W3-T4：PersistedState 发布带已知 root 变更 → catalog 走 delta；
+        // 全量扫描发布（Inventory）无变更信息 → 冷路径全量重建语义不变。
+        // 变更信息先于 publication 消费被 move 前取出。
+        let delta_added_roots = match &transition.publication {
+            PersistedCatalogPublication::PersistedState {
+                published_segment_roots,
+            } => Some(published_segment_roots.clone()),
+            PersistedCatalogPublication::Inventory { .. } => None,
+        };
+
         match transition.publication {
             PersistedCatalogPublication::PersistedState {
                 published_segment_roots,
@@ -99,7 +109,19 @@ impl ChunkStorage {
         }
 
         if let Some(registry_catalog_sources) = transition.registry_catalog_sources {
-            self.persist_series_registry_index_with_catalog_sources(&registry_catalog_sources)?;
+            match delta_added_roots {
+                Some(added_roots) => self
+                    .persist_series_registry_index_with_catalog_sources_and_root_changes(
+                        &registry_catalog_sources,
+                        &added_roots,
+                        &transition.removed_roots,
+                    )?,
+                None => {
+                    self.persist_series_registry_index_with_catalog_sources(
+                        &registry_catalog_sources,
+                    )?;
+                }
+            }
         }
 
         Ok(PersistedCatalogRefreshApply::Applied)

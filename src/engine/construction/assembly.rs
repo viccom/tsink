@@ -123,7 +123,11 @@ impl StorageStateAssembly {
                 catalog_entry_cache_capacity,
                 catalog_series_cache_bytes,
             ),
-            catalog_persist_memo: Default::default(),
+            // W3-T4：delta 序号锚点从盘面恢复（`_checkpoint.json` + 现存
+            // delta 最大 seq），保证重启后 delta 序号不与历史冲突。
+            catalog_persist_memo: registry_catalog::CatalogPersistMemo::from_disk(
+                series_index_path.as_deref(),
+            ),
             segment_maps: SegmentMapRegistry::new(persisted_mmap_budget_bytes),
             timestamp_indexes: TimestampIndexCache::new(timestamp_index_cache_budget_bytes),
             persisted_index_dirty,
@@ -162,6 +166,8 @@ impl StorageStateAssembly {
             flush_interval: options.flush_interval,
             seal_policy: options.seal_policy,
             catalog_persist_interval: options.catalog_persist_interval,
+            catalog_delta_max_count: options.catalog_delta_max_count,
+            catalog_delta_max_bytes: options.catalog_delta_max_bytes,
         }
     }
 

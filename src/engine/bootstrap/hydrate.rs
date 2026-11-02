@@ -34,6 +34,7 @@ impl StartupHydrationPhase {
             registry,
             loaded_segments,
             startup_quarantined,
+            catalog_delta_stats: _,
         } = recovered;
         let replay_highwater = loaded_segments.wal_replay_highwater;
 
