@@ -41,7 +41,8 @@
 | W1-T4 | ⏳ | 计划标注可选，默认不做 |
 | W2-T1 | ✅ | 三红测落地（registry_catalog.rs 底部 `#[cfg(test)] mod`，stub 全 cfg(test) 门控零生产行为改动）：编译红→断言红两段留证；lib 599 绿 + 4 红（3 新 + 1 基线）。契约钉死：capacity=4 插 6 → 终态 len=4 淘汰最旧 2；invalidate 双 map 齐删；series 字节预算超限淘汰。**约定**：内部构造 `with_capacity(entry, series_bytes)` 语义 0=无界（Default 结构性无界）；StorageBuilder 旋钮 0=不缓存仍按计划语义（T2 区分映射）。T2 建议补「命中刷新 touch 序」用例 |
 | W2-T2 | ✅ | LRU 落地：`CatalogLruMap<V>` 原语（touch 序命中刷新 + 超限批量淘汰至 3/4 水位 + 字节预算，保底 1 条防 N9 重读回归）+ `invalidate` 接在 `remove_persisted_segment_roots` 索引应用后（唯一删除汇聚点，调用图已核）+ 双旋钮（默认 32768 / 32MiB，serde default；旋钮 0=不缓存 vs 内部 0=无界两层语义显式区分）+ 快照 `catalog_cache_evictions_total/entries`（serde default 兼容）。复用 `core_impl/utilities.rs` 的 `saturating_sub_fetch`。4 用例绿（含新增 touch 序）+ N9 45 绿 + lib 603 绿+唯一基线红 + crash 门禁 80 轮绿。**观测项**：crash test 首跑一闪失败 1 次（subagent 报告），此后其 14 连跑 + 160 轮门禁 + 本会话 80 轮门禁 + 2 连跑全绿未复现，W2-T3 复测关注 |
-| W2-T3 | ⏳ | 未开始 |
+| W2-T3 | ✅ 已交付 / ⏳ 2h 判据后台收 | soak 测试（crate 内 `#[ignore]`，observability_snapshot 内部可达）+ `scripts/check_catalog_cache_soak.sh`（release、`--exact` 用完整测试路径）+ performance-tuning.md「Catalog caches」。冒烟 600s 过（entries 2/32768、compaction 失效清槽实证、evictions 0）；5s 端到端过；lib/fmt/clippy 净。完整 2h 由主 Agent 直跑测试二进制后台收（绕 cargo 锁） |
+| W2 边界 | ✅ | `cargo test -p tsink --no-fail-fast` 全 target：lib 603 绿+1 基线红+soak ignored，11 个集成文件全绿；fmt/clippy 0 告警 |
 | W3-T1..T5 | ⏳ | 未开始 |
 | W4-T0..T5 | ⏳ | 未开始 |
 
