@@ -56,6 +56,28 @@ pub(crate) fn full_segment_dir_load_count() -> u64 {
     FULL_SEGMENT_DIR_LOADS.with(std::cell::Cell::get)
 }
 
+// Test instrumentation (W3-T1): counts series.bin reads on the startup segment
+// path (`load_segment_dir_indexed`'s `load_series` branch — the only route
+// startup uses to open per-segment series metadata). Thread-local so parallel
+// tests and background threads (catalog fingerprinting, compaction full loads)
+// cannot pollute each other's counts. W3-T4's catalog-delta fast-path test
+// consumes this: with a valid checkpoint plus deltas present, startup must
+// still trust the catalog and never open any series.bin.
+#[cfg(test)]
+thread_local! {
+    static STARTUP_SERIES_FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_startup_series_file_read_count() {
+    STARTUP_SERIES_FILE_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn startup_series_file_read_count() -> u64 {
+    STARTUP_SERIES_FILE_READS.with(std::cell::Cell::get)
+}
+
 /// Fully loads a single segment directory for a compaction window under the
 /// runtime-strict policy: a directory that disappeared concurrently is
 /// skipped, while any corruption fails the pass with compaction validation
@@ -739,6 +761,8 @@ fn load_segment_dir_indexed(path: &Path, load_series: bool) -> Result<ParsedInde
 
     let mut postings = SegmentPostingsIndex::default();
     let series = if load_series {
+        #[cfg(test)]
+        STARTUP_SERIES_FILE_READS.with(|count| count.set(count.get() + 1));
         let series_bytes = read_required_segment_file(path, &layout.series_path)?;
         let postings_bytes = read_required_segment_file(path, &layout.postings_path)?;
         verify_file_manifest_entry(&parsed_manifest.files[2], FILE_KIND_SERIES, &series_bytes)?;

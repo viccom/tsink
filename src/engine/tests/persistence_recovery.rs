@@ -2287,3 +2287,475 @@ fn startup_recovers_when_catalog_is_missing_or_corrupt() {
         reopened.close().unwrap();
     }
 }
+
+// ---- W3-T1（红）：catalog 增量写入与恢复 -------------------------------------
+//
+// W3-T4 目标布局：catalog checkpoint（`series_index.catalog.json`）旁常驻增量
+// 目录 `series_index.catalog.d/`（`{seq:020}.delta.json` + `_checkpoint.json`）。
+// 当前实现没有该目录，例行 persist 一律全量重写 checkpoint——以下三测锁定目标
+// 行为，红态失败点：delta 目录不存在（`read_dir` NotFound）+ checkpoint 被全量
+// 重写（mtime/长度/内容变化）。delta 机制本身由 W3-T4 实现。
+
+/// W3-T4 计划定名的 catalog 增量目录（与 checkpoint 同目录，尚不存在）。
+const CATALOG_DELTA_DIR_NAME: &str = "series_index.catalog.d";
+
+const CATALOG_DELTA_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+
+use std::time::Instant;
+
+fn catalog_delta_dir(data_path: &Path) -> PathBuf {
+    data_path.join(CATALOG_DELTA_DIR_NAME)
+}
+
+fn data_catalog_checkpoint_file(data_path: &Path) -> PathBuf {
+    super::super::registry_catalog::catalog_path(&data_path.join(SERIES_INDEX_FILE_NAME))
+}
+
+/// catalog checkpoint 快照：mtime（symlink_metadata）+ 长度 + 全量内容。
+/// 内容全量比对严格强于哈希比对。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogCheckpointSnapshot {
+    modified: std::time::SystemTime,
+    len: u64,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_catalog_checkpoint(path: &Path) -> Option<CatalogCheckpointSnapshot> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(CatalogCheckpointSnapshot {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+        bytes: std::fs::read(path).ok()?,
+    })
+}
+
+/// catalog checkpoint 里 `segments` 数组的长度；解析失败按 0 处理（只让轮询
+/// 谓词更保守，不会把"已变化"误判成"未变化"）。
+fn catalog_checkpoint_segment_count(bytes: &[u8]) -> usize {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("segments")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(0)
+}
+
+fn poll_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// 列出 delta 目录下的 `.delta.json` 文件（文件名排序 = seq 序）。
+fn catalog_delta_files(delta_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(delta_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().ends_with(".delta.json") {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// W3-T1 三测共用的构建参数：小 flush/catalog 拍 + 无条件 seal，让例行
+/// persist 在亚秒级产生 catalog 变更（compaction 间隔由各测按需覆盖）。
+fn catalog_delta_builder(data_path: &Path) -> StorageBuilder {
+    StorageBuilder::new()
+        .with_data_path(data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(4)
+        .with_flush_interval(Duration::from_millis(50))
+        .with_catalog_persist_interval(Duration::from_millis(50))
+        .with_seal_min_points(1)
+}
+
+/// 错开启动锚点（finalize 的节流 persist / 强制 checkpoint）设置的节流时间戳：
+/// 发布拍内的 catalog persist 尝试若落在节流窗口内会被 SkippedThrottled，且该
+/// 变更要等下一次发布才会重试——写批前先等一拍，保证首个发布拍的 persist
+/// 必然通过节流。
+fn settle_past_catalog_persist_throttle() {
+    std::thread::sleep(Duration::from_millis(150));
+}
+
+fn insert_catalog_delta_series(
+    storage: &Arc<dyn Storage>,
+    metric: &str,
+    labels: &[Label],
+    ts_base: i64,
+    point_count: i64,
+) {
+    let rows: Vec<Row> = (ts_base..ts_base + point_count)
+        .map(|ts| Row::with_labels(metric, labels.to_vec(), DataPoint::new(ts, ts as f64)))
+        .collect();
+    storage.insert_rows(&rows).unwrap();
+}
+
+/// 确定性数据集：值 = ts（全窗逐点比对用）。
+fn catalog_delta_expected_points(ts_base: i64, point_count: i64) -> Vec<DataPoint> {
+    (ts_base..ts_base + point_count)
+        .map(|ts| DataPoint::new(ts, ts as f64))
+        .collect()
+}
+
+fn assert_catalog_delta_series_window(
+    storage: &Arc<dyn Storage>,
+    metric: &str,
+    labels: &[Label],
+    ts_base: i64,
+    point_count: i64,
+) {
+    assert_eq!(
+        storage.select(metric, labels, 0, i64::MAX).unwrap(),
+        catalog_delta_expected_points(ts_base, point_count),
+        "series {metric} must survive reopen with every point intact"
+    );
+}
+
+fn count_lane_segments_at_level(lane_path: &Path, level: u8) -> usize {
+    load_segments_for_level(lane_path, level)
+        .map(|segments| segments.len())
+        .unwrap_or(0)
+}
+
+/// T1-红：例行 persist 产生的 catalog 变更必须以 delta 落盘，checkpoint 文件
+/// 保持不动；重开后对全部写入 series 做全窗逐点校验。
+#[test]
+fn catalog_delta_recovers_without_full_rewrite() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "delta")];
+
+    // 第一开：基线数据 + close（close 锚点走强制 checkpoint 全量落盘）。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        settle_past_catalog_persist_throttle();
+        for idx in 0..30 {
+            insert_catalog_delta_series(
+                &storage,
+                &format!("catalog-delta-{idx:02}"),
+                &labels,
+                1,
+                4,
+            );
+        }
+        storage.close().unwrap();
+    }
+    let baseline = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("close must leave a catalog checkpoint on disk");
+
+    // 第二开：再写一批，例行 persist 应以 delta 记录新段而不是重写 checkpoint。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-delta-30", &labels, 1, 4);
+        let produced_change = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            delta_dir.is_dir()
+                || std::fs::read(&catalog_file)
+                    .map(|bytes| bytes != baseline.bytes)
+                    .unwrap_or(false)
+        });
+        assert!(
+            produced_change,
+            "routine persist must record the new segment (delta or checkpoint change) \
+             within 10s"
+        );
+
+        // 红态断言：两处红都收集到同一次失败输出里。
+        let mut failures = Vec::new();
+        let current = snapshot_catalog_checkpoint(&catalog_file)
+            .expect("catalog checkpoint must still exist while the storage is open");
+        if current != baseline {
+            failures.push(format!(
+                "catalog checkpoint was fully rewritten by routine persist: \
+                 mtime {:?} -> {:?}, len {} -> {}",
+                baseline.modified, current.modified, baseline.len, current.len
+            ));
+        }
+        match catalog_delta_files(&delta_dir) {
+            Err(err) => failures.push(format!(
+                "delta dir {} must exist after a routine catalog change: {err}",
+                delta_dir.display()
+            )),
+            Ok(deltas) if deltas.len() != 1 => failures.push(format!(
+                "expected exactly 1 delta file under {}, got {}",
+                delta_dir.display(),
+                deltas.len()
+            )),
+            Ok(_) => {}
+        }
+        assert!(
+            failures.is_empty(),
+            "catalog delta expectations failed:\n- {}",
+            failures.join("\n- ")
+        );
+        storage.close().unwrap();
+    }
+
+    // 第三开：全窗逐点校验（delta 应用或 checkpoint 重建后数据都必须一致）。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        for idx in 0..=30 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-delta-{idx:02}"),
+                &labels,
+                1,
+                4,
+            );
+        }
+        storage.close().unwrap();
+    }
+}
+
+/// T1-红：两个 delta（先 add 后 remove）按 seq 序重放后，最终集合必须正确：
+/// 被合并消失的段数据不重复可见，存活段数据完整。
+///
+/// remove 制造手法：基线留 3 个 L0 段（低于触发阈值 4，close 的
+/// compact_until_settled 不会吸收合并），轮 1 的新段把 L0 推到 4；实例 B 用
+/// 1s compaction 拍——delta#1(add) 在发布拍内落盘，合并发生在 ≥1s 后的
+/// compaction 拍，两轮变更按时间错峰、序号有序。
+#[test]
+fn catalog_delta_replay_order_matters() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "replay")];
+
+    // 基线：3 个 L0 段（compaction 触发阈值 4 之下），close 后 checkpoint 全量
+    // 落盘且不被 close 合并吸收。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        settle_past_catalog_persist_throttle();
+        for round in 0..3 {
+            let metric = format!("catalog-replay-base-{round}");
+            let ts_base = 1 + round * 10;
+            insert_catalog_delta_series(&storage, &metric, &labels, ts_base, 4);
+            let published = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+                count_lane_segments_at_level(&lane_path, 0) > round as usize
+            });
+            assert!(
+                published,
+                "baseline batch {round} must be published as an L0 segment within 10s"
+            );
+        }
+        storage.close().unwrap();
+    }
+    let baseline = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("close must leave a catalog checkpoint on disk");
+    let baseline_count = catalog_checkpoint_segment_count(&baseline.bytes);
+    assert_eq!(
+        baseline_count, 3,
+        "baseline checkpoint must carry exactly the 3 seeded L0 roots"
+    );
+
+    // 轮 1（add）：新 series → 第 4 个 L0 段发布 → 第 1 个 delta。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_millis(1000))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-replay-add", &labels, 31, 4);
+        let round1_landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            delta_dir.is_dir()
+                || std::fs::read(&catalog_file)
+                    .map(|bytes| catalog_checkpoint_segment_count(&bytes) > baseline_count)
+                    .unwrap_or(false)
+        });
+        assert!(
+            round1_landed,
+            "round 1 (add) must reach the persisted catalog within 10s"
+        );
+        // 红态断言（先目录存在 = 红点，再数量）：合并拍在 ≥1s 后，此处读到的
+        // delta 目录只含轮 1 的 add。
+        match catalog_delta_files(&delta_dir) {
+            Err(err) => panic!(
+                "round 1 (add) must leave a delta under {}: {err}",
+                delta_dir.display()
+            ),
+            Ok(deltas) => assert_eq!(
+                deltas.len(),
+                1,
+                "round 1 (add) must produce exactly one delta before the compaction pass"
+            ),
+        }
+
+        // 轮 2（remove）：后台 compaction 把 4 个 L0 段合并进 L1，源段 root
+        // 消失 → 第 2 个 delta（无任何新增段，故不产生额外 add delta）。
+        let round1_checkpoint = std::fs::read(&catalog_file).unwrap_or_default();
+        let round1_count = catalog_checkpoint_segment_count(&round1_checkpoint);
+        let merged = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            count_lane_segments_at_level(&lane_path, 0) < 4
+                && count_lane_segments_at_level(&lane_path, 1) >= 1
+        });
+        assert!(
+            merged,
+            "background compaction must merge the 4 L0 segments into L1 within 10s"
+        );
+        let round2_landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            catalog_delta_files(&delta_dir)
+                .map(|deltas| deltas.len() >= 2)
+                .unwrap_or(false)
+                || std::fs::read(&catalog_file)
+                    .map(|bytes| catalog_checkpoint_segment_count(&bytes) != round1_count)
+                    .unwrap_or(false)
+        });
+        assert!(
+            round2_landed,
+            "round 2 (remove) must reach the persisted catalog within 10s"
+        );
+        match catalog_delta_files(&delta_dir) {
+            Err(err) => panic!(
+                "round 2 (remove) must leave a second delta under {}: {err}",
+                delta_dir.display()
+            ),
+            Ok(deltas) => assert_eq!(
+                deltas.len(),
+                2,
+                "rounds 1+2 must produce exactly two deltas (add, remove)"
+            ),
+        }
+        storage.close().unwrap();
+    }
+
+    // 重开：全窗逐点校验最终集合（合并后的 L1 段承载全部数据，恰出现一次）。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        for round in 0..3 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-replay-base-{round}"),
+                &labels,
+                1 + round * 10,
+                4,
+            );
+        }
+        assert_catalog_delta_series_window(&storage, "catalog-replay-add", &labels, 31, 4);
+        storage.close().unwrap();
+    }
+}
+
+/// T1-红：checkpoint 后存在 delta 的目录重开时，不得退回全量读 series.bin——
+/// 可观测判据 = 启动路径 series.bin 读取计数（cfg(test) 计数器，W3-T4 消费）
+/// 不增长。红态失败点 = delta 目录不存在（前置断言）。
+#[test]
+fn catalog_delta_preserves_startup_fast_path() {
+    crate::engine::segment::reset_startup_series_file_read_count();
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "fastpath")];
+
+    // 计数器自证：空目录首开无段可读，计数为 0。
+    {
+        let (storage, reads) = build_counting_series_reads(catalog_delta_builder(data_path));
+        assert_eq!(reads, 0, "empty data dir must not read any series.bin");
+        settle_past_catalog_persist_throttle();
+        for idx in 0..6 {
+            insert_catalog_delta_series(&storage, &format!("catalog-fast-{idx}"), &labels, 1, 4);
+        }
+        storage.close().unwrap();
+    }
+
+    // 计数器自证：删掉 catalog 强制回退段扫描时，计数必须增长（证明计数器
+    // 探的是真实回退路径，而非恒 0 的空仪器）。
+    std::fs::remove_file(&catalog_file).unwrap();
+    {
+        let (storage, reads) = build_counting_series_reads(catalog_delta_builder(data_path));
+        assert!(
+            reads > 0,
+            "missing catalog must force the startup fallback that reads series.bin"
+        );
+        for idx in 0..6 {
+            assert_catalog_delta_series_window(
+                &storage,
+                &format!("catalog-fast-{idx}"),
+                &labels,
+                1,
+                4,
+            );
+        }
+        storage.close().unwrap();
+    }
+
+    // 正常重开：catalog 有效 → 快路径，series.bin 计数不增长。
+    let baseline = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("closed storage must leave a catalog checkpoint on disk");
+    {
+        let (storage, reads) = build_counting_series_reads(catalog_delta_builder(data_path));
+        assert_eq!(
+            reads, 0,
+            "a valid checkpoint must keep startup on the catalog fast path"
+        );
+
+        // 制造 delta（复用例行 persist 链），然后重开验证快路径保持。
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-fast-post", &labels, 1, 4);
+        let produced_change = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            delta_dir.is_dir()
+                || std::fs::read(&catalog_file)
+                    .map(|bytes| bytes != baseline.bytes)
+                    .unwrap_or(false)
+        });
+        assert!(
+            produced_change,
+            "routine persist must record the new segment (delta or checkpoint change) \
+             within 10s"
+        );
+        // 红态断言（前置）：delta 必须存在。
+        match catalog_delta_files(&delta_dir) {
+            Err(err) => panic!(
+                "a delta must exist under {} before the fast-path reopen: {err}",
+                delta_dir.display()
+            ),
+            Ok(deltas) => assert!(
+                !deltas.is_empty(),
+                "delta dir must not be empty before the fast-path reopen"
+            ),
+        }
+        storage.close().unwrap();
+
+        // delta 存在时重开：仍走快路径 + 数据一致。
+        let (reopened, reads) = build_counting_series_reads(catalog_delta_builder(data_path));
+        assert_eq!(
+            reads, 0,
+            "startup with a checkpoint plus deltas must not read any series.bin"
+        );
+        for idx in 0..6 {
+            assert_catalog_delta_series_window(
+                &reopened,
+                &format!("catalog-fast-{idx}"),
+                &labels,
+                1,
+                4,
+            );
+        }
+        assert_catalog_delta_series_window(&reopened, "catalog-fast-post", &labels, 1, 4);
+        reopened.close().unwrap();
+    }
+}
+
+/// 围绕 `build()` 统计本线程启动路径的 series.bin 读取次数。
+fn build_counting_series_reads(builder: StorageBuilder) -> (Arc<dyn Storage>, u64) {
+    let before = crate::engine::segment::startup_series_file_read_count();
+    let storage = builder.build().unwrap();
+    let reads = crate::engine::segment::startup_series_file_read_count() - before;
+    (storage, reads)
+}

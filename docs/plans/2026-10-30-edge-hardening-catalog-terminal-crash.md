@@ -43,7 +43,11 @@
 | W2-T2 | ✅ | LRU 落地：`CatalogLruMap<V>` 原语（touch 序命中刷新 + 超限批量淘汰至 3/4 水位 + 字节预算，保底 1 条防 N9 重读回归）+ `invalidate` 接在 `remove_persisted_segment_roots` 索引应用后（唯一删除汇聚点，调用图已核）+ 双旋钮（默认 32768 / 32MiB，serde default；旋钮 0=不缓存 vs 内部 0=无界两层语义显式区分）+ 快照 `catalog_cache_evictions_total/entries`（serde default 兼容）。复用 `core_impl/utilities.rs` 的 `saturating_sub_fetch`。4 用例绿（含新增 touch 序）+ N9 45 绿 + lib 603 绿+唯一基线红 + crash 门禁 80 轮绿。**观测项**：crash test 首跑一闪失败 1 次（subagent 报告），此后其 14 连跑 + 160 轮门禁 + 本会话 80 轮门禁 + 2 连跑全绿未复现，W2-T3 复测关注 |
 | W2-T3 | ✅ 已交付 / ⏳ 2h 判据后台收 | soak 测试（crate 内 `#[ignore]`，observability_snapshot 内部可达）+ `scripts/check_catalog_cache_soak.sh`（release、`--exact` 用完整测试路径）+ performance-tuning.md「Catalog caches」。冒烟 600s 过（entries 2/32768、compaction 失效清槽实证、evictions 0）；5s 端到端过；lib/fmt/clippy 净。完整 2h 由主 Agent 直跑测试二进制后台收（绕 cargo 锁） |
 | W2 边界 | ✅ | `cargo test -p tsink --no-fail-fast` 全 target：lib 603 绿+1 基线红+soak ignored，11 个集成文件全绿；fmt/clippy 0 告警 |
-| W3-T1..T5 | ⏳ | 未开始 |
+| W3-T1 | ✅ | 三红测落地（断言红非超时红）：catalog 全量重写被红测实锤（mtime/len 变化）+ delta 目录缺失 + 快路径计数器自证有效（删 catalog→reads>0，有效 catalog→reads==0）。**发现例行 persist 语义**：节流跳过不重试、重试只在下一次发布拍（测试用 `settle_past_catalog_persist_throttle` 错峰）——W3-T4 实装注意。series.bin 计数器 = loader.rs `load_segment_dir_indexed` 分支 cfg(test) thread-local（启动唯一读路径）。remove 制造：3 个 L0 基线段 + 1000ms compaction 拍（50ms 会有 delta 竞态；close 路径 `compact_until_settled` 会吸收 remove 进强制 checkpoint 故不可用）。delta 数量断言（恰 1/恰 2）若 T4 做按拍合并需微调 |
+| W3-T2 | ⏳ | 未开始 |
+| W3-T3 | ⏳ | 未开始 |
+| W3-T4 | ⏳ | 未开始 |
+| W3-T5 | ⏳ | 未开始 |
 | W4-T0..T5 | ⏳ | 未开始 |
 
 ---
