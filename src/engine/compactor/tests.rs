@@ -677,6 +677,175 @@ fn l2_compaction_terminates_when_only_large_segments_remain() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W4-T3（表征绿）：L2 替换 marker 的崩溃幂等重放。计划将 T3 标「红」，但所
+// 测机制（`finalize_pending_compaction_replacements` 对 `<data>/
+// .compaction-replacements/` 内 marker 的启动重放，execution.rs）已存在且
+// level 无关——本测以 L2 形态表征既有行为，预期绿；跑出断言红 = 真实缺陷
+// 登记。W4-T4 让 L2 输出段真实存在后，本测是其崩溃安全网。
+// ---------------------------------------------------------------------------
+
+/// 崩溃时序：压缩已写完输出段、marker 已原子落盘、源段尚未删除时进程死掉。
+/// 启动重放（第一次 finalize）必须把半应用状态收敛到终态：源段全部消失、
+/// 输出段存活、marker 被消费、数据可读且正确；重复调用（marker 已空）必须
+/// Ok 且段集合不变（幂等，目录指纹 mtime+内容逐字节比对）。
+#[test]
+fn l2_compaction_marker_replay_is_idempotent() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-marker-crash")])
+        .unwrap()
+        .series_id;
+
+    // 4 个 L2 源段（段 id 1..=4，各 100 点，ts 首尾相接覆盖 [0, 400)）。
+    write_l2_small_segments(&temp_dir, &registry, series_id, 4);
+
+    // L2 输出段：源段的合并形态（全部 400 点），段 id 1000 避开源 id 空间。
+    // 真实时序里它由压缩在发布 marker 前落盘——直接写盘即「输出已落盘」。
+    let merged_points: Vec<(i64, f64)> = (0..400i64).map(|ts| (ts, ts as f64)).collect();
+    write_level_segment(&temp_dir, 2, 1000, series_id, &registry, &merged_points);
+
+    let mut source_roots = Vec::new();
+    let mut output_root = None;
+    for segment in load_segments_for_level(temp_dir.path(), 2).unwrap() {
+        if segment.manifest.segment_id == 1000 {
+            output_root = Some(segment.root.clone());
+        } else {
+            source_roots.push(segment.root.clone());
+        }
+    }
+    let output_root = output_root.expect("fixture 必须含输出段");
+    assert_eq!(source_roots.len(), 4, "fixture 必须恰好 4 个源段");
+    assert!(
+        source_roots.iter().all(|root| root.exists()),
+        "半应用前置：源段必须在盘"
+    );
+
+    // 半应用 marker：经生产写入路径原样落盘（原子写 + fsync），apply 未执行
+    // ——等价于 marker 写完、apply 前崩溃的真实现场。
+    let marker_path = execution::write_compaction_replacement_marker(
+        temp_dir.path(),
+        &source_roots,
+        std::slice::from_ref(&output_root),
+    )
+    .unwrap();
+    assert!(marker_path.exists(), "半应用前置：marker 必须在盘");
+
+    // 第一次 finalize：启动重放把半应用状态收敛到终态。
+    finalize_pending_compaction_replacements(temp_dir.path()).unwrap();
+
+    for root in &source_roots {
+        assert!(!root.exists(), "源段 {} 必须被重放删除", root.display());
+    }
+    assert!(output_root.exists(), "输出段必须存活");
+    assert!(!marker_path.exists(), "marker 必须被消费");
+    let marker_dir = temp_dir.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    assert_eq!(
+        fs::read_dir(&marker_dir).unwrap().count(),
+        0,
+        "重放后 marker 目录必须为空"
+    );
+
+    // 段集合正确：L2 只剩输出段（id=1000）——本 fixture 输出=源合并形态，
+    // 数据集合相同，只有段集合断言能区分「读到输出段」与「源段未删」。
+    let l2_ids: Vec<u64> = load_segments_for_level(temp_dir.path(), 2)
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.manifest.segment_id)
+        .collect();
+    assert_eq!(l2_ids, vec![1000], "重放后 L2 必须只剩输出段");
+    let points = decoded_numeric_points(temp_dir.path(), series_id);
+    assert_eq!(points.len(), 400, "合并形态 400 点必须全量可读");
+    for (ts, value) in &points {
+        assert_eq!(*value, *ts as f64, "ts={ts} 的值必须保持不变");
+    }
+
+    // 幂等：marker 已空，二次 finalize 必须 Ok 且一切不变（目录指纹
+    // mtime + 内容逐字节比对、源段不复活、marker 目录仍为空）。
+    let output_fingerprint = segment_dir_fingerprint(&output_root);
+    finalize_pending_compaction_replacements(temp_dir.path()).unwrap();
+    assert_eq!(
+        segment_dir_fingerprint(&output_root),
+        output_fingerprint,
+        "二次 finalize 不得触碰存活段（mtime/内容变化）"
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 2).unwrap().len(),
+        1,
+        "二次 finalize 后段集合不得变化"
+    );
+    for root in &source_roots {
+        assert!(!root.exists(), "二次 finalize 后源段不得复活");
+    }
+    assert_eq!(
+        fs::read_dir(&marker_dir).unwrap().count(),
+        0,
+        "二次 finalize 后 marker 目录仍须为空"
+    );
+}
+
+/// 变体（防半写 marker）：截断的 marker JSON。既有语义（execution.rs
+/// `parse_compaction_replacement_marker` 失败经 `?` 向上传播，不跳过）：
+/// finalize 返回 Err 且现场完全不动——源不删、输出不删、损坏 marker 留在
+/// 盘上（不消费，重放保持可重试）。只表征既有行为，不新增要求。
+#[test]
+fn finalize_pending_replacements_rejects_truncated_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-marker-truncated")])
+        .unwrap()
+        .series_id;
+
+    write_l2_small_segments(&temp_dir, &registry, series_id, 2);
+    let merged_points: Vec<(i64, f64)> = (0..200i64).map(|ts| (ts, ts as f64)).collect();
+    write_level_segment(&temp_dir, 2, 1000, series_id, &registry, &merged_points);
+
+    let mut source_roots = Vec::new();
+    let mut output_root = None;
+    for segment in load_segments_for_level(temp_dir.path(), 2).unwrap() {
+        if segment.manifest.segment_id == 1000 {
+            output_root = Some(segment.root.clone());
+        } else {
+            source_roots.push(segment.root.clone());
+        }
+    }
+    let output_root = output_root.expect("fixture 必须含输出段");
+
+    // 手写截断 marker：合法 payload 的前半（半写现场；生产写入是原子替换 +
+    // fsync，该状态只可能来自写路径 bug 或盘损坏——防御性表征）。
+    let marker_dir = temp_dir.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    fs::create_dir_all(&marker_dir).unwrap();
+    let truncated_marker = marker_dir.join("replace-truncated.json");
+    fs::write(
+        &truncated_marker,
+        br#"{"version":1,"source_segments":["segm"#,
+    )
+    .unwrap();
+
+    let result = finalize_pending_compaction_replacements(temp_dir.path());
+    assert!(
+        result.is_err(),
+        "截断 marker 必须报错（既有语义：parse 失败向上传播，不静默跳过）"
+    );
+
+    // 现场完全不动：源段在盘、输出段在盘、损坏 marker 未被消费。
+    for root in &source_roots {
+        assert!(root.exists(), "报错路径不得删除源段 {}", root.display());
+    }
+    assert!(output_root.exists(), "报错路径不得动输出段");
+    assert!(
+        truncated_marker.exists(),
+        "损坏 marker 不得被消费（保持可重试，等后续修复介入）"
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 2).unwrap().len(),
+        3,
+        "报错路径不得改变段集合"
+    );
+}
+
 #[test]
 fn compacts_overlapping_l0_segments_into_l1() {
     let temp_dir = TempDir::new().unwrap();
