@@ -55,6 +55,7 @@
 | W4-T1 | ⏳ | 未开始 |
 | W4-T1 | ✅ | 三红测落地（编译红→stub→断言红）：40 段 fixture（各 100 点、ts=i*100 全局唯一、值=ts 逐点可校验）+ 终止判据（连续 3 轮无进展判静默，上限 200 pass）+ 测 3 红点钉「收敛必须发生」（level==2 对未动输入恒真）。测 2 旋钮 stub 落 **Compactor 侧**（`DEFAULT_L2_TRIGGER=32` + `l2_trigger` 字段 + `with_l2_compaction_trigger`，对齐 l0/l1_trigger 惯例；测试直构 standalone Compactor 不经 StorageBuilder，StorageBuilder 旋钮 T4 随 transition 引入）。**独立证实既有 flaky**：`persistence_recovery::catalog_*` 三测在基线 stash 下 6 轮 2 红且名字不固定（8 线程并发 poll 10s 超时，红跑 ~10.5s vs 绿 ~1.4s）——与 W3-T4/W4-T0 两处观察同因，处理前 lib 全量在 N±1 failed 间波动 |
 | W4-T2 | ⏳ | 未开始 |
+| W4-T2 | ✅ | 两测落地：`l2_compaction_skips_large_segments`（断言红：6×50 点候选须合并消失 + 大段 mtime+内容指纹逐字节不变；budget 注入复用生产旋钮 `with_output_segment_point_budget(800)`→max_input=100，**大/小段取 200/50 点**与边界 100 两侧留距离——对 T4 的 ≤/< 语义不敏感；大段与小段 id 交错排列使「T4 不做过滤」缺陷在指纹断言必然暴露）+ `l2_compaction_terminates_when_only_large_segments_remain`（基线表征绿，判别力 T4 后生效：候选过滤缺失→队首窗口吞大段→compacted==true 或指纹红） |
 | W4-T3 | ⏳ | 未开始 |
 | W4-T4 | ⏳ | 未开始 |
 | W4-T5 | ⏳ | 未开始 |

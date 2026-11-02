@@ -1,8 +1,11 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tempfile::TempDir;
 
@@ -439,6 +442,239 @@ fn l2_compaction_output_level_is_l2() {
             .is_empty(),
         "终层收敛不得把输出写到 L0"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W4-T2（红 + 基线表征）：L2 收敛不做无意义重写（写放大上界）。按 W4-T4
+// 计划语义钉死：候选 = point_count ≤ max_input_points（=
+// output_segment_point_budget/8），触发 = 候选 ≥ 2 且 L2 总段数 > l2_trigger，
+// 窗口 ≤ source_window_segments。
+// - 测 1 `l2_compaction_skips_large_segments`：红态 = 无 L2ToL2 → 小段不合并。
+// - 测 2 `l2_compaction_terminates_when_only_large_segments_remain`：当前必然
+//   绿（基线表征），判别力在 W4-T4 落地后生效——候选过滤缺失会反复重选大段
+//   窗口烧预算，届时指纹断言转红；T4 后必须保持绿。
+// ---------------------------------------------------------------------------
+
+/// budget 注入值：默认 8M 点太大、fixture 写不起，压到 800 → max_input_points
+/// = 100：50 点段为候选、200 点段为大段（与边界 100 保持距离，对 ≤ / < 的
+/// 边界语义不敏感）。
+const W4_T2_OUTPUT_BUDGET: usize = 800;
+/// W4-T4 候选判据：point_count ≤ output_segment_point_budget / 8。
+const W4_T2_MAX_INPUT_POINTS: usize = W4_T2_OUTPUT_BUDGET / 8;
+
+/// W4-T2 共用 fixture：在 L2 写 `specs.len()` 个段（段 id 1..=len），第 i 段
+/// specs[i] 个点，时间窗首尾相接但互不重叠（段 i 覆盖 [cursor, cursor+size)），
+/// 值 = ts as f64（确定性，可逐点校验）。返回总点数（供可读性断言）。
+fn write_l2_segments_of_sizes(
+    temp_dir: &tempfile::TempDir,
+    registry: &SeriesRegistry,
+    series_id: u64,
+    specs: &[usize],
+) -> usize {
+    let mut cursor = 0i64;
+    let mut total_points = 0usize;
+    for (segment_index, &point_count) in specs.iter().enumerate() {
+        let points = (cursor..cursor + point_count as i64)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        write_level_segment(
+            temp_dir,
+            2,
+            segment_index as u64 + 1,
+            series_id,
+            registry,
+            &points,
+        );
+        cursor += point_count as i64;
+        total_points += point_count;
+    }
+    total_points
+}
+
+/// 段目录指纹：(目录树内最新 mtime, 全部文件按相对路径序拼接内容的哈希)。
+/// 目录自身 mtime 一并计入——文件增删即使剩余内容不变也会改变目录 mtime。
+/// 用于断言大段在 L2 收敛中未被重写（mtime + 内容逐字节不变）。
+fn segment_dir_fingerprint(root: &Path) -> (SystemTime, u64) {
+    fn visit(dir: &Path, prefix: &str, newest: &mut SystemTime, hasher: &mut DefaultHasher) {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        paths.sort_unstable();
+        for path in paths {
+            let meta = fs::metadata(&path).unwrap();
+            *newest = (*newest).max(meta.modified().unwrap());
+            let relative = format!("{prefix}{}", path.file_name().unwrap().to_string_lossy());
+            if meta.is_dir() {
+                visit(&path, &format!("{relative}/"), newest, hasher);
+            } else {
+                relative.hash(hasher);
+                let bytes = fs::read(&path).unwrap();
+                hasher.write(&(bytes.len() as u64).to_le_bytes());
+                hasher.write(&bytes);
+            }
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    let mut newest = fs::metadata(root).unwrap().modified().unwrap();
+    visit(root, "", &mut newest, &mut hasher);
+    (newest, hasher.finish())
+}
+
+/// 快照 L2 中全部大段（point_count > max_input_points）的段目录指纹，键 =
+/// segment_id。跑前/跑后各调一次并比对，即可断言大段未被重写。
+fn snapshot_large_segment_fingerprints(
+    base: &Path,
+    max_input_points: usize,
+) -> HashMap<u64, (SystemTime, u64)> {
+    load_segments_for_level(base, 2)
+        .unwrap()
+        .into_iter()
+        .filter(|segment| segment.manifest.point_count > max_input_points)
+        .map(|segment| {
+            (
+                segment.manifest.segment_id,
+                segment_dir_fingerprint(&segment.root),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn l2_compaction_skips_large_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-skip-large")])
+        .unwrap()
+        .series_id;
+
+    // 6 个 50 点小段（候选）与 5 个 200 点大段按段 id 交错排列（1..=11）：
+    // 非重叠路径的窗口按 id 从队首取——若 L2ToL2 不做 max_input_points 过滤，
+    // 队首窗口必然吞进大段；做过滤则窗口只含小段。总段数 11 > l2_trigger=2、
+    // 候选 6 ≥ 2，满足 W4-T4 触发条件。
+    let specs: [usize; 11] = [50, 200, 50, 200, 50, 200, 50, 200, 50, 200, 50];
+    let total_points = write_l2_segments_of_sizes(&temp_dir, &registry, series_id, &specs);
+
+    let large_before = snapshot_large_segment_fingerprints(temp_dir.path(), W4_T2_MAX_INPUT_POINTS);
+    assert_eq!(large_before.len(), 5, "fixture 必须恰好含 5 个大段");
+    let segments_before = load_segments_for_level(temp_dir.path(), 2).unwrap().len();
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    )
+    .with_output_segment_point_budget(W4_T2_OUTPUT_BUDGET)
+    .with_l2_compaction_trigger(2);
+    drive_l2_compaction_to_quiescence(&compactor, 200);
+
+    // 判据 1（红形态收口）：候选小段必须被 L2ToL2 合并消失——段数下降。
+    let segments_after = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert!(
+        segments_after.len() < segments_before,
+        "6 个 50 点小段（候选）必须被 L2ToL2 合并、段数必须从 {segments_before} 下降，\
+         实际 {} 段——红态：L2 是终层，无 L2ToL2 transition，段数不降",
+        segments_after.len()
+    );
+
+    // 判据 2（写放大上界）：大段 mtime 与内容逐字节不变——收敛只准动候选段，
+    // 重写大段 = 重写全部历史数据。
+    let large_after = snapshot_large_segment_fingerprints(temp_dir.path(), W4_T2_MAX_INPUT_POINTS);
+    assert_eq!(
+        large_after.len(),
+        large_before.len(),
+        "大段必须原样保留，不得被删除或替换"
+    );
+    for (segment_id, before) in &large_before {
+        assert_eq!(
+            before,
+            large_after.get(segment_id).expect("大段不得消失"),
+            "大段 segment_id={segment_id} 被 L2 收敛重写（mtime/内容变化）\
+             ——候选过滤（point_count ≤ max_input_points）失效"
+        );
+    }
+
+    // 判据 3：数据完整——小段合并是保数据的，全部点可读、值不变。
+    let points = decoded_numeric_points(temp_dir.path(), series_id);
+    assert_eq!(points.len(), total_points, "全部点必须完整可读");
+    for (ts, value) in &points {
+        assert_eq!(*value, *ts as f64, "ts={ts} 的值必须保持不变");
+    }
+}
+
+#[test]
+fn l2_compaction_terminates_when_only_large_segments_remain() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-large-only")])
+        .unwrap()
+        .series_id;
+
+    // 10 个 200 点大段（point_count 全部 > max_input_points=100），段数 10 >
+    // l2_trigger=2：候选为 0，L2ToL2 永不满足触发。
+    let specs: [usize; 10] = [200; 10];
+    let total_points = write_l2_segments_of_sizes(&temp_dir, &registry, series_id, &specs);
+
+    let large_before = snapshot_large_segment_fingerprints(temp_dir.path(), W4_T2_MAX_INPUT_POINTS);
+    assert_eq!(large_before.len(), 10, "fixture 必须恰好含 10 个大段");
+    let segments_before = load_segments_for_level(temp_dir.path(), 2).unwrap().len();
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    )
+    .with_output_segment_point_budget(W4_T2_OUTPUT_BUDGET)
+    .with_l2_compaction_trigger(2);
+
+    // 有限 pass 内每轮 compacted == false：不得活锁、不得空转重选大段窗口。
+    for pass in 0..50u32 {
+        let stats = compactor.compact_once_with_changes().unwrap().stats;
+        assert!(
+            !stats.compacted,
+            "第 {pass} 轮 pass 压缩了只含大段的 L2——候选过滤（point_count ≤ \
+             max_input_points）失效，写放大上界被突破"
+        );
+    }
+
+    // 大段全部原样（mtime + 内容）、段数不变、无输出泄漏到低层。
+    let large_after = snapshot_large_segment_fingerprints(temp_dir.path(), W4_T2_MAX_INPUT_POINTS);
+    assert_eq!(large_after.len(), large_before.len(), "大段不得消失");
+    for (segment_id, before) in &large_before {
+        assert_eq!(
+            before,
+            large_after.get(segment_id).expect("大段不得消失"),
+            "大段 segment_id={segment_id} 被重写（mtime/内容变化）"
+        );
+    }
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 2).unwrap().len(),
+        segments_before,
+        "只有大段时 L2 段数不得变化"
+    );
+    assert!(load_segments_for_level(temp_dir.path(), 1)
+        .unwrap()
+        .is_empty());
+    assert!(load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .is_empty());
+
+    // 终止后静止语义成立：继续驱动到静止，全程无压缩。
+    let tail = drive_l2_compaction_to_quiescence(&compactor, 10);
+    assert!(
+        tail.iter().all(|stats| !stats.compacted),
+        "50 轮后仍未静止：L2ToL2 在只有大段时反复选中窗口（活锁/空转）"
+    );
+
+    // 数据完整：全部点可读、值不变。
+    let points = decoded_numeric_points(temp_dir.path(), series_id);
+    assert_eq!(points.len(), total_points, "全部点必须完整可读");
+    for (ts, value) in &points {
+        assert_eq!(*value, *ts as f64, "ts={ts} 的值必须保持不变");
+    }
 }
 
 #[test]
