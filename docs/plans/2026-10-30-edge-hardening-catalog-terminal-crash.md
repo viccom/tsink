@@ -39,7 +39,9 @@
 | W1-T2fix | ✅ | D1 修复（segments.rs +21 行，TDD 两红→绿）：open 时同段持久化 marker 托底 `next_seq`（max 文件扫描值, marker.frame+1）+ 三水位 `advance_highwater_floor`（max-only 语义已核）；跨段不托底（帧号每段重计，老段边界由 `discard_unpublished_suffixes` 管）；`published_prefix_len` 真损坏检测原样保留。回归测试 `wal_reopen_after_reset_*` 2 例钉住可用性+静默丢失两态；crash test 4 模式×5 seed 连跑 2 次绿；lib 599 绿+唯一基线红；append 热路径零改动 |
 | W1-T3 | ✅ | 门禁脚本 `scripts/check_crash_consistency.sh`（ITER=20/REPEAT/RUST_LOG 可覆盖，80 轮 6s ≤120s）+ ITER 参数化（缺省 5，非法值 panic）+ storage-engine.md「Crash-Consistency Testing」小节。验收：脚本 3 次连跑绿 + 注入变红有效——**能力边界实证**：字面「跳 fsync」注入门禁仍绿（SIGKILL 不丢 page cache，fsync 防掉电不防进程死），调整为跳 BufWriter flush（字节不出用户态）后门禁正确红（append r0 DataCorruption + 失败现场目录聚合 + 退出码 1），已还原 |
 | W1-T4 | ⏳ | 计划标注可选，默认不做 |
-| W2-T1..T3 | ⏳ | 未开始 |
+| W2-T1 | ✅ | 三红测落地（registry_catalog.rs 底部 `#[cfg(test)] mod`，stub 全 cfg(test) 门控零生产行为改动）：编译红→断言红两段留证；lib 599 绿 + 4 红（3 新 + 1 基线）。契约钉死：capacity=4 插 6 → 终态 len=4 淘汰最旧 2；invalidate 双 map 齐删；series 字节预算超限淘汰。**约定**：内部构造 `with_capacity(entry, series_bytes)` 语义 0=无界（Default 结构性无界）；StorageBuilder 旋钮 0=不缓存仍按计划语义（T2 区分映射）。T2 建议补「命中刷新 touch 序」用例 |
+| W2-T2 | ⏳ | 未开始 |
+| W2-T3 | ⏳ | 未开始 |
 | W3-T1..T5 | ⏳ | 未开始 |
 | W4-T0..T5 | ⏳ | 未开始 |
 

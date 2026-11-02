@@ -63,6 +63,15 @@ pub(super) struct ValidatedRegistryCatalog {
     pub(super) series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
 }
 
+/// W2-T1 stub：恒 0（永不超预算）。真实估算口径（metric/labels 堆字节等）
+/// 由 W2-T2 定，届时由 `get_or_load_series` 的插入/命中路径调用并触发预算淘汰。
+#[cfg(test)]
+#[allow(dead_code)]
+fn estimated_series_bytes(series: &[crate::engine::segment::PersistedSeries]) -> usize {
+    let _ = series;
+    0
+}
+
 /// 段级 catalog entry 缓存（N9b）：段不可变且 segment_id 单调不复用 →
 /// entry 按 root 永久有效。post-flush 维护拍高频构建 catalog 时全量重读
 /// 段 manifest 是 openat 风暴根因（万级段 = 单核 CPU）；集合指纹缓存在
@@ -73,9 +82,61 @@ pub(super) struct ValidatedRegistryCatalog {
 pub(super) struct CatalogEntryCache {
     entries: Mutex<HashMap<PathBuf, Option<PersistedRegistryCatalogEntry>>>,
     series: Mutex<HashMap<PathBuf, Vec<crate::engine::segment::PersistedSeries>>>,
+    // W2-T1 stub 占位字段：容量参数（`0` = 无界，故 `Default` 语义不变）。
+    // 仅测试可见；W2-T2 接线淘汰逻辑时去 cfg 并实现真实消费。
+    #[cfg(test)]
+    #[allow(dead_code)]
+    entry_capacity: usize,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    series_budget_bytes: usize,
 }
 
 impl CatalogEntryCache {
+    // ---- W2-T1 stubs（断言红）：真实淘汰/失效实现归 W2-T2 ----
+
+    /// W2-T1 stub：仅存容量参数，无任何淘汰逻辑。契约：`0` 表示无界——
+    /// `Default`（0, 0）因此保持既有无界行为不变。W2-T2 实现真实淘汰：
+    /// entries 插入后 len > capacity 时按 touch（最近命中）序淘汰至
+    /// `capacity * 3/4`；series 按估算字节预算独立淘汰最旧。
+    #[cfg(test)]
+    fn with_capacity(entry_capacity: usize, series_budget_bytes: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            series: Mutex::new(HashMap::new()),
+            entry_capacity,
+            series_budget_bytes,
+        }
+    }
+
+    /// W2-T1 stub（语义不完整即 stub）：只清 entries、不清 series——
+    /// W2-T2 收口为两个 map 同时移除该 root（含 None/空 Vec 槽）。
+    #[cfg(test)]
+    fn invalidate(&self, root: &Path) {
+        self.entries.lock().remove(root);
+    }
+
+    // `#[cfg(test)]` 观测访问器：红阶段钉断言用，W2-T2 落地后按需保留。
+    #[cfg(test)]
+    fn entries_len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    #[cfg(test)]
+    fn series_len(&self) -> usize {
+        self.series.lock().len()
+    }
+
+    #[cfg(test)]
+    fn entries_contains(&self, root: &Path) -> bool {
+        self.entries.lock().contains_key(root)
+    }
+
+    #[cfg(test)]
+    fn series_contains(&self, root: &Path) -> bool {
+        self.series.lock().contains_key(root)
+    }
+
     fn get_or_build(
         &self,
         source: &PersistedRegistryCatalogSource,
@@ -505,4 +566,249 @@ fn fingerprint_series<'a>(
 fn update_len_prefixed_bytes(hasher: &mut Xxh64, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+/// W2-T1（edge-hardening）：CatalogEntryCache 淘汰与失效语义测试（红）。
+/// 放在本文件而非 tests/persistence_background.rs：`get_or_build` /
+/// `get_or_load_series` 是模块私有方法，子模块测试可直接调用，零可见性改动；
+/// 且这三个用例测的是缓存结构语义（淘汰/失效）而非持久化管线。真实段目录用
+/// SegmentWriter 直接产（manifest 二进制格式不手搓），不需要 storage 实例。
+#[cfg(test)]
+mod catalog_entry_cache_tests {
+    use super::*;
+    use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
+    use crate::engine::durability::WalHighWatermark;
+    use crate::engine::encoder::Encoder;
+    use crate::engine::segment::PersistedSeries;
+    use crate::engine::series::SeriesValueFamily;
+    use crate::value::Value;
+    use tempfile::TempDir;
+
+    /// 产一个真实段目录（manifest.bin + series.bin 全套）：root 由 segment_id
+    /// 确定，manifest 二进制格式不手搓。
+    fn write_numeric_segment(
+        lane_path: &Path,
+        registry: &SeriesRegistry,
+        series_id: SeriesId,
+        segment_id: u64,
+        points: &[(i64, f64)],
+    ) -> PathBuf {
+        let chunk_points = points
+            .iter()
+            .map(|(ts, value)| ChunkPoint {
+                ts: *ts,
+                value: Value::F64(*value),
+            })
+            .collect::<Vec<_>>();
+        let encoded = Encoder::encode_chunk_points(&chunk_points, ValueLane::Numeric).unwrap();
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            vec![Chunk {
+                header: ChunkHeader {
+                    series_id,
+                    lane: ValueLane::Numeric,
+                    value_family: Some(SeriesValueFamily::F64),
+                    point_count: chunk_points.len() as u16,
+                    min_ts: chunk_points.first().unwrap().ts,
+                    max_ts: chunk_points.last().unwrap().ts,
+                    ts_codec: encoded.ts_codec,
+                    value_codec: encoded.value_codec,
+                },
+                points: chunk_points,
+                encoded_payload: encoded.payload,
+                wal_highwater: WalHighWatermark::default(),
+            }],
+        );
+        let writer = SegmentWriter::new(lane_path, 0, segment_id).unwrap();
+        writer.write_segment(registry, &chunks).unwrap();
+        writer.layout().root.clone()
+    }
+
+    fn numeric_source(root: PathBuf) -> PersistedRegistryCatalogSource {
+        PersistedRegistryCatalogSource {
+            lane: SegmentLaneFamily::Numeric,
+            root,
+        }
+    }
+
+    fn resolve_one_series(metric: &str, labels: &[Label], registry: &SeriesRegistry) -> SeriesId {
+        registry
+            .resolve_or_insert(metric, labels)
+            .unwrap()
+            .series_id
+    }
+
+    /// PersistedSeries 未 derive PartialEq：字段级比较。
+    fn assert_series_lists_equal(left: &[PersistedSeries], right: &[PersistedSeries]) {
+        assert_eq!(left.len(), right.len());
+        for (left_series, right_series) in left.iter().zip(right.iter()) {
+            assert_eq!(left_series.series_id, right_series.series_id);
+            assert_eq!(left_series.metric, right_series.metric);
+            assert_eq!(left_series.labels, right_series.labels);
+            assert_eq!(left_series.value_family, right_series.value_family);
+        }
+    }
+
+    /// 目标语义（W2-T2 钉死）：capacity=4 时第 5 次插入触发淘汰至 3（最旧
+    /// root1/root2 出局），第 6 次插入后 len=4 不再触发——终态 len==4；
+    /// 淘汰后再次读取（盘上还在）能正确重建且内容一致。
+    #[test]
+    fn catalog_entry_cache_evicts_oldest_beyond_capacity() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join("numeric");
+        let registry = SeriesRegistry::new();
+        let labels = vec![Label::new("host", "eviction")];
+        let series_id = resolve_one_series("catalog_cache_eviction_metric", &labels, &registry);
+
+        let roots = (1..=6u64)
+            .map(|segment_id| {
+                write_numeric_segment(
+                    &lane_path,
+                    &registry,
+                    series_id,
+                    segment_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let sources = roots
+            .iter()
+            .map(|root| numeric_source(root.clone()))
+            .collect::<Vec<_>>();
+
+        let cache = CatalogEntryCache::with_capacity(4, 0);
+        let mut built = Vec::new();
+        for source in &sources {
+            built.push(
+                cache
+                    .get_or_build(source)
+                    .unwrap()
+                    .expect("real segment root must build an entry"),
+            );
+        }
+
+        assert_eq!(
+            cache.entries_len(),
+            4,
+            "inserting beyond entry capacity must evict down to capacity"
+        );
+        assert!(
+            !cache.entries_contains(&roots[0]),
+            "oldest root #1 must be evicted"
+        );
+        assert!(
+            !cache.entries_contains(&roots[1]),
+            "oldest root #2 must be evicted"
+        );
+        for root in &roots[2..] {
+            assert!(
+                cache.entries_contains(root),
+                "recent roots must stay cached"
+            );
+        }
+
+        let rebuilt = cache
+            .get_or_build(&sources[0])
+            .unwrap()
+            .expect("evicted-but-on-disk root must rebuild");
+        assert_eq!(
+            rebuilt, built[0],
+            "rebuilt entry must match the pre-eviction entry"
+        );
+    }
+
+    /// 目标语义：失效接口同时清 entries 与 series 两个 map（含 None/空 Vec
+    /// 槽）；失效后目录已删 → get_or_build 走磁盘得 None（NotFound 语义），
+    /// 不得复活已失效的槽。
+    #[test]
+    fn catalog_entry_cache_drops_removed_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join("numeric");
+        let registry = SeriesRegistry::new();
+        let labels = vec![Label::new("host", "invalidate")];
+        let series_id = resolve_one_series("catalog_cache_invalidate_metric", &labels, &registry);
+        let root =
+            write_numeric_segment(&lane_path, &registry, series_id, 1, &[(1, 1.0), (2, 2.0)]);
+        let source = numeric_source(root.clone());
+
+        let cache = CatalogEntryCache::with_capacity(0, 0);
+        assert!(cache.get_or_build(&source).unwrap().is_some());
+        assert_eq!(cache.get_or_load_series(&root).unwrap().len(), 1);
+        assert_eq!(cache.entries_len(), 1);
+        assert_eq!(cache.series_len(), 1);
+
+        cache.invalidate(&root);
+
+        assert_eq!(
+            cache.entries_len(),
+            0,
+            "invalidate must drop the entries slot immediately"
+        );
+        assert_eq!(
+            cache.series_len(),
+            0,
+            "invalidate must drop the series slot too"
+        );
+        assert!(!cache.entries_contains(&root));
+        assert!(!cache.series_contains(&root));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            cache.get_or_build(&source).unwrap(),
+            None,
+            "removed root must rebuild to None from disk"
+        );
+        assert_eq!(
+            cache.entries_len(),
+            1,
+            "None (NotFound) is itself a cached outcome"
+        );
+    }
+
+    /// 目标语义：series 缓存按估算字节计上界，超预算按 touch 序淘汰最旧，
+    /// 且不 panic；被淘汰的 root 盘上还在 → 再读能重建出原数据。
+    #[test]
+    fn catalog_series_cache_respects_byte_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join("numeric");
+        let registry = SeriesRegistry::new();
+
+        // 三个段，每段一个独立 series → series.bin 各自非空。
+        let roots = (1..=3u64)
+            .map(|segment_id| {
+                let labels = vec![Label::new("host", format!("budget-{segment_id}"))];
+                let series_id =
+                    resolve_one_series("catalog_series_budget_metric", &labels, &registry);
+                write_numeric_segment(
+                    &lane_path,
+                    &registry,
+                    series_id,
+                    segment_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // 预算给 1 字节：任何真实 series 元数据都超限 → 必须触发淘汰。
+        let cache = CatalogEntryCache::with_capacity(0, 1);
+        let loaded = roots
+            .iter()
+            .map(|root| cache.get_or_load_series(root).unwrap())
+            .collect::<Vec<_>>();
+        assert!(loaded.iter().all(|series| series.len() == 1));
+
+        assert!(
+            cache.series_len() < roots.len(),
+            "series cache must evict beyond the byte budget (len = {})",
+            cache.series_len()
+        );
+        assert!(
+            !cache.series_contains(&roots[0]),
+            "oldest root must be evicted first when over budget"
+        );
+
+        let reloaded = cache.get_or_load_series(&roots[0]).unwrap();
+        assert_series_lists_equal(&reloaded, &loaded[0]);
+    }
 }
