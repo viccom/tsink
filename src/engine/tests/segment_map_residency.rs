@@ -4,9 +4,14 @@
 //! terminations where commit grew monotonically with total segment data
 //! because every live segment's chunk bytes stayed resident forever.
 
-use std::sync::atomic::Ordering;
+use std::fs::File;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::*;
+use crate::engine::storage_engine::metrics::StorageObservabilityCounters;
+use crate::engine::storage_engine::state::SegmentMapRegistry;
+use crate::mmap::create_mmap;
 
 fn persistent_storage_with_mmap_budget(
     root: &Path,
@@ -257,4 +262,107 @@ fn compaction_replacement_releases_source_segment_maps() {
     }
 
     storage.close().unwrap();
+}
+
+/// W4-T0：compaction 先删源段目录、后刷新内存索引，被预算驱逐的槽位在窗口
+/// 内重映射会撞上已删除的 chunks 路径。`get_or_remap` 必须在 NotFound 时按
+/// 注入的 re-resolver（装配层按当前持久化索引实现）重新解析 slot 并重试一次
+/// 装载；解析不到时只重试一次、返回原错误，且每次 NotFound 计入
+/// `persisted_remap_not_found_total`。
+#[test]
+fn segment_map_remap_after_source_deleted_retries_once() {
+    let temp_dir = TempDir::new().unwrap();
+    // Two distinguishable files: the deleted source (40 bytes) and the
+    // replacement the refreshed persisted index points at (80 bytes).
+    let source_path = temp_dir.path().join("source").join("chunks.bin");
+    let replacement_path = temp_dir.path().join("replacement").join("chunks.bin");
+    std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(replacement_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, vec![0u8; 40]).unwrap();
+    std::fs::write(&replacement_path, vec![0u8; 80]).unwrap();
+
+    let observability = Arc::new(StorageObservabilityCounters::default());
+    let registry = SegmentMapRegistry::new(usize::MAX, Arc::clone(&observability));
+    let slot = 7;
+
+    let source_map = Arc::new(create_mmap(File::open(&source_path).unwrap()).unwrap());
+    registry.install(slot, source_path.clone(), source_map);
+    assert!(
+        registry.get_or_remap(slot).unwrap().is_some(),
+        "fixture slot must resolve while its file exists"
+    );
+
+    // Evict the mapping and delete the source file: the registry slot now
+    // points at a path the compactor already removed (the replacement-delete
+    // window), and a re-map hits NotFound.
+    registry.evict_all_for_tests();
+    assert_eq!(registry.resident_count(), 0);
+    std::fs::remove_file(&source_path).unwrap();
+
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let resolver_calls = Arc::clone(&resolver_calls);
+        let replacement_path = replacement_path.clone();
+        registry.set_remap_resolver(Arc::new(move |_slot| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            Some(replacement_path.clone())
+        }));
+    }
+
+    let map = registry
+        .get_or_remap(slot)
+        .unwrap()
+        .expect("re-resolved remap must survive the deleted source path");
+    assert_eq!(
+        map.len(),
+        80,
+        "remap must follow the re-resolved replacement path, not the deleted source"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        1,
+        "a NotFound remap must re-resolve exactly once"
+    );
+    assert_eq!(
+        observability
+            .flush
+            .persisted_remap_not_found_total
+            .load(Ordering::Acquire),
+        1,
+        "each NotFound remap must be counted"
+    );
+
+    // Negative branch: the refreshed index no longer knows the slot either.
+    // The retry must happen exactly once and surface the original error —
+    // a retry loop would drive the resolver call count past two.
+    registry.evict_all_for_tests();
+    std::fs::remove_file(&replacement_path).unwrap();
+    {
+        let resolver_calls = Arc::clone(&resolver_calls);
+        registry.set_remap_resolver(Arc::new(move |_slot| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+    }
+
+    let err = registry
+        .get_or_remap(slot)
+        .err()
+        .expect("remap must fail when the re-resolver also loses the slot");
+    assert!(
+        matches!(&err, TsinkError::IoWithPath { path, .. } if path == &source_path),
+        "the original NotFound must surface when the slot cannot be re-resolved, got {err}"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        2,
+        "the second NotFound must re-resolve exactly once, not loop"
+    );
+    assert_eq!(
+        observability
+            .flush
+            .persisted_remap_not_found_total
+            .load(Ordering::Acquire),
+        2,
+    );
 }

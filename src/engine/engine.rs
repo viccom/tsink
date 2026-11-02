@@ -191,7 +191,9 @@ struct VisibilityState {
 
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
-    persisted_index: RwLock<PersistedIndexState>,
+    /// W4-T0：`Arc` 化以便实例构造完成后把 slot→chunks 重解析器闭包注入
+    /// segment-map registry（闭包捕获同一索引句柄）；读写语义不变。
+    persisted_index: Arc<RwLock<PersistedIndexState>>,
     /// N9b 段级 catalog entry 缓存：post-flush 维护拍高频构建 catalog 时
     /// 段 manifest 重读按 root 缓存（段不可变 → entry 永久有效；compaction
     /// 持续产段的集合渐变下只读新增段）。独立锁，不嵌套任何其他锁。

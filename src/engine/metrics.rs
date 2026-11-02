@@ -269,6 +269,9 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) catalog_delta_replayed_total: AtomicU64,
     pub(super) catalog_delta_apply_fallback_total: AtomicU64,
     pub(super) catalog_delta_fingerprint_fallback_total: AtomicU64,
+    /// W4-T0：被驱逐槽位重映射撞上已删除源段路径（compaction 删源段先于
+    /// 内存索引刷新的窗口）并触发「按当前持久化索引重解析 + 重试一次」的次数。
+    pub(super) persisted_remap_not_found_total: AtomicU64,
     pub(super) tier_moves_total: AtomicU64,
     pub(super) tier_move_errors_total: AtomicU64,
     pub(super) expired_segments_total: AtomicU64,

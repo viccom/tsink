@@ -514,6 +514,11 @@ pub struct FlushObservabilitySnapshot {
     pub catalog_delta_apply_fallback_total: u64,
     #[serde(default)]
     pub catalog_delta_fingerprint_fallback_total: u64,
+    /// W4-T0：查询对被驱逐槽位重映射时命中已删除源段路径（compaction 删源
+    /// 段先于内存索引刷新的窗口）并触发「按当前持久化索引重解析 + 重试一次」
+    /// 的次数。
+    #[serde(default)]
+    pub persisted_remap_not_found_total: u64,
     pub tier_moves_total: u64,
     pub tier_move_errors_total: u64,
     pub expired_segments_total: u64,

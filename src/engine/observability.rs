@@ -237,6 +237,9 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             catalog_delta_fingerprint_fallback_total: counters
                 .catalog_delta_fingerprint_fallback_total
                 .load(Ordering::Relaxed),
+            persisted_remap_not_found_total: counters
+                .persisted_remap_not_found_total
+                .load(Ordering::Relaxed),
             tier_moves_total: counters.tier_moves_total.load(Ordering::Relaxed),
             tier_move_errors_total: counters.tier_move_errors_total.load(Ordering::Relaxed),
             expired_segments_total: counters.expired_segments_total.load(Ordering::Relaxed),

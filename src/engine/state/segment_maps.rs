@@ -29,6 +29,8 @@ use parking_lot::RwLock;
 use crate::mmap::{create_mmap, PlatformMmap};
 use crate::{Result, TsinkError};
 
+use super::super::metrics::StorageObservabilityCounters;
+
 struct SegmentMapEntry {
     chunks_path: PathBuf,
     map: Option<Arc<PlatformMmap>>,
@@ -39,11 +41,19 @@ struct SegmentMapRegistryInner {
     entries: HashMap<usize, SegmentMapEntry>,
 }
 
+/// W4-T0：slot→chunks 路径重解析器。装配层按当前持久化索引实现（替换发生后
+/// 索引里的 root→slot 已指向替换段），在 remap 撞上已删除源段路径时提供
+/// 该 slot 现在应指向的 chunks 路径。
+pub(in crate::engine::storage_engine) type SegmentMapRemapResolver =
+    Arc<dyn Fn(usize) -> Option<PathBuf> + Send + Sync>;
+
 pub(in crate::engine::storage_engine) struct SegmentMapRegistry {
     budget_bytes: usize,
     clock: AtomicU64,
     resident_bytes: AtomicU64,
     inner: RwLock<SegmentMapRegistryInner>,
+    remap_resolver: RwLock<Option<SegmentMapRemapResolver>>,
+    observability: Arc<StorageObservabilityCounters>,
 }
 
 fn map_len_as_u64(map: &PlatformMmap) -> u64 {
@@ -51,7 +61,10 @@ fn map_len_as_u64(map: &PlatformMmap) -> u64 {
 }
 
 impl SegmentMapRegistry {
-    pub(in crate::engine::storage_engine) fn new(budget_bytes: usize) -> Self {
+    pub(in crate::engine::storage_engine) fn new(
+        budget_bytes: usize,
+        observability: Arc<StorageObservabilityCounters>,
+    ) -> Self {
         Self {
             budget_bytes,
             clock: AtomicU64::new(0),
@@ -59,7 +72,18 @@ impl SegmentMapRegistry {
             inner: RwLock::new(SegmentMapRegistryInner {
                 entries: HashMap::new(),
             }),
+            remap_resolver: RwLock::new(None),
+            observability,
         }
+    }
+
+    /// W4-T0：注入 slot→chunks 路径重解析器（装配层在实例构造完成后调用一次）。
+    /// 未注入时 remap 的 NotFound 行为与既往一致（直接报错）。
+    pub(in crate::engine::storage_engine) fn set_remap_resolver(
+        &self,
+        resolver: SegmentMapRemapResolver,
+    ) {
+        *self.remap_resolver.write() = Some(resolver);
     }
 
     /// Cache-held resident bytes. Mirrored into the memory-accounting
@@ -125,7 +149,19 @@ impl SegmentMapRegistry {
 
         // Read the file outside the registry lock so a slow re-map (a full
         // segment read on Windows) cannot stall resident-slot lookups.
-        let map = Arc::new(Self::load_map(&chunks_path)?);
+        let map = match Self::load_map(&chunks_path) {
+            Ok(map) => map,
+            Err(err) => match self.replacement_chunks_path_after_source_not_found(slot, &err) {
+                // Exactly one retry on the re-resolved path; when it also
+                // fails the original error is the faithful report.
+                Some(replacement_path) => match Self::load_map(&replacement_path) {
+                    Ok(map) => map,
+                    Err(_) => return Err(err),
+                },
+                None => return Err(err),
+            },
+        };
+        let map = Arc::new(map);
 
         let mut inner = self.inner.write();
         // The slot may have been removed (replacement) or concurrently
@@ -145,6 +181,36 @@ impl SegmentMapRegistry {
         }
         self.enforce_budget(&mut inner);
         Ok(Some(map))
+    }
+
+    /// W4-T0：compaction 先删源段目录、后刷新内存索引，被预算驱逐的槽位在
+    /// 窗口内重映射会撞上已删除的 chunks 路径。仅当装载报 NotFound 时介入：
+    /// 计数后经注入的 re-resolver 按当前持久化索引重解析该 slot 的 chunks
+    /// 路径，交由调用方重试一次装载。回调与重装载都发生在 registry 锁外
+    /// （调用方可能持有 persisted index 读锁），且 resolver 只 `try_read`，
+    /// 不引入 registry↔index 反向阻塞。
+    fn replacement_chunks_path_after_source_not_found(
+        &self,
+        slot: usize,
+        err: &TsinkError,
+    ) -> Option<PathBuf> {
+        if !Self::is_chunks_file_not_found(err) {
+            return None;
+        }
+        self.observability
+            .flush
+            .persisted_remap_not_found_total
+            .fetch_add(1, Ordering::Relaxed);
+        let resolver = self.remap_resolver.read().as_ref().cloned();
+        resolver.and_then(|resolver| resolver(slot))
+    }
+
+    fn is_chunks_file_not_found(err: &TsinkError) -> bool {
+        matches!(
+            err,
+            TsinkError::IoWithPath { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     fn load_map(chunks_path: &Path) -> Result<PlatformMmap> {
