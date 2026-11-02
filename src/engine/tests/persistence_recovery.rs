@@ -3136,3 +3136,384 @@ fn catalog_forced_checkpoint_writes_full_file() {
         storage.close().unwrap();
     }
 }
+
+// ---- W3-T3（红）：崩溃窗口降级 ------------------------------------------------
+//
+// 崩溃窗盘面不由 close 产生（close 必然强制合并并清 delta，语义见 W3-T2），而是
+// 「实时制造 + 就地捕获 + 回卷重放」：第二开逐轮产 delta 并捕获字节，close 之后
+// 把 catalog 主文件回卷到基线内容、delta 目录按捕获字节复原、合并 marker 移除
+// ——等效于崩溃发生在任何合并/强制 checkpoint 之前。三个子场景只差对盘面的破坏
+// 方式：
+//   1. 删掉 seq 最大的 delta（「段已 rename、delta 未写」）；
+//   2. 最新 delta 内容截断一半（半写）；
+//   3. marker 回拨旧序号 + 已合并 delta 复原（「checkpoint 已写、marker 未更新」，
+//      重开时重复应用）。
+// 红态失败点 = delta 从不出现（前置断言，同 W3-T1/T2）。回退语义的绿态判据：
+// 重开成功 + 全窗逐点一致 + catalog 主文件强制重写为与在盘段对账的正确条目 +
+// 残留 delta 清理；回退计数/告警等可观测项由 W3-T4 接线
+// （`catalog_delta_apply_fallback_total`）。
+
+/// 制造崩溃窗前态：基线 close（checkpoint 只含基线段）→ 第二开逐轮产 delta 并
+/// 就地捕获字节（delta 落盘即不可变，文件名即 seq）→ close（其强制合并产物随后
+/// 由调用方回卷覆盖）。返回（基线 checkpoint 快照, 捕获的 delta（文件名, 字节））。
+fn catalog_delta_crash_window_fixture(
+    data_path: &Path,
+    labels: &[Label],
+    base_metric: &str,
+    delta_metrics: &[&str],
+) -> (CatalogCheckpointSnapshot, Vec<(String, Vec<u8>)>) {
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, base_metric, labels, 1, 4);
+        storage.close().unwrap();
+    }
+    let baseline = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("close must leave a catalog checkpoint on disk");
+
+    let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        for (round, metric) in delta_metrics.iter().enumerate() {
+            insert_catalog_delta_series(&storage, metric, labels, 11 + round as i64 * 10, 4);
+            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+                catalog_delta_files(&delta_dir)
+                    .map(|deltas| deltas.len() > round)
+                    .unwrap_or(false)
+            });
+            assert!(
+                landed,
+                "delta round {round} ({metric}) must land under {} within 10s",
+                delta_dir.display()
+            );
+            let newest = catalog_delta_files(&delta_dir)
+                .unwrap_or_default()
+                .pop()
+                .expect("the delta polled as landed must still be listed");
+            captured.push((
+                newest.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(&newest)
+                    .expect("a landed delta must stay readable while the storage is open"),
+            ));
+        }
+        storage.close().unwrap();
+    }
+    (baseline, captured)
+}
+
+/// 把盘面回卷成「任何合并/强制 checkpoint 之前」的崩溃窗：catalog 主文件回到
+/// 基线内容（不含 delta 段）、delta 目录按捕获字节复原、合并 marker 移除。
+fn rewind_catalog_to_crash_window(
+    data_path: &Path,
+    baseline: &CatalogCheckpointSnapshot,
+    captured: &[(String, Vec<u8>)],
+) {
+    std::fs::write(data_catalog_checkpoint_file(data_path), &baseline.bytes).unwrap();
+    let delta_dir = catalog_delta_dir(data_path);
+    let _ = std::fs::remove_dir_all(&delta_dir);
+    std::fs::create_dir_all(&delta_dir).unwrap();
+    for (name, bytes) in captured {
+        std::fs::write(delta_dir.join(name), bytes).unwrap();
+    }
+}
+
+/// 回退重建后的 catalog 必须是「正确条目」：离开回卷前的陈旧内容，且条目数与
+/// 在盘段数（数值 lane 各层）对账。
+fn assert_catalog_rebuilt_to_on_disk_segments(
+    data_path: &Path,
+    stale: &CatalogCheckpointSnapshot,
+    failures: &mut Vec<String>,
+) {
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let bytes = match std::fs::read(&catalog_file) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            failures.push(format!(
+                "catalog checkpoint {} must stay readable after the fallback rebuild: {err}",
+                catalog_file.display()
+            ));
+            return;
+        }
+    };
+    if bytes == stale.bytes {
+        failures.push(format!(
+            "fallback must force-rewrite the catalog checkpoint {} away from the stale content",
+            catalog_file.display()
+        ));
+    }
+    let on_disk = count_lane_segments_across_levels(&data_path.join(NUMERIC_LANE_ROOT));
+    let carried = catalog_checkpoint_segment_count(&bytes);
+    if carried != on_disk {
+        failures.push(format!(
+            "rebuilt catalog must carry an entry for every on-disk segment: \
+             {carried} entries vs {on_disk} segments"
+        ));
+    }
+}
+
+/// T3-红：最新 delta 缺失（「段已 rename、delta 未写」崩溃窗）→ 重开必须成功并
+/// 回退重建：残留旧 delta 一并清理，全窗数据逐点一致。
+#[test]
+fn catalog_delta_missing_falls_back_to_rebuild() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "fallback")];
+
+    let (baseline, captured) = catalog_delta_crash_window_fixture(
+        data_path,
+        &labels,
+        "catalog-fallback-base",
+        &["catalog-fallback-b", "catalog-fallback-c"],
+    );
+    rewind_catalog_to_crash_window(data_path, &baseline, &captured);
+
+    // 崩溃窗：段已 rename、delta 未写——只删 seq 最大的那个 delta，旧 delta 留存。
+    let newest_name = captured
+        .last()
+        .expect("fixture must capture two deltas")
+        .0
+        .clone();
+    std::fs::remove_file(delta_dir.join(&newest_name)).expect("the newest delta must be removable");
+    let remaining = catalog_delta_files(&delta_dir)
+        .expect("the older delta must stay in place inside the crash window");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "crash window shape: exactly the older delta must remain under {}",
+        delta_dir.display()
+    );
+
+    // 重开：delta 断层不得阻塞启动；回退重建后全窗逐点一致。
+    let storage = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed when the newest delta is missing");
+    assert_catalog_delta_series_window(&storage, "catalog-fallback-base", &labels, 1, 4);
+    assert_catalog_delta_series_window(&storage, "catalog-fallback-b", &labels, 11, 4);
+    assert_catalog_delta_series_window(&storage, "catalog-fallback-c", &labels, 21, 4);
+
+    // 回退语义（绿态判据，W3-T4 实现）：catalog 强制重写 + 残留 delta 清理。
+    let rebuilt_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        std::fs::read(data_catalog_checkpoint_file(data_path))
+            .map(|bytes| bytes != baseline.bytes)
+            .unwrap_or(false)
+    });
+    let cleaned_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        catalog_delta_files(&delta_dir)
+            .map(|deltas| deltas.is_empty())
+            .unwrap_or(true)
+    });
+    let mut failures = Vec::new();
+    if !rebuilt_in_time {
+        failures.push(
+            "fallback must force-rewrite the catalog checkpoint away from the stale baseline \
+             (force_registry_checkpoint after startup)"
+                .to_string(),
+        );
+    }
+    if !cleaned_in_time {
+        failures.push(format!(
+            "fallback must clean the leftover delta(s) under {}",
+            delta_dir.display()
+        ));
+    }
+    if rebuilt_in_time && cleaned_in_time {
+        assert_catalog_rebuilt_to_on_disk_segments(data_path, &baseline, &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "missing-delta fallback expectations failed:\n- {}",
+        failures.join("\n- ")
+    );
+    storage.close().unwrap();
+}
+
+/// T3-红：最新 delta 半写截断 → 重开必须成功并回退重建：损坏 delta 与残留旧
+/// delta 一并清理，全窗数据逐点一致。
+#[test]
+fn catalog_delta_truncated_falls_back_to_rebuild() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "truncated")];
+
+    let (baseline, captured) = catalog_delta_crash_window_fixture(
+        data_path,
+        &labels,
+        "catalog-truncated-base",
+        &["catalog-truncated-b", "catalog-truncated-c"],
+    );
+    rewind_catalog_to_crash_window(data_path, &baseline, &captured);
+
+    // 崩溃窗：最新 delta 半写——内容截断一半（JSON 解析必然失败）。
+    let (newest_name, newest_bytes) = captured.last().expect("fixture must capture two deltas");
+    assert!(
+        newest_bytes.len() >= 4,
+        "delta must be long enough to truncate meaningfully, got {} bytes",
+        newest_bytes.len()
+    );
+    let newest_path = delta_dir.join(newest_name);
+    let mut truncated = newest_bytes.clone();
+    truncated.truncate(truncated.len() / 2);
+    std::fs::write(&newest_path, truncated).expect("truncated delta must be writable");
+    assert_eq!(
+        catalog_delta_files(&delta_dir)
+            .expect("both deltas must stay listed inside the crash window")
+            .len(),
+        2,
+        "crash window shape: the truncated delta must remain on disk"
+    );
+
+    // 重开：损坏 delta 不得阻塞启动；回退重建后全窗逐点一致。
+    let storage = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed when the newest delta is half-written");
+    assert_catalog_delta_series_window(&storage, "catalog-truncated-base", &labels, 1, 4);
+    assert_catalog_delta_series_window(&storage, "catalog-truncated-b", &labels, 11, 4);
+    assert_catalog_delta_series_window(&storage, "catalog-truncated-c", &labels, 21, 4);
+
+    // 回退语义（绿态判据，W3-T4 实现）：catalog 强制重写 + 全部 delta 清理。
+    let rebuilt_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        std::fs::read(data_catalog_checkpoint_file(data_path))
+            .map(|bytes| bytes != baseline.bytes)
+            .unwrap_or(false)
+    });
+    let cleaned_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        catalog_delta_files(&delta_dir)
+            .map(|deltas| deltas.is_empty())
+            .unwrap_or(true)
+    });
+    let mut failures = Vec::new();
+    if !rebuilt_in_time {
+        failures.push(
+            "fallback must force-rewrite the catalog checkpoint away from the stale baseline \
+             (force_registry_checkpoint after startup)"
+                .to_string(),
+        );
+    }
+    if !cleaned_in_time {
+        failures.push(format!(
+            "fallback must clean the truncated delta and the leftover older delta(s) under {}",
+            delta_dir.display()
+        ));
+    }
+    if rebuilt_in_time && cleaned_in_time {
+        assert_catalog_rebuilt_to_on_disk_segments(data_path, &baseline, &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "truncated-delta fallback expectations failed:\n- {}",
+        failures.join("\n- ")
+    );
+    storage.close().unwrap();
+}
+
+/// catalog checkpoint 的 segments 数组按 (lane, level, segment_id) 不得出现重复
+/// 条目——重复应用若非幂等（upsert 退化为追加并落盘），会在这里暴露。
+fn assert_no_duplicate_catalog_entries(catalog_bytes: &[u8]) {
+    let value: serde_json::Value = serde_json::from_slice(catalog_bytes)
+        .expect("catalog checkpoint must stay valid JSON after the delta replay");
+    let segments = value
+        .get("segments")
+        .and_then(serde_json::Value::as_array)
+        .expect("catalog checkpoint must carry a segments array");
+    let mut seen = std::collections::BTreeSet::new();
+    for segment in segments {
+        // serde_json::Value 未实现 Ord（无 `ord` feature），用 JSON 字面串作键。
+        let key = (
+            segment.get("lane").map(serde_json::Value::to_string),
+            segment.get("level").map(serde_json::Value::to_string),
+            segment.get("segment_id").map(serde_json::Value::to_string),
+        );
+        let key = format!("{:?}/{:?}/{:?}", key.0, key.1, key.2);
+        assert!(
+            seen.insert(key.clone()),
+            "catalog must not carry duplicate segment entries after delta replay: {key}"
+        );
+    }
+}
+
+/// T3-红：`_checkpoint.json` 指向旧序号但 checkpoint 内容已合并了这些 delta
+/// （「checkpoint 已写、marker 未更新」崩溃窗）→ 重开时 seq > checkpoint_seq 的
+/// delta 会被重复应用；upsert 幂等要求重开成功、条目无重复、不退化成回退重写。
+#[test]
+fn catalog_delta_stale_checkpoint_replays_idempotently() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let delta_dir = catalog_delta_dir(data_path);
+    let marker = delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+    let labels = vec![Label::new("host", "stale")];
+
+    let (baseline, captured) = catalog_delta_crash_window_fixture(
+        data_path,
+        &labels,
+        "catalog-stale-base",
+        &["catalog-stale-b", "catalog-stale-c"],
+    );
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let consolidated = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("close must leave the consolidated catalog checkpoint on disk");
+    assert_ne!(
+        consolidated.bytes, baseline.bytes,
+        "close must have consolidated the delta segments into the checkpoint"
+    );
+    // 红态前置断言：当前实现没有 `_checkpoint.json`。
+    let marker_seq = catalog_checkpoint_marker_seq(&marker)
+        .expect("close must write _checkpoint.json carrying a numeric checkpoint_seq");
+
+    // 构造「checkpoint 已写、marker 未更新」崩溃窗：marker 回拨到旧序号，已合并
+    // 的 delta 按捕获字节复原（崩溃发生在 marker 更新与 delta 清理之前）。
+    let max_captured_seq = captured
+        .iter()
+        .filter_map(|(name, _)| catalog_delta_seq(Path::new(name)))
+        .max()
+        .expect("captured deltas must carry parseable seqs");
+    let stale_seq = marker_seq.saturating_sub(1);
+    assert!(
+        stale_seq < max_captured_seq,
+        "stale anchor {stale_seq} must trail at least one restored delta \
+         (max captured seq {max_captured_seq}) so the reopen genuinely re-applies deltas"
+    );
+    std::fs::create_dir_all(&delta_dir).expect("delta dir must exist for the crash-window state");
+    std::fs::write(
+        &marker,
+        format!("{{\"version\":2,\"checkpoint_seq\":{stale_seq}}}"),
+    )
+    .expect("stale marker must be writable");
+    for (name, bytes) in &captured {
+        std::fs::write(delta_dir.join(name), bytes).expect("restored delta must be writable");
+    }
+
+    // 重开：重复应用不得产生重复条目，也不得退化成回退重建。
+    let reopened = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed when the checkpoint marker trails the checkpoint content");
+    assert_catalog_delta_series_window(&reopened, "catalog-stale-base", &labels, 1, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-stale-b", &labels, 11, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-stale-c", &labels, 21, 4);
+
+    // 幂等判据：catalog 主文件保持原样（回退重建会强制重写它）；文件内不得出现
+    // 重复段条目。
+    let after = std::fs::read(&catalog_file)
+        .expect("catalog checkpoint must stay readable after the idempotent replay");
+    assert_eq!(
+        after, consolidated.bytes,
+        "idempotent delta replay must validate the reconstructed catalog in place; \
+         a rewrite here means the replay degraded into the fallback rebuild"
+    );
+    assert_no_duplicate_catalog_entries(&after);
+    reopened.close().unwrap();
+}
