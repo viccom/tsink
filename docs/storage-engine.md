@@ -18,11 +18,12 @@ This document describes the internal architecture of the tsink storage engine: h
 10. [On-Disk Segment Format](#on-disk-segment-format)
 11. [LSM-Style Compaction](#lsm-style-compaction)
 12. [Series Registry](#series-registry)
-13. [Query Execution](#query-execution)
-14. [Tiered Storage](#tiered-storage)
-15. [Tombstones and Deletion](#tombstones-and-deletion)
-16. [Memory Budget and Backpressure](#memory-budget-and-backpressure)
-17. [Directory Layout](#directory-layout)
+13. [Segment Catalog](#segment-catalog)
+14. [Query Execution](#query-execution)
+15. [Tiered Storage](#tiered-storage)
+16. [Tombstones and Deletion](#tombstones-and-deletion)
+17. [Memory Budget and Backpressure](#memory-budget-and-backpressure)
+18. [Directory Layout](#directory-layout)
 
 ---
 
@@ -272,7 +273,7 @@ A background thread runs the flush pipeline on a configurable interval (default 
 2. **Write segment files** — group chunks by lane and write a new L0 segment directory using `SegmentWriter`.
 3. **Advance WAL high-watermark** — update `wal.published` to the maximum `wal_highwater` across all flushed chunks.
 4. **Trim WAL** — delete WAL segments entirely behind the new high-watermark.
-5. **Publish persisted catalog** — atomically swap the in-memory persisted index to include the new segment, making it visible to queries.
+5. **Publish persisted catalog** — atomically swap the in-memory persisted index to include the new segment, making it visible to queries. The on-disk side of this publish is the delta append described in [Segment Catalog](#segment-catalog).
 6. **Release memory** — update persisted watermarks so sealed chunks can be evicted to free memory budget.
 
 ---
@@ -395,6 +396,66 @@ Series IDs are `u64` values assigned from a monotonically increasing counter (ba
 
 ---
 
+## Segment Catalog
+
+The persisted segment catalog (`series_index.catalog.json`, JSON, `version: 2`) is a denormalized inventory of every persisted segment root: per segment, the manifest scalars (chunk/point/series counts, time bounds, WAL high-water marks) plus content hashes of the `chunks`, `chunk_index`, `series`, and `postings` files. It lives next to the series registry checkpoint in the data directory; a sibling directory `series_index.catalog.d/` holds the incremental delta log described below. (This file is distinct from the registry's own `series_index.bin` checkpoint.)
+
+The catalog is a derived cache, not a correctness dependency: startup recovery re-derives the whole inventory from the segment directories whenever the catalog is missing, stale, or corrupt. Its payoff at startup is the series fingerprint fast path below — with a valid, fingerprint-carrying catalog the loader skips the per-segment `series.bin` files entirely — and its payoff at runtime is keeping routine persistence `O(changes)` instead of `O(segments)`.
+
+### Checkpoint + delta layout
+
+```text
+series_index.catalog.json          ← full checkpoint (JSON, version 2)
+series_index.catalog.d/
+  {seq:020}.delta.json             ← ordered deltas; seq is contiguous per checkpoint
+  _checkpoint.json                 ← {"version":2,"checkpoint_seq":N}; all changes ≤ N are absorbed into the main file
+```
+
+A delta records one publish tick's root changes:
+
+```json
+{"version":2,"seq":N,"added":[entry...],"removed":["L1/seg-…",...],"series_fingerprint":{...}|null}
+```
+
+`added` entries reuse the checkpoint entry encoding; `removed` lists the merged/deleted segment roots as paths relative to the data directory (external roots degrade to full paths); `series_fingerprint` carries the whole-registry series fingerprint recomputed at write time (`null` when it could not be recomputed — see the fast path).
+
+### Write paths
+
+- **Routine publish — delta append.** Each flush-pipeline publish tick reports the segment roots it added or removed, and the catalog persists exactly that change as one delta file: `O(changes)` work (added entries come from the segment-entry cache, the fingerprint from the series cache), with no throttle applied — a publish tick may be the last chance to persist that change. An empty change set performs no build and no I/O. If the main checkpoint file is absent (first publish on an instance without a builder-written baseline), the tick falls back to writing a full checkpoint, because deltas need an existing checkpoint to replay against. A failed delta write only marks the catalog dirty (retried on the next tick, or absorbed by the threshold-triggered checkpoint below); it never fails the flush.
+- **Merge — threshold-triggered consolidation.** When the count of unabsorbed deltas reaches `catalog_delta_max_count` (default **100**) or their serialized bytes reach `catalog_delta_max_bytes` (default **1 MiB**), the change that crosses the threshold is absorbed into a full checkpoint instead of becoming another delta file: entries are rebuilt from the segment sources, reconciled against the last persisted root set (which also corrects drift from changes the pipeline never reported), the main file is rewritten, `_checkpoint.json` is advanced, and deltas with `seq ≤ checkpoint_seq` are deleted.
+- **Close / explicit checkpoint.** Shutdown and explicit checkpoint anchors always rewrite the main file, advance the marker, and clear deltas, regardless of any throttle.
+
+All writes are atomic (temp file + rename + parent-directory fsync), and the ordering is deliberate: the publish pipeline renames the segment files and fsyncs their directory *before* the delta append, so a crash can only lose the delta for an already-durable segment — never the reverse. Consolidations write the new main file first, then delete the absorbed delta files, then advance the marker; a crash in between leaves a "new main file + old marker" state that startup replay tolerates (already-absorbed changes re-apply idempotently).
+
+### Startup validation and replay
+
+On open, the loader reads `_checkpoint.json` (a missing marker means `checkpoint_seq = 0`, so deltas with `seq ≥ 1` still replay — covering a crash before the first marker write) and reconstructs the catalog view as *main-file entries plus deltas with `seq > checkpoint_seq` applied in order*: `added` upserts by `(lane, level, segment_id)`, `removed` deletes by the parsed segment identity — both idempotent. The delta sequence must be contiguous starting at `checkpoint_seq + 1`. The reconstructed view is then compared against a full scan of the segment directories, exactly as a checkpoint-only validation would be — validation strength does not decrease.
+
+A gap, corrupt file, or version mismatch anywhere in the delta chain discards all deltas and falls back to the existing mismatch path: rebuild the catalog from the segment directories and write a forced checkpoint (counter `catalog_delta_apply_fallback_total`). A successful replay performs zero writes.
+
+### Series fingerprint fast path
+
+Every delta (and the checkpoint) carries a whole-registry series fingerprint. When the validated catalog provides one, startup skips loading the per-segment `series.bin` definitions upfront and verifies the fingerprint afterwards, once the registry is reconstructed: it is compared against the series IDs referenced by the segments' chunk indexes. On match the skip stands; on mismatch — or when the fingerprint is `null`/unrecomputable — startup loads series metadata from every segment instead. Correctness is unchanged either way, only slower (counter `catalog_delta_fingerprint_fallback_total`).
+
+### Observability
+
+`FlushObservabilitySnapshot` exposes six catalog counters (all `serde`-defaulted, so older consumers stay compatible):
+
+| Counter | Meaning |
+|---|---|
+| `catalog_delta_appended_total` | Delta files appended on routine publish ticks |
+| `catalog_delta_bytes_total` | Cumulative serialized delta bytes |
+| `catalog_checkpoint_total` | Full checkpoint writes (cold-path rewrites + merge/forced anchors) |
+| `catalog_delta_replayed_total` | Deltas applied during startup replay |
+| `catalog_delta_apply_fallback_total` | Startup fallbacks triggered by a delta gap/corruption |
+| `catalog_delta_fingerprint_fallback_total` | Startup fast paths disabled for missing fingerprints |
+
+### Crash semantics
+
+The invariant the format guarantees is: a crash at any point leaves the catalog either fully consistent (main file + marker + contiguous deltas) or detectably stale, and staleness always degrades to the segment-directory rebuild — never to lost data or a false validation. The kill-point suite in [Crash-Consistency Testing](#crash-consistency-testing) exercises these windows end-to-end by SIGKILLing real processes during flush activity and reopening, which covers mid-append deltas, mid-merge states, and marker/delta skew.
+
+---
+
 ## Query Execution
 
 A query traverses four data sources in order and merges the results:
@@ -506,6 +567,8 @@ A fully configured storage instance on disk:
     L0/  L1/  L2/        ← same structure, blob-lane segments
   series_index.bin       ← series registry full checkpoint
   series_index.delta.d/  ← incremental registry deltas
+  series_index.catalog.json    ← segment catalog checkpoint
+  series_index.catalog.d/      ← segment catalog deltas + _checkpoint.json marker
   tombstones.store/      ← sharded tombstone records
   tsink.lock             ← exclusive process lock (prevents double-open)
 ```
