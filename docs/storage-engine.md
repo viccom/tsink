@@ -10,18 +10,19 @@ This document describes the internal architecture of the tsink storage engine: h
 2. [Data Types and Value Lanes](#data-types-and-value-lanes)
 3. [Write Path](#write-path)
 4. [Write-Ahead Log (WAL)](#write-ahead-log-wal)
-5. [In-Memory Write Buffer](#in-memory-write-buffer)
-6. [Chunks and Encoding](#chunks-and-encoding)
-7. [Encoding Codecs](#encoding-codecs)
-8. [Flush Pipeline](#flush-pipeline)
-9. [On-Disk Segment Format](#on-disk-segment-format)
-10. [LSM-Style Compaction](#lsm-style-compaction)
-11. [Series Registry](#series-registry)
-12. [Query Execution](#query-execution)
-13. [Tiered Storage](#tiered-storage)
-14. [Tombstones and Deletion](#tombstones-and-deletion)
-15. [Memory Budget and Backpressure](#memory-budget-and-backpressure)
-16. [Directory Layout](#directory-layout)
+5. [Crash-Consistency Testing](#crash-consistency-testing)
+6. [In-Memory Write Buffer](#in-memory-write-buffer)
+7. [Chunks and Encoding](#chunks-and-encoding)
+8. [Encoding Codecs](#encoding-codecs)
+9. [Flush Pipeline](#flush-pipeline)
+10. [On-Disk Segment Format](#on-disk-segment-format)
+11. [LSM-Style Compaction](#lsm-style-compaction)
+12. [Series Registry](#series-registry)
+13. [Query Execution](#query-execution)
+14. [Tiered Storage](#tiered-storage)
+15. [Tombstones and Deletion](#tombstones-and-deletion)
+16. [Memory Budget and Backpressure](#memory-budget-and-backpressure)
+17. [Directory Layout](#directory-layout)
 
 ---
 
@@ -131,6 +132,53 @@ A separate file `wal.published` records the highest `(segment, frame)` pair that
 | `Salvage` | Skips corrupted frames whose boundaries are intact; quarantines the corrupt segment and continues from the next. |
 
 On open, if the last active segment is found corrupt, it is quarantined (left in place) and a fresh segment is started.
+
+---
+
+## Crash-Consistency Testing
+
+The `PerAppend` durability contract above is enforced empirically by `tests/crash_consistency_test.rs`: the test repeatedly SIGKILLs real storage processes at each kill point, reopens the directory, and verifies that every acknowledged write survived intact. It exists to catch WAL/segment/compaction defects that unit tests with simulated failures miss (e.g. frame-number collisions between a killed process and its reopening successor).
+
+### How to run
+
+```bash
+# Quick sweep: 5 rounds per kill mode (4 modes = 20 crash/reopen cycles), ~6 s.
+cargo test --test crash_consistency_test
+
+# Gate script: 20 rounds per mode (80 cycles), ~6 s; fails on any violation.
+scripts/check_crash_consistency.sh            # env: ITER (default 20), REPEAT (default 1), RUST_LOG (default warn)
+ITER=40 REPEAT=2 scripts/check_crash_consistency.sh
+```
+
+`ITER` (environment variable) sets the rounds **per kill mode**; round `i` of every mode runs with seed `SEED_BASE + i` (`0xA5A5_0001 + i`), which drives a SplitMix64-derived kill delay, so sweeps are reproducible. `ITER=0` or a non-numeric value panics — a misconfigured crash gate must fail, not silently shrink the sweep.
+
+Do **not** add `--ignored --exact crash_child_mode` to the cargo invocation. That argv belongs to the parent test itself, which re-executes the test binary to spawn its killable child processes; passing it to cargo runs only the ignored child entry point and skips the actual gate.
+
+### The four kill points
+
+| Mode | Child behavior | Crash window targeted |
+|---|---|---|
+| `append` | Write storm under `WalSyncMode::PerAppend` | Anywhere inside the WAL append path (mid-frame write, between frame append and fsync, mid-ack bookkeeping) |
+| `flush` | Epochs of `open(50 ms flush interval)` → write → `close()` | Mid-write, mid background-flush, or mid-close (segment write/rename) |
+| `compact` | 8 tiny L0 segments preseeded, then churn under a 50 ms compaction interval with continuous writes | Mid marker application or mid source-segment deletion (`.compaction-replacements/` handling) |
+| `recover` | Two children: (a) write storm killed mid-append leaving a WAL tail; (b) the `open()` that replays that tail, killed after a short 20–80 ms delay | Binary startup / WAL replay of the unflushed tail; each round reports whether the kill landed before or after replay finished |
+
+### What is asserted
+
+After every kill, the parent reopens the directory and checks:
+
+1. **Acked writes survive exactly** — every point acknowledged by the child before the kill (per an fsync'd intent/ack journal) is readable exactly once with the exact expected value.
+2. **No duplicates** — a full scan finds no duplicated `(dev, ts)` pairs, and every stored point has the correct value.
+3. **Reopen chain holds** — `close()` after the crash reopen succeeds, and two further open/close cycles preserve the data.
+4. **Segment integrity (compact only)** — no segment directory exists without a `manifest`, mirroring the loader's scan.
+
+The journal parser tolerates a torn final line (SIGKILL can race the last append); a corrupt line anywhere else fails the round.
+
+### Failure artifacts
+
+A round that fails keeps its on-disk state for diagnosis at `/tmp/tsink-crash-w1t2-<mode>-<seed:08x>-<round>/` (`data/` plus the child's journal and logs); the gate script prints the newest such directories on failure. Rounds that pass delete their directory, so a tidy `/tmp` means the last run was clean.
+
+> **Note on `close()` vs `flush()`**: the public `Storage` trait has no `flush()`; the durability drain is exercised via `close()` (which seals and flushes before shutdown). The `flush`/`compact` modes additionally run with a 50 ms background flush/compaction interval so kill points inside the flush pipeline are reachable without close.
 
 ---
 

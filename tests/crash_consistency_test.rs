@@ -77,14 +77,15 @@ const TS_BASE: i64 = 1_700_000_000;
 const BATCH_SIZE: usize = 8;
 /// Runaway guard only; the child is normally ended by the parent's SIGKILL.
 const MAX_BATCHES: u64 = 1_000_000;
-/// Fixed seeds so the whole run is reproducible.
-const SEEDS: [u64; 5] = [
-    0xA5A5_0001,
-    0xA5A5_0002,
-    0xA5A5_0003,
-    0xA5A5_0004,
-    0xA5A5_0005,
-];
+/// Base of the deterministic seed sequence: round `i` of a mode runs with
+/// seed `SEED_BASE + i`, so SplitMix64 keeps the kill delays distinct across
+/// rounds while the whole sweep stays reproducible.
+const SEED_BASE: u64 = 0xA5A5_0001;
+/// Rounds per kill mode when `ITER` is unset: keeps a plain `cargo test`
+/// fast while still sweeping every kill point.
+const DEFAULT_ITER: u64 = 5;
+/// Parent-only knob sizing the seed sweep (rounds per kill mode).
+const ENV_ITER: &str = "ITER";
 /// All kill modes, one full seed sweep each.
 const MODES: [&str; 4] = ["append", "flush", "compact", "recover"];
 /// Tiny L0 segments preseeded before the compact churn loop (plan: >= 6).
@@ -191,6 +192,26 @@ fn open_journal(journal_path: &Path) -> File {
         .append(true)
         .open(journal_path)
         .expect("open crash journal")
+}
+
+/// Rounds per kill mode: the `ITER` environment variable, `DEFAULT_ITER`
+/// when unset. A value that fails to parse or is `0` panics loudly — a
+/// misconfigured crash gate must fail, not silently shrink the sweep.
+fn iter_count() -> u64 {
+    match env::var(ENV_ITER) {
+        Err(env::VarError::NotPresent) => DEFAULT_ITER,
+        Ok(raw) => {
+            let rounds = raw.parse::<u64>().unwrap_or_else(|err| {
+                panic!("{ENV_ITER}={raw:?} is not a valid round count: {err}")
+            });
+            assert!(
+                rounds > 0,
+                "{ENV_ITER}={raw:?} must be a positive round count (>= 1)"
+            );
+            rounds
+        }
+        Err(err) => panic!("reading {ENV_ITER}: {err}"),
+    }
 }
 
 fn parse_child_mode() -> CrashMode {
@@ -365,9 +386,11 @@ fn recover_open_child(data_dir: &Path) {
 
 #[test]
 fn crash_kill_reopens_with_acked_rows_intact() {
+    let rounds = iter_count();
     for mode in MODES {
-        for (round, &seed) in SEEDS.iter().enumerate() {
-            run_crash_round(mode, round, seed);
+        for round in 0..rounds {
+            let seed = SEED_BASE + round;
+            run_crash_round(mode, round as usize, seed);
         }
     }
 }

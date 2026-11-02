@@ -37,7 +37,7 @@
 | W1-T1 | ✅ | harness 骨架 + 子进程协议 5 轮绿（连跑 3 次稳定）；**偏离**：计划锚点 `flush()` 失效——`Storage` trait 无 flush（storage.rs:627-1074），门禁改用 `close()`（完整持久化排空）+ 二次重开，T2+ 沿用 |
 | W1-T2 | ✅ | 四杀点落地（append/flush/compact/recover × 5 seed）；**发现真实缺陷 D1**（不在计划预计三候选内）：干净 close/reopen 周期后中途被杀 → WAL 帧号回卷碰撞 published marker → 重开硬失败 `WAL publish boundary frame N is missing`（flush 2/5、compact 1/5 确定性复现；append/recover 绿）→ 已登记 **W1-T2fix**；`.tmp-seg-*` 残留现场捕获 1 例（按计划不断言只登记）；目录扫描口径为 lane 感知 `<data>/lane_*/segments/L*/`（简报 `<data>/segments/` 不准） |
 | W1-T2fix | ✅ | D1 修复（segments.rs +21 行，TDD 两红→绿）：open 时同段持久化 marker 托底 `next_seq`（max 文件扫描值, marker.frame+1）+ 三水位 `advance_highwater_floor`（max-only 语义已核）；跨段不托底（帧号每段重计，老段边界由 `discard_unpublished_suffixes` 管）；`published_prefix_len` 真损坏检测原样保留。回归测试 `wal_reopen_after_reset_*` 2 例钉住可用性+静默丢失两态；crash test 4 模式×5 seed 连跑 2 次绿；lib 599 绿+唯一基线红；append 热路径零改动 |
-| W1-T3 | ⏳ | 未开始（须待 W1-T2fix 转绿——脚本验收要求连跑 3 次全绿） |
+| W1-T3 | ✅ | 门禁脚本 `scripts/check_crash_consistency.sh`（ITER=20/REPEAT/RUST_LOG 可覆盖，80 轮 6s ≤120s）+ ITER 参数化（缺省 5，非法值 panic）+ storage-engine.md「Crash-Consistency Testing」小节。验收：脚本 3 次连跑绿 + 注入变红有效——**能力边界实证**：字面「跳 fsync」注入门禁仍绿（SIGKILL 不丢 page cache，fsync 防掉电不防进程死），调整为跳 BufWriter flush（字节不出用户态）后门禁正确红（append r0 DataCorruption + 失败现场目录聚合 + 退出码 1），已还原 |
 | W1-T4 | ⏳ | 计划标注可选，默认不做 |
 | W2-T1..T3 | ⏳ | 未开始 |
 | W3-T1..T5 | ⏳ | 未开始 |
