@@ -35,8 +35,9 @@
 | 任务 | 状态 | 备注 |
 |---|---|---|
 | W1-T1 | ✅ | harness 骨架 + 子进程协议 5 轮绿（连跑 3 次稳定）；**偏离**：计划锚点 `flush()` 失效——`Storage` trait 无 flush（storage.rs:627-1074），门禁改用 `close()`（完整持久化排空）+ 二次重开，T2+ 沿用 |
-| W1-T2 | ⏳ | 未开始 |
-| W1-T3 | ⏳ | 未开始 |
+| W1-T2 | ✅ | 四杀点落地（append/flush/compact/recover × 5 seed）；**发现真实缺陷 D1**（不在计划预计三候选内）：干净 close/reopen 周期后中途被杀 → WAL 帧号回卷碰撞 published marker → 重开硬失败 `WAL publish boundary frame N is missing`（flush 2/5、compact 1/5 确定性复现；append/recover 绿）→ 已登记 **W1-T2fix**；`.tmp-seg-*` 残留现场捕获 1 例（按计划不断言只登记）；目录扫描口径为 lane 感知 `<data>/lane_*/segments/L*/`（简报 `<data>/segments/` 不准） |
+| W1-T2fix | ⏳ | **D1 修复**：WAL publish-boundary 帧号回卷——`reset_locked`（wal/segments.rs:231-291）截断后 marker=appended 高水位，open 的 `next_seq`（segments.rs:157）只取文件内容未被持久化 marker 托底；`ensure_min_next_seq`/`ensure_min_highwater`（:309/:442-445 floor）生产接线缺失（唯一调用 `bootstrap/wal_open.rs:23` 传 replay 派生水位≈(0,0)，floor 空转）。风险两态：可用性（重开失败）+ 正确性变体（新帧 ≤marker 被当作已发布 → acked 数据静默丢失）。修复须 TDD：红=crash test flush/compact 模式，验收=4 模式×5 seed 连跑 2 次全绿 + 597 lib 不新增红 |
+| W1-T3 | ⏳ | 未开始（须待 W1-T2fix 转绿——脚本验收要求连跑 3 次全绿） |
 | W1-T4 | ⏳ | 计划标注可选，默认不做 |
 | W2-T1..T3 | ⏳ | 未开始 |
 | W3-T1..T5 | ⏳ | 未开始 |
