@@ -874,6 +874,140 @@ fn wal_reset_preserves_monotonic_sequence() {
     assert_eq!(wal.current_durable_highwater().frame, 2);
 }
 
+/// Regression: after a reset-style checkpoint (truncate the active WAL while the
+/// publish marker retains the pre-reset highwater) plus a reopen, appended frames
+/// must stay strictly above the persisted marker. `FramedWal::open` recomputes
+/// `next_seq` from file contents only, so a truncated file restarts frames at 1
+/// and the next crash leaves a WAL whose frames collide with the published
+/// boundary — the directory then fails to open with "publish boundary frame N is
+/// missing" (crash_consistency_test W1 flush/compact kill points).
+#[test]
+fn wal_reopen_after_reset_keeps_frame_seq_above_published_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    let marker_frame = 12u64;
+
+    {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        for series_id in 0..marker_frame {
+            wal.append_series_definition(&SeriesDefinitionFrame {
+                series_id,
+                metric: format!("cpu_{series_id}"),
+                labels: vec![Label::new("host", "a")],
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            wal.current_highwater(),
+            WalHighWatermark {
+                segment: 0,
+                frame: marker_frame
+            }
+        );
+        wal.reset().unwrap();
+        assert_eq!(
+            wal.current_published_highwater(),
+            WalHighWatermark {
+                segment: 0,
+                frame: marker_frame
+            }
+        );
+        assert_eq!(scan_last_seq(&wal.path()).unwrap(), 0);
+    }
+
+    // Reopen after the reset: the empty file carries no frame history, so the
+    // persisted marker is the only record of the consumed frame range.
+    {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        assert_eq!(
+            wal.current_published_highwater(),
+            WalHighWatermark {
+                segment: 0,
+                frame: marker_frame
+            }
+        );
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 900,
+            metric: "post_reset".to_string(),
+            labels: vec![Label::new("host", "c")],
+        })
+        .unwrap();
+        let appended_seq = scan_last_seq(&wal.path()).unwrap();
+        assert!(
+            appended_seq > marker_frame,
+            "frame appended after reset/reopen must sit above the published marker \
+             {marker_frame}, got seq {appended_seq}"
+        );
+    }
+
+    // The next open (crash recovery) must not trip over the publish boundary.
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let replay = wal
+        .replay_frames_after(WalHighWatermark {
+            segment: 0,
+            frame: marker_frame,
+        })
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+}
+
+/// Correctness twin of the collision regression: a post-reset write must not be
+/// swallowed by the stale publish marker. While new frame seqs collide with the
+/// marker, the publication pipeline treats the new commit as already published
+/// (the marker does not advance) and a replay from the checkpoint highwater —
+/// what a persisted L0 manifest records — silently skips the acked write.
+#[test]
+fn wal_reopen_after_reset_does_not_treat_new_writes_as_published() {
+    let temp_dir = TempDir::new().unwrap();
+    let marker_frame = 6u64;
+
+    {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        for series_id in 0..marker_frame {
+            wal.append_series_definition(&SeriesDefinitionFrame {
+                series_id,
+                metric: format!("cpu_{series_id}"),
+                labels: vec![Label::new("host", "a")],
+            })
+            .unwrap();
+        }
+        wal.reset().unwrap();
+    }
+
+    {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 77,
+            metric: "post_reset".to_string(),
+            labels: vec![Label::new("host", "b")],
+        })
+        .unwrap();
+        let published = wal.current_published_highwater();
+        assert!(
+            published
+                > WalHighWatermark {
+                    segment: 0,
+                    frame: marker_frame
+                },
+            "post-reset commit must be published above the stale marker, got {published:?}"
+        );
+    }
+
+    // Replaying from the checkpoint highwater must surface the post-reset write
+    // instead of skipping it as already published.
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let replay = wal
+        .replay_frames_after(WalHighWatermark {
+            segment: 0,
+            frame: marker_frame,
+        })
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert!(
+        matches!(replay[0], ReplayFrame::SeriesDefinition(ref def) if def.series_id == 77),
+        "post-reset write must survive replay from the checkpoint highwater"
+    );
+}
+
 #[test]
 fn ensure_min_next_seq_sets_sequence_floor() {
     let temp_dir = TempDir::new().unwrap();

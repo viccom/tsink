@@ -117,6 +117,17 @@ impl FramedWal {
         let mut active_last_seq = recovery.active_segment_last_seq;
         let last_highwater = recovery.last_highwater;
 
+        // The persisted publish marker is a floor on frame numbering in its own
+        // segment: reset-style checkpoints truncate the active WAL while the
+        // marker retains the pre-reset highwater, so an empty file carries no
+        // record of the consumed frame range. Frames restart at 1 in every new
+        // segment, so a marker in any older segment imposes no constraint here.
+        let published_frame_floor = existing_published_highwater
+            .filter(|marker| marker.segment == active.id)
+            .map(|marker| marker.frame.saturating_add(1))
+            .unwrap_or_default();
+        active_last_seq = active_last_seq.max(published_frame_floor);
+
         let published_highwater = existing_published_highwater.unwrap_or(last_highwater);
         let writer_file = if recovery.quarantine_active_segment {
             let quarantined_segment = active.id;
@@ -171,6 +182,16 @@ impl FramedWal {
             #[cfg(test)]
             cached_series_definition_rebuild_hook: Mutex::new(None),
         };
+
+        // Same-segment markers also floor the runtime watermarks: the frames the
+        // marker covers were appended and made durable before the checkpoint that
+        // removed them, so recovery must stay monotonic with the pre-crash state
+        // (a clean `reset` leaves all three watermarks at the marker).
+        if let Some(marker) = existing_published_highwater {
+            if marker.segment == active.id {
+                wal.advance_highwater_floor(marker);
+            }
+        }
 
         if existing_published_highwater.is_none() {
             wal.persist_published_highwater(published_highwater, true)?;
