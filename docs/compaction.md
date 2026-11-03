@@ -195,6 +195,25 @@ which replays all pending markers in sorted order, completing any interrupted
 replacements. An output-side manifest must exist for the replacement to be applied; if
 it does not, the replacement is treated as a corruption error.
 
+### Known read window between step 3 and the index refresh
+
+Step 3 deletes the source segment directories, but the in-memory persisted index is only
+updated on the next maintenance tick (`apply_persisted_catalog_transition_phase`). That
+leaves a short window in which the index still references a source segment whose files
+are gone. A query that reaches that segment inside the window and whose chunk mapping was
+already evicted by the mmap budget fails with `NotFound` instead of returning data — the
+query is transiently rejected, never silently wrong, and a retry once the index has
+refreshed succeeds.
+
+`SegmentMapRemapResolver` (W4-T0) does not close this window: slots are assigned
+monotonically and never re-bound (`install.rs`), so re-resolving a slot against the
+still-stale index yields the same deleted path. The counter
+`persisted_remap_not_found_total` therefore measures *how often the window is hit*, not
+how often it was repaired. Two ways to shrink the window exist — defer source deletion
+into a hidden staging directory until after the index refresh, or tolerate the error at
+the query layer — neither is implemented today; closing it is tracked as review item C-3
+in `docs/research/2026-11-03-edge-hardening-review.md`.
+
 ---
 
 ## Background thread
