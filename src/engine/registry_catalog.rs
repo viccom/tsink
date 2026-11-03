@@ -272,8 +272,12 @@ impl<V: Clone> CatalogLruMap<V> {
     }
 
     /// 超限批量淘汰（插入路径调用）：一次按 touch 升序扫描，同时朝
-    /// count `capacity * 3/4` 与 bytes `budget * 3/4` 两个水位收敛；摊还
-    /// O(1)/插入。任何时刻至少保留 1 条（touch 最新的刚插入条目不淘汰）——
+    /// count `capacity - capacity/4` 与 bytes `budget - budget/4` 两个水位
+    /// 收敛；摊还 O(1)/插入。水位取**向上取整的 3/4**（`x - x/4` 恒等于
+    /// `ceil(3x/4)`），不用 `x/4*3`（先除后乘，非 4 倍数容量下偏低、最多少
+    /// 2 条 → 过度淘汰），也不用 `x*3/4` 的饱和乘法（`usize::MAX` 时饱和到
+    /// 4.6e18 而非真实的 1.38e19，同样过度淘汰）；`x - x/4` 对任意 `x` 无溢出。
+    /// 任何时刻至少保留 1 条（touch 最新的刚插入条目不淘汰）——
     /// 单条目超预算时宁可越界也不全清，全清会让下次读取必然 miss，重演
     /// N9 修掉的重读风暴。
     fn evict_over_limit(&self, slots: &mut HashMap<PathBuf, CatalogCacheSlot<V>>) {
@@ -283,8 +287,8 @@ impl<V: Clone> CatalogLruMap<V> {
         if !count_over && !bytes_over {
             return;
         }
-        let count_water_mark = (self.capacity / 4 * 3).max(1);
-        let bytes_water_mark = self.budget_bytes / 4 * 3;
+        let count_water_mark = self.capacity - self.capacity / 4;
+        let bytes_water_mark = self.budget_bytes - self.budget_bytes / 4;
         let mut used_bytes = self.used_bytes.load(Ordering::Relaxed);
         let mut by_touch = slots
             .iter()
@@ -1765,5 +1769,65 @@ mod catalog_entry_cache_tests {
 
         let reloaded = cache.get_or_load_series(&roots[0]).unwrap();
         assert_series_lists_equal(&reloaded, &loaded[0]);
+    }
+
+    /// 造 `capacity + 1` 个真实段并全部插入条数有界缓存（无字节预算），返回
+    /// 超限淘汰后的驻留条数。
+    fn insert_overflowing_by_count(capacity: usize) -> usize {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join("numeric");
+        let registry = SeriesRegistry::new();
+        let labels = vec![Label::new("host", format!("watermark-{capacity}"))];
+        let series_id = resolve_one_series("catalog_cache_watermark_metric", &labels, &registry);
+        let sources = (1..=capacity as u64 + 1)
+            .map(|segment_id| {
+                numeric_source(write_numeric_segment(
+                    &lane_path,
+                    &registry,
+                    series_id,
+                    segment_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let cache = CatalogEntryCache::with_capacity(capacity, 0);
+        for source in &sources {
+            cache
+                .get_or_build(source)
+                .unwrap()
+                .expect("real segment root must build an entry");
+        }
+        cache.entries_len()
+    }
+
+    /// 淘汰水位必须是 ceil(3/4) = `capacity - capacity/4`：`capacity/4*3`
+    /// 先除后乘，在非 4 倍数容量下偏低（最多少 2 条），导致过度淘汰。
+    #[test]
+    fn catalog_cache_eviction_watermark_is_three_quarters() {
+        let mut mismatches = Vec::new();
+        for capacity in [5usize, 6, 7, 10, 11] {
+            let expected = capacity - capacity / 4;
+            let actual = insert_overflowing_by_count(capacity);
+            if actual != expected {
+                mismatches.push(format!(
+                    "capacity={capacity}: expected {expected} (capacity - capacity/4), \
+                     got {actual} (capacity/4*3 = {})",
+                    capacity / 4 * 3
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "eviction must stop at the ceil(3/4) watermark:\n{}",
+            mismatches.join("\n")
+        );
+
+        // 极小容量：cap=2 的 3/4 水位是 2，插入第 3 条后必须仍留 2 条；
+        // `2/4*3 = 0 → max(1)` 会一次性清到只剩 1 条，越过水位。
+        let tiny = insert_overflowing_by_count(2);
+        assert_eq!(
+            tiny, 2,
+            "capacity=2 must keep 2 slots (ceil(3/4) watermark), not collapse to 1"
+        );
     }
 }

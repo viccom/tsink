@@ -325,7 +325,7 @@ let storage = StorageBuilder::new()
     .build()?
 ```
 
-Both caches are LRU (touch-order refresh, bulk eviction to a 3/4 watermark), and applying removal tombstones to the persisted index invalidates the affected segments' slots immediately.
+Both caches are LRU (touch-order refresh, bulk eviction to a 3/4 watermark), and applying removal tombstones to the persisted index invalidates the affected segments' slots immediately. The watermark is computed as `limit - limit / 4` — the rounded-up 3/4 (`ceil(3·limit/4)`, identical to the exact 3/4 for multiples of 4), which avoids the downward bias of integer division; `limit / 4 * 3` would evict too far for capacities that are not multiples of 4 (by up to 2 slots).
 
 ### Recommended values
 
