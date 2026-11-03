@@ -128,8 +128,7 @@ impl ChunkStorage {
             .catalog_persist_attempts_total
             .fetch_add(1, Ordering::Relaxed);
         match outcome {
-            registry_catalog::CatalogPersistOutcome::Persisted
-            | registry_catalog::CatalogPersistOutcome::CheckpointConsolidated => {
+            registry_catalog::CatalogPersistOutcome::Persisted => {
                 self.observability
                     .flush
                     .catalog_persisted_total

@@ -52,6 +52,83 @@ fn invoke_directory_sync_hook(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 测试用注入点：让 `write_tmp_and_sync` 在**已创建 tmp 文件之后**写失败，
+/// 以验证失败分支的 tmp 清理（ENOSPC/EIO 等真实注入无法可靠构造）。
+/// 钩子按**目标路径**匹配，只影响本测试自己的目标文件，不影响并行测试的
+/// tmp 写入。
+#[cfg(test)]
+type TmpWriteFailureHook = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static;
+
+#[cfg(test)]
+pub(crate) struct TmpWriteFailureHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TmpWriteFailureHookGuard {
+    fn drop(&mut self) {
+        *tmp_write_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn tmp_write_hook_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc<TmpWriteFailureHook>>> {
+    static TMP_WRITE_HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<TmpWriteFailureHook>>>,
+    > = std::sync::OnceLock::new();
+    TMP_WRITE_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn tmp_write_test_lock() -> &'static std::sync::Mutex<()> {
+    static TMP_WRITE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    TMP_WRITE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+fn invoke_tmp_write_hook(target: &Path) -> std::io::Result<()> {
+    let hook = tmp_write_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(target)?;
+    }
+    Ok(())
+}
+
+/// 让下一个匹配 `matcher` 的目标的 tmp 写入失败一次（返回的 guard 存活期间
+/// 有效）。
+#[cfg(test)]
+pub(crate) fn fail_tmp_write_matching_once<F>(
+    matcher: F,
+    message: impl Into<String>,
+) -> TmpWriteFailureHookGuard
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let lock = tmp_write_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let failed = Arc::new(AtomicBool::new(false));
+    let message = message.into();
+    *tmp_write_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::new(move |target| {
+        if matcher(target) && !failed.swap(true, Ordering::SeqCst) {
+            return Err(std::io::Error::other(message.clone()));
+        }
+        Ok(())
+    }));
+    TmpWriteFailureHookGuard { _lock: lock }
+}
+
 #[cfg(test)]
 pub(crate) fn fail_directory_sync_once(
     path: PathBuf,
@@ -363,6 +440,16 @@ pub(crate) fn tmp_path_for(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{file_name}.tmp-{pid}-{nonce:016x}")))
 }
 
+/// 写/刷/fsync 失败时清理**本函数已建出**的 tmp 文件。
+///
+/// 不清理的后果是 dotfile 无界累积：tmp 名里的 nonce 单调递增、全仓无启动清扫，
+/// ENOSPC/EIO/EDQUOT 落在 write 路径时每一拍都留下一个部分写入的
+/// `.{name}.tmp-{pid}-{nonce}`，永不回收（与 `.tmp-seg-*` 同型）。
+/// `AlreadyExists` 分支不在此列——那是别人的文件，绝不能删。
+fn discard_tmp_after_write_failure(tmp_path: &Path) {
+    let _ = remove_file_if_exists(tmp_path);
+}
+
 pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
@@ -391,24 +478,29 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
                 })
             }
         };
+        // 注入点：测试在 tmp 已建出之后强制写失败，以覆盖失败分支的清理。
+        #[cfg(test)]
+        if let Err(source) = invoke_tmp_write_hook(path) {
+            drop(file);
+            discard_tmp_after_write_failure(&tmp_path);
+            return Err(TsinkError::IoWithPath {
+                path: tmp_path.clone(),
+                source,
+            });
+        }
         let mut writer = BufWriter::new(file);
-        writer
-            .write_all(bytes)
-            .map_err(|source| TsinkError::IoWithPath {
+        let write_result = writer.write_all(bytes);
+        let write_result = write_result.and_then(|()| writer.flush());
+        let write_result = write_result.and_then(|()| writer.get_ref().sync_all());
+        if let Err(source) = write_result {
+            // 先关句柄再删（Windows 上打开的文件无法删除）。
+            drop(writer);
+            discard_tmp_after_write_failure(&tmp_path);
+            return Err(TsinkError::IoWithPath {
                 path: tmp_path.clone(),
                 source,
-            })?;
-        writer.flush().map_err(|source| TsinkError::IoWithPath {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|source| TsinkError::IoWithPath {
-                path: tmp_path.clone(),
-                source,
-            })?;
+            });
+        }
         return Ok(tmp_path);
     }
 
@@ -576,6 +668,48 @@ mod tests {
             "error must carry the blocked parent directory path, got: {rendered}"
         );
         assert!(matches!(err, TsinkError::IoWithPath { .. }));
+    }
+
+    /// C-12：写失败必须清掉已建出的 tmp 文件，否则每次失败都在目录里留下一个
+    /// 永不回收的 `.{name}.tmp-{pid}-{nonce}` dotfile。
+    #[test]
+    fn write_tmp_and_sync_removes_tmp_file_when_the_write_fails() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let target = temp_dir.path().join("state.bin");
+        let before = list_tmp_dotfiles(temp_dir.path());
+
+        let hooked_target = target.clone();
+        let _hook = fail_tmp_write_matching_once(
+            move |candidate| candidate == hooked_target.as_path(),
+            "injected write failure",
+        );
+        let err = write_tmp_and_sync(&target, b"payload").expect_err("injected write must fail");
+        assert!(
+            matches!(err, TsinkError::IoWithPath { .. }),
+            "the injected failure must surface as IoWithPath, got: {err:?}"
+        );
+
+        let after = list_tmp_dotfiles(temp_dir.path());
+        assert_eq!(
+            after, before,
+            "a failed tmp write must leave no dotfile behind (before {before:?}, after {after:?})"
+        );
+        assert!(
+            !target.exists(),
+            "a failed tmp write must not publish the target file"
+        );
+    }
+
+    fn list_tmp_dotfiles(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.') && name.contains(".tmp-"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     #[test]

@@ -523,6 +523,12 @@ struct CatalogPersistMemoState {
     delta_bytes_since_checkpoint: u64,
     /// delta 写失败时保留、待下一拍重试落盘的 root 变更（后写覆盖先写）。
     pending_changes: BTreeMap<PathBuf, CatalogRootChangeOp>,
+    /// 冷路径原地验证采纳的 series 指纹，连同当时段集条目的内容指纹：同一段集
+    /// （段不可变 ⇒ series 元数据不变）下可复用它，避免强制锚点为了重算指纹
+    /// 去读 `series.bin`（「catalog 有效即可恢复」语义，见
+    /// `startup_reopens_from_registry_catalog_without_segment_series_files`）。
+    validated_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
+    validated_fingerprint_entries_hash: Option<u64>,
 }
 
 impl Default for CatalogPersistMemoState {
@@ -538,6 +544,8 @@ impl Default for CatalogPersistMemoState {
             deltas_since_checkpoint: 0,
             delta_bytes_since_checkpoint: 0,
             pending_changes: BTreeMap::new(),
+            validated_fingerprint: None,
+            validated_fingerprint_entries_hash: None,
         }
     }
 }
@@ -549,9 +557,6 @@ pub(super) enum CatalogPersistOutcome {
     Persisted,
     /// 例行发布拍：delta 追加落盘（携带序列化字节数）。
     DeltaAppended { bytes: u64 },
-    /// delta 数/字节达阈值：本笔变更直接并入全量 checkpoint（主文件 + 标记 +
-    /// delta 清理）。
-    CheckpointConsolidated,
     /// 节流窗口内：不构建、不读盘、不写盘；变更并入备忘待下一拍。
     SkippedThrottled,
     /// 内容与上次写入一致且文件未被外部改动（备忘命中，零 IO）。
@@ -665,7 +670,17 @@ fn persist_registry_catalog_checkpoint(
     let file_len = std::fs::metadata(&path).map(|meta| meta.len()).ok();
     {
         let mut state = memo.state.lock();
-        if state.last_entries_hash == Some(entries_hash) && state.last_file_len == file_len {
+        // 内容指纹去重门**只对例行拍**成立：`force` 是关闭/显式 checkpoint
+        // 锚点，其契约是「主文件即全量真值 + delta 清空 + marker 前移」。
+        // 冷路径原地验证会把备忘置成「主文件 + delta 重构 = 全量真值」（见
+        // 下面的 `!force` 验证分支），若此后本会话再无发布拍，force 拍命中
+        // 此门就会提前返回——delta 不清理、marker 不前移、checkpoint 计数不涨，
+        // 锚点语义整体丢失且重启恢复被迫依赖那批未合并 delta。故 force 必须
+        // 绕过（重写主文件是幂等成本，锚点正确性优先）。
+        if !force
+            && state.last_entries_hash == Some(entries_hash)
+            && state.last_file_len == file_len
+        {
             state.last_persisted_at = Some(now);
             return Ok((None, CatalogPersistOutcome::SkippedUnchanged));
         }
@@ -703,6 +718,14 @@ fn persist_registry_catalog_checkpoint(
                     // 主文件 + delta 已共同反映全部变更：备忘里的 pending delta
                     // 变更视为已吸收（重构失配时才会走到下面的全量重写）。
                     state.pending_changes.clear();
+                    // 采纳重构视图的指纹并连同段集指纹一起备忘：同一段集（段不可变
+                    // ⇒ series 元数据不变）下，后续强制锚点（close / 显式
+                    // checkpoint）需要重写主文件时可复用该指纹，而不必去读
+                    // `series.bin`——保持「catalog 有效即足以恢复」语义（见
+                    // `startup_reopens_from_registry_catalog_without_segment_series_files`）。
+                    state.validated_fingerprint = validated.series_fingerprint.clone();
+                    state.validated_fingerprint_entries_hash =
+                        validated.series_fingerprint.as_ref().map(|_| entries_hash);
                     return Ok((
                         validated.series_fingerprint,
                         CatalogPersistOutcome::SkippedValidatedFromFile,
@@ -714,7 +737,21 @@ fn persist_registry_catalog_checkpoint(
 
     let fingerprint = match absorbed_fingerprint {
         Some(fingerprint) => Some(fingerprint),
-        None => Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
+        // 段集与「冷路径原地验证采纳的指纹」同源（段不可变 ⇒ series 元数据不变）
+        // ⇒ 复用备忘指纹，避免为一次锚点重写去读全量 `series.bin`。
+        None => {
+            let cached = {
+                let state = memo.state.lock();
+                match state.validated_fingerprint_entries_hash {
+                    Some(hash) if hash == entries_hash => state.validated_fingerprint.clone(),
+                    _ => None,
+                }
+            };
+            match cached {
+                Some(fingerprint) => Some(fingerprint),
+                None => Some(build_series_fingerprint_from_sources(sources, entry_cache)?),
+            }
+        }
     };
     // 重置判据（须在主文件重写前采样）：重写前的主文件不承载任何段条目
     // （缺失/损坏/空）⇒ 本实例从未把段集全量同步到盘，delta 序号空间没有
@@ -898,6 +935,13 @@ fn persist_registry_catalog_delta(
         // 「合并即全量、无视节流」语义（吸收 absorbed_checkpoint_seq=Some），
         // 不是 close/显式锚点的强制刷新——后者走 `persist_registry_catalog_throttled`
         // 的 force 分支，仍按真实失败上抛（关停时无法持久化必须报错）。
+        //
+        // outcome 必须**透传**而非一律改写成 `CheckpointConsolidated`：内部若因
+        // 去重/验证而早退（SkippedUnchanged / SkippedValidatedFromFile），本拍实际
+        // 没做 checkpoint——`deltas_since_checkpoint` / `pending_changes` 未归零，
+        // 上报成合并会让调用方同时 +1 `catalog_persisted_total` 与
+        // `catalog_checkpoint_total`（虚报）。加 `!force` 守卫后本支路已基本不可
+        // 达该早退，透传是防将来回归的契约。
         return match persist_registry_catalog_checkpoint(
             snapshot_path,
             sources,
@@ -909,9 +953,7 @@ fn persist_registry_catalog_delta(
             Some(seq),
             series_fingerprint,
         ) {
-            Ok((fingerprint, _)) => {
-                Ok((fingerprint, CatalogPersistOutcome::CheckpointConsolidated))
-            }
+            Ok((fingerprint, outcome)) => Ok((fingerprint, outcome)),
             Err(err) => {
                 warn!(
                     error = %err,

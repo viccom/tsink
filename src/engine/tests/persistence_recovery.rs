@@ -3877,6 +3877,108 @@ fn catalog_cold_path_validates_stale_checkpoint_with_deltas_in_place() {
     reopened.close().unwrap();
 }
 
+/// C-11：冷路径原地验证把内容指纹备忘（`last_entries_hash` / `last_file_len`）
+/// 置好后，若本会话再无发布拍，`close()` 的强制锚点会命中「内容指纹去重门」
+/// 提前返回——delta 不清理、marker 不前移、关闭不计 checkpoint。
+///
+/// 锚点契约（`docs/storage-engine.md`）：Close / explicit checkpoint 必须
+/// **始终重写主文件、推进 marker、清空 delta**。`force` 因此必须绕过内容指纹
+/// 去重，否则重启恢复从此依赖那批未合并 delta 的完好性。
+#[test]
+fn catalog_close_anchor_bypasses_content_dedup_gate() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let delta_dir = catalog_delta_dir(data_path);
+    let marker = delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+    let labels = vec![Label::new("host", "close-anchor")];
+
+    // 盘面 = 「发布拍已落 delta、close 之前崩溃」：主文件只含基线段，delta
+    // 完整可重放，marker 从未写过。
+    let (baseline, captured) = catalog_delta_crash_window_fixture(
+        data_path,
+        &labels,
+        "catalog-anchor-base",
+        &["catalog-anchor-b", "catalog-anchor-c"],
+    );
+    rewind_catalog_to_crash_window(data_path, &baseline, &captured);
+    let max_captured_seq = captured
+        .iter()
+        .filter_map(|(name, _)| catalog_delta_seq(Path::new(name)))
+        .max()
+        .expect("captured deltas must carry parseable seqs");
+
+    // 重开：启动校验重放 delta 通过 ⇒ finalize 走冷路径**原地验证**，把内容
+    // 指纹备忘置成「主文件 + delta 重构 = 全量真值」而不重写主文件。
+    let reopened = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed on a stale checkpoint plus valid deltas");
+    assert_catalog_delta_series_window(&reopened, "catalog-anchor-base", &labels, 1, 4);
+    assert_eq!(
+        catalog_delta_files(&delta_dir).unwrap_or_default().len(),
+        captured.len(),
+        "the cold-path in-place validation must leave the replayable deltas untouched"
+    );
+    assert!(
+        !marker.exists(),
+        "the cold-path in-place validation must not advance {}",
+        marker.display()
+    );
+    let checkpoints_before_close = reopened
+        .observability_snapshot()
+        .flush
+        .catalog_checkpoint_total;
+
+    // 本会话再无发布拍 ⇒ close 的强制锚点是唯一一次全量刷新机会。
+    reopened.close().unwrap();
+
+    let mut failures = Vec::new();
+    let remaining = catalog_delta_files(&delta_dir).unwrap_or_default();
+    if !remaining.is_empty() {
+        failures.push(format!(
+            "the close anchor must clear every merged delta, {} file(s) survive: {:?}",
+            remaining.len(),
+            remaining
+                .iter()
+                .map(|path| path.file_name().unwrap_or_default().to_string_lossy())
+                .collect::<Vec<_>>()
+        ));
+    }
+    match catalog_checkpoint_marker_seq(&marker) {
+        Some(seq) if seq >= max_captured_seq => {}
+        Some(seq) => failures.push(format!(
+            "the close anchor must advance {} past the merged delta seqs (>= {max_captured_seq}), got {seq}",
+            marker.display()
+        )),
+        None => failures.push(format!(
+            "the close anchor must write {} carrying a numeric checkpoint_seq",
+            marker.display()
+        )),
+    }
+    let checkpoints_after_close = reopened
+        .observability_snapshot()
+        .flush
+        .catalog_checkpoint_total;
+    if checkpoints_after_close != checkpoints_before_close.saturating_add(1) {
+        failures.push(format!(
+            "the close anchor must count exactly one catalog checkpoint, \
+             catalog_checkpoint_total went {checkpoints_before_close} -> {checkpoints_after_close}"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "close anchor contract violated (content dedup gate must not short-circuit force):\n- {}",
+        failures.join("\n- ")
+    );
+
+    // 锚点生效后重开仍必须完整可查（主文件已是全量真值 + delta 已清）。
+    let after = catalog_delta_builder(data_path).build().unwrap();
+    assert_catalog_delta_series_window(&after, "catalog-anchor-base", &labels, 1, 4);
+    assert_catalog_delta_series_window(&after, "catalog-anchor-b", &labels, 11, 4);
+    assert_catalog_delta_series_window(&after, "catalog-anchor-c", &labels, 21, 4);
+    after.close().unwrap();
+}
+
 /// Highest `seg-<hex>` dirname id under one level directory (`0` if none).
 fn max_segment_dirname_id(level_dir: &Path) -> u64 {
     std::fs::read_dir(level_dir)

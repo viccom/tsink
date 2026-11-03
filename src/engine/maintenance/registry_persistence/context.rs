@@ -211,7 +211,12 @@ impl<'a> RegistryPersistenceContext<'a> {
         let persisted_series_ids = pending_registry.all_series_ids();
         if persisted_series_ids.is_empty() {
             self.remove_pending_series_ids(pending_series_ids);
-            return Ok(());
+            // 子集为空不代表本拍没有段变更：registry 里待持久化的 series 全部
+            // 在两次 persist 之间消失时，本拍的 `added_roots`/`removed_roots`
+            // 仍然要落 catalog（catalog 条目由段 manifest 构建，不依赖 registry
+            // 的 series）。早退成 `Ok(())` 会把本拍 root 变更静默丢弃——既没写
+            // delta、也没进 `pending_changes`、也没置脏。
+            return persist_catalog_index(checkpoint_path, sources);
         }
 
         let current_delta_series_count = self.delta_series_count_value();
