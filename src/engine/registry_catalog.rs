@@ -671,22 +671,43 @@ fn persist_registry_catalog_checkpoint(
         }
     }
 
-    // 冷启动 / 跨窗口：先只读文件做 entries 比对。命中则直接采纳文件的
-    // series_fingerprint ——不读任何 segment 的 series.bin（catalog 有效即
-    // 足以恢复，见 `startup_reopens_from_registry_catalog_without_segment_series_files`）。
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(actual) = serde_json::from_slice::<PersistedRegistryCatalogFile>(&bytes) {
-            if actual.segments == expected_entries {
-                let mut state = memo.state.lock();
-                state.last_persisted_at = Some(now);
-                state.last_entries_hash = Some(entries_hash);
-                state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-                // 主文件已反映全部变更：备忘里的 pending delta 变更视为已吸收。
-                state.pending_changes.clear();
-                return Ok((
-                    actual.series_fingerprint,
-                    CatalogPersistOutcome::SkippedValidatedFromFile,
-                ));
+    // 冷启动 / 跨窗口：主文件 + 未合并 delta 重构后与 expected 比对——与启动
+    // 校验同一实现（`validate_catalog_checkpoint_with_deltas`），不残留「只读
+    // checkpoint 本体」的旧语义。命中即**原地验证**：不重写主文件、不删 delta、
+    // 不推 marker（携带未合并 delta 的重启不再付一次 O(段数) 全量重写），并直接
+    // 采纳重构视图的 series_fingerprint ——不读任何 segment 的 series.bin
+    // （catalog 有效即足以恢复，见
+    // `startup_reopens_from_registry_catalog_without_segment_series_files`）。
+    //
+    // 仅冷路径（`!force`）适用：`force` 是关闭/显式 checkpoint 锚点，契约是
+    // 「主文件即全量真值 + delta 清空 + marker 前移」，原地验证会留下未合并
+    // delta 与旧 marker，锚点语义回退。
+    if !force {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(actual) = serde_json::from_slice::<PersistedRegistryCatalogFile>(&bytes) {
+                let deltas = list_catalog_delta_files(snapshot_path);
+                if let Some(validated) = validate_catalog_checkpoint_with_deltas(
+                    snapshot_path,
+                    actual,
+                    &deltas,
+                    &expected_entries,
+                ) {
+                    let mut state = memo.state.lock();
+                    state.last_persisted_at = Some(now);
+                    // hash 取重构后（= expected）的条目指纹，len 必须取**主文件
+                    // 实际字节长度**（主文件本身未重写）：二者配成「内容指纹 +
+                    // 文件未被外部改动」的判据，下一拍才不会被误判成
+                    // SkippedUnchanged。
+                    state.last_entries_hash = Some(entries_hash);
+                    state.last_file_len = Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                    // 主文件 + delta 已共同反映全部变更：备忘里的 pending delta
+                    // 变更视为已吸收（重构失配时才会走到下面的全量重写）。
+                    state.pending_changes.clear();
+                    return Ok((
+                        validated.series_fingerprint,
+                        CatalogPersistOutcome::SkippedValidatedFromFile,
+                    ));
+                }
             }
         }
     }
@@ -1183,27 +1204,50 @@ pub(super) fn validate_registry_catalog_with_delta_report(
         })?,
     )?;
 
-    let mut report = CatalogDeltaValidationReport {
-        validated: None,
+    let report = CatalogDeltaValidationReport {
+        validated: validate_catalog_checkpoint_with_deltas(
+            snapshot_path,
+            actual,
+            &deltas,
+            &expected_segments,
+        ),
         deltas_present: !deltas.is_empty(),
     };
+    Ok(report)
+}
 
+/// 校验核心：把「checkpoint 主文件条目 + 依次应用 seq > checkpoint_seq 的 delta」
+/// 重构后与 `expected_segments`（调用方已构建的段目录真值）比对。
+///
+/// 启动校验与冷路径 persist 共用这一份实现（两处口径必须一致：冷路径原地验证
+/// 通过的盘面，重开后启动校验也必须通过）。
+///
+/// 返回 `None` = 不可采纳（调用方各自回退）：
+/// - marker 损坏/版本不符、任一 delta 解析失败/版本不符/seq 与文件名不符、
+///   已应用 delta 序号断层（未从 checkpoint_seq+1 连续起算）；
+/// - 重构结果与 `expected_segments` 失配。
+fn validate_catalog_checkpoint_with_deltas(
+    snapshot_path: &Path,
+    actual: PersistedRegistryCatalogFile,
+    deltas: &[(u64, PathBuf)],
+    expected_segments: &[PersistedRegistryCatalogEntry],
+) -> Option<ValidatedRegistryCatalog> {
     let checkpoint_seq = match std::fs::read(catalog_checkpoint_marker_path(snapshot_path)) {
         Ok(bytes) => {
             let marker: PersistedRegistryCatalogCheckpointMarker =
                 match serde_json::from_slice(&bytes) {
                     Ok(marker) => marker,
-                    Err(_) => return Ok(report),
+                    Err(_) => return None,
                 };
             if marker.version != REGISTRY_CATALOG_DELTA_FILE_VERSION {
-                return Ok(report);
+                return None;
             }
             marker.checkpoint_seq
         }
         // marker 缺失 → checkpoint_seq = 0，seq ≥ 1 的 delta 仍参与重放
         // （首笔 checkpoint 之前崩溃的实例以此恢复增量）。
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(_) => return Ok(report),
+        Err(_) => return None,
     };
 
     let mut reconstructed = actual.segments;
@@ -1219,18 +1263,18 @@ pub(super) fn validate_registry_catalog_with_delta_report(
         // （「段已 rename、delta 未写」崩溃窗），其上变更不可再补。
         let expected_seq = checkpoint_seq.saturating_add(1 + offset as u64);
         if *seq != expected_seq {
-            return Ok(report);
+            return None;
         }
         let bytes = match std::fs::read(delta_path) {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(report),
+            Err(_) => return None,
         };
         let delta: PersistedRegistryCatalogDeltaFile = match serde_json::from_slice(&bytes) {
             Ok(delta) => delta,
-            Err(_) => return Ok(report),
+            Err(_) => return None,
         };
         if delta.version != REGISTRY_CATALOG_DELTA_FILE_VERSION || delta.seq != *seq {
-            return Ok(report);
+            return None;
         }
         apply_catalog_delta_to_entries(&delta, &mut reconstructed);
         fingerprint = delta.series_fingerprint;
@@ -1240,15 +1284,14 @@ pub(super) fn validate_registry_catalog_with_delta_report(
 
     reconstructed.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
     if reconstructed != expected_segments {
-        return Ok(report);
+        return None;
     }
 
-    report.validated = Some(ValidatedRegistryCatalog {
+    Some(ValidatedRegistryCatalog {
         series_fingerprint: fingerprint,
         deltas_replayed: replayed,
         fingerprint_fallback,
-    });
-    Ok(report)
+    })
 }
 
 /// 幂等应用一笔 delta：added 按段身份 (lane, level, segment_id) upsert，

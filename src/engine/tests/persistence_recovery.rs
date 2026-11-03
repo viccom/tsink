@@ -3518,6 +3518,147 @@ fn catalog_delta_stale_checkpoint_replays_idempotently() {
     reopened.close().unwrap();
 }
 
+/// 冷路径（重启后无变更上报的 persist）必须与启动校验同一口径：把「checkpoint
+/// 主文件 + 未合并 delta」重构后比对，命中即**原地验证**——不重写主文件、不删
+/// delta、不推 marker。否则每次携带未合并 delta 的重启都必付一次 O(段数) 全量
+/// 重写，delta 的收益被限制在单次会话内。
+///
+/// 盘面 = 真实的「发布拍已落 delta、close 之前崩溃」：主文件是上一会话 close 的
+/// checkpoint（只含基线段），delta seq 1/2 完整，marker 从未写过（checkpoint_seq
+/// =0 ⇒ 两笔 delta 全部可重放）。启动校验能通过 ⇒ finalize 选 `Persist`
+/// （`root_changes=None`）⇒ 走的就是这条冷路径。
+#[test]
+fn catalog_cold_path_validates_stale_checkpoint_with_deltas_in_place() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let delta_dir = catalog_delta_dir(data_path);
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let marker = delta_dir.join(CATALOG_CHECKPOINT_MARKER_NAME);
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "cold-path")];
+
+    let (baseline, captured) = catalog_delta_crash_window_fixture(
+        data_path,
+        &labels,
+        "catalog-cold-base",
+        &["catalog-cold-b", "catalog-cold-c"],
+    );
+    rewind_catalog_to_crash_window(data_path, &baseline, &captured);
+
+    // 盘面自证：主文件只含基线段（陈旧），delta 完好且可重放，marker 不存在。
+    let checkpoint_before = snapshot_catalog_checkpoint(&catalog_file)
+        .expect("the crash window must leave the stale checkpoint readable");
+    let on_disk_segments = count_lane_segments_across_levels(&lane_path);
+    assert_eq!(
+        catalog_checkpoint_segment_count(&checkpoint_before.bytes) + captured.len(),
+        on_disk_segments,
+        "crash-window shape: the stale checkpoint must trail the deltas by exactly \
+         the delta-carried segments ({} checkpoint entries + {} deltas vs {} on-disk segments)",
+        catalog_checkpoint_segment_count(&checkpoint_before.bytes),
+        captured.len(),
+        on_disk_segments
+    );
+    assert!(
+        !marker.exists(),
+        "crash-window shape: no consolidation marker may exist before the reopen"
+    );
+    assert_eq!(
+        catalog_delta_files(&delta_dir)
+            .expect("the crash window must keep the delta dir")
+            .len(),
+        captured.len(),
+        "crash-window shape: every captured delta must be back on disk"
+    );
+
+    // 重开：启动校验重放 delta 通过 ⇒ 冷路径必须重构比对后原地验证。
+    let reopened = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed on a stale checkpoint plus valid deltas");
+    assert_catalog_delta_series_window(&reopened, "catalog-cold-base", &labels, 1, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-cold-b", &labels, 11, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-cold-c", &labels, 21, 4);
+
+    let mut failures = Vec::new();
+    let after = match std::fs::read(&catalog_file) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            failures.push(format!(
+                "catalog checkpoint {} must stay readable after the cold-path persist: {err}",
+                catalog_file.display()
+            ));
+            None
+        }
+    };
+    if let Some(after) = after {
+        if after != checkpoint_before.bytes {
+            failures.push(format!(
+                "cold-path persist must validate the checkpoint+delta reconstruction in place \
+                 and not rewrite the main file: len {} -> {}, mtime {:?} -> {:?}",
+                checkpoint_before.len,
+                after.len(),
+                checkpoint_before.modified,
+                std::fs::metadata(&catalog_file)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            ));
+        }
+    }
+    if let Ok(deltas) = catalog_delta_files(&delta_dir) {
+        if deltas.len() != captured.len() {
+            failures.push(format!(
+                "an in-place validation must leave the {} replayable delta(s) untouched, found {}",
+                captured.len(),
+                deltas.len()
+            ));
+        }
+    }
+    if marker.exists() {
+        failures.push(format!(
+            "an in-place validation must not advance {}",
+            marker.display()
+        ));
+    }
+    let checkpoints_after_reopen = reopened
+        .observability_snapshot()
+        .flush
+        .catalog_checkpoint_total;
+    if checkpoints_after_reopen != 0 {
+        failures.push(format!(
+            "cold-path persist counted {checkpoints_after_reopen} full checkpoint write(s); \
+             an in-place validation writes none"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "cold-path in-place validation failed:\n- {}",
+        failures.join("\n- ")
+    );
+
+    // 会话内继续发布：delta 序号接着重放链续写（seq 3），主文件仍不动——
+    // 证明备忘（next_seq / last_entries_hash / last_file_len）已按主文件真实状态
+    // 更新，而不是退化成「下一拍再全量重写」。
+    settle_past_catalog_persist_throttle();
+    insert_catalog_delta_series(&reopened, "catalog-cold-d", &labels, 31, 4);
+    let appended = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        catalog_delta_files(&delta_dir)
+            .map(|deltas| deltas.len() > captured.len())
+            .unwrap_or(false)
+    });
+    assert!(
+        appended,
+        "the post-reopen publish tick must append a delta under {} within 10s",
+        delta_dir.display()
+    );
+    let after_publish = std::fs::read(&catalog_file)
+        .expect("the main file must stay readable after the post-reopen publish");
+    assert_eq!(
+        after_publish, checkpoint_before.bytes,
+        "a validated cold path must keep the main file untouched for the rest of the session"
+    );
+    reopened.close().unwrap();
+}
+
 /// Highest `seg-<hex>` dirname id under one level directory (`0` if none).
 fn max_segment_dirname_id(level_dir: &Path) -> u64 {
     std::fs::read_dir(level_dir)
