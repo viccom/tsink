@@ -79,8 +79,13 @@
 | R-2 | 阈值合并写失败上抛导致 flush 失败（与 delta 失败「只标脏」口径不一致） | `da5d76d` |
 | R-4 | catalog_delta flaky 族轮询超时 10s 偏紧（4 线程下仍复现） | `da5d76d` |
 | C-7~C-10 + D-1~D-7 + X-1 | soak 短跑变量覆盖、指纹回退计数漏计、窗口 8→16 文档漂移、chunk_points 关联失效等 12 处 | `3ee1fb2` |
+| C-11 | close 锚点被内容指纹去重短路（delta 未清、marker 不前移；既有缺陷） | `9eb985c` |
+| C-12 | `write_tmp_and_sync` 写失败不清理 tmp（dotfile 无界累积） | `9eb985c` |
+| C-13 | 三路仲裁实际只有两路轮转（L0/L1 持续可触发时饿死 L2ToL2） | `6e618c9` |
+| C-15 | `pending_series` 子集为空时静默丢弃本拍 root 变更 | `9eb985c` |
+| C-16 | 合并支路丢弃 outcome（`SkippedUnchanged` 虚报为 checkpoint） | `9eb985c` |
 
-**仍开放**（需设计决策或后续排期）：C-3（W4-T0 resolver 在生产窗口内无效，需动删除时序）、R-3（Gate 2 去重遮蔽，需增强断言）、R-5~R-9、X-2~X-5。
+**仍开放**（需设计决策或后续排期）：C-3（W4-T0 resolver 在生产窗口内无效，需动删除时序——`docs/research/2026-11-03-edge-hardening-review.md §7` 有 A/B 方案对比，建议先做方案 B 登记）、C-14（series 预算 < 单条目致缓存塌缩）、C-17（close 128 拍上限静默截断）、R-3（Gate 2 去重遮蔽）、R-5~R-9、X-2~X-6。
 
 ---
 

@@ -4,7 +4,7 @@
 > **权威计划**：`docs/plans/2026-10-30-edge-hardening-catalog-terminal-crash.md`（其「实施状态」表为进度权威）。
 > **方法**：三路只读深度审查子代理（W1 / W2+W3 / W4，第一轮）+ 两路横切面审查（旋钮观测文档 / 并发异常资源，第二轮）；主会话对**每一条**缺陷级结论做第一手取证——读代码行、穷举写点、实测运行、必要时自证伪。凡未能第一手复现的结论，标注「未复现」而非「确认」。
 > **基线**：初版报告基线 HEAD `76fb802`；第二轮横切面基线 HEAD `15951e1`。
-> **状态**：初版 7 项确认缺陷中 6 项已修复（C-1/C-2/C-4/C-5/C-6 + R-1），第二轮新增 4 项（C-7~C-10）待修。逐项状态见 §6。
+> **状态**：共确认 17 项缺陷（初版 7 + 横切面 4 + 并发 5 + 1 项已实证 flaky），**已修 15 项**；仍开放 C-3（需架构裁决，见 §7 简报）、C-14/C-17/X-2~X-6 与 R-3/R-5~R-9（登记待排期）。逐项状态见 §6。
 
 ## 0. 复核证据总表
 
@@ -229,11 +229,61 @@
 | **C-10 chunk_points 关联失效** | ✅ 已修 | `3ee1fb2` |
 | D-1~D-7 文档不符 | ✅ 已修 | `3ee1fb2` |
 | X-1 裸 `+=` 改饱和 | ✅ 已修 | `3ee1fb2` |
-| X-2~X-5 风险 | ⏳ 登记待排期 | — |
-| C-3 删源时序根治 | ⏳ 需设计决策 | — |
+| **C-11 close 锚点被内容去重短路** | ✅ 已修 | `9eb985c` |
+| **C-12 tmp 写失败 dotfile 无界累积** | ✅ 已修 | `9eb985c` |
+| **C-13 三路仲裁饿死 L2ToL2** | ✅ 已修 | `6e618c9` |
+| **C-15 子集为空静默丢 root 变更** | ✅ 已修 | `9eb985c` |
+| **C-16 合并 outcome 虚报** | ✅ 已修 | `9eb985c` |
+| C-14 series 预算 < 单条目 → 缓存塌缩到 1 条 | ⏳ 登记待排期 | — |
+| C-17 close 128 拍上限静默截断 | ⏳ 登记待排期 | — |
+| X-2~X-6（含锁内深拷贝） | ⏳ 登记待排期 | — |
+| C-3 删源时序根治 | ⏳ 需设计决策（§7 简报，建议先做方案 B） | — |
 | R-3 Gate 2 去重遮蔽 | ⏳ 需增强断言或登记边界 | — |
-| R-5/R-6/R-7/R-8/R-9 | ⏳ 登记待排期 | — |
-| 计划状态表（`plan:61` 的窗口声称） | ⏳ 待主会话订正 | — |
+| R-5/R-6/R-7/R-9 | ⏳ 登记待排期 | — |
+| R-8 崩溃门禁 `no acknowledged writes` 偶发 | ⏳ 已实证 2/20，登记 flaky | — |
+| 计划状态表（`plan:61` 的窗口声称） | ✅ 已订正 | `460b0a9` |
+
+## 6. 第二轮并发/异常/资源审查新增发现（基线 `460b0a9`，均经主会话第一手复核）
+
+### C-11｜close/强制锚点被「内容指纹去重」短路——delta 未清、marker 不前移（既有缺陷）
+`registry_catalog.rs:664-672` 的去重门 `if state.last_entries_hash == Some(entries_hash) && state.last_file_len == file_len { return SkippedUnchanged }` **没有 `!force` 守卫**，而紧接着的原地验证分支专门加了 `!force` 并注释「force 是关闭/显式锚点，契约是主文件即全量真值 + delta 清空 + marker 前移」。
+触发：本会话冷路径原地验证把 `last_entries_hash`/`last_file_len` 置好后无新发布拍 → `close()` 命中去重门 → `reset_delta_state`/删 delta/写 marker/计数归零全跳过，最多 99 个 delta 与旧 marker 跨会话存活；`catalog_checkpoint_total` 不涨。
+**既有性**：`git show origin/master:...| grep` 证实 origin/master:200 同样无守卫 → 非本批次引入，但本批次已使 close 契约文档化，必须修。
+修复 `9eb985c`：加 `!force`；**并带出一处必要配套**——force 重写主文件需要 `series_fingerprint`，而原地验证刻意不读 `series.bin`（「catalog 有效即可恢复」语义），故新增 `validated_fingerprint` / `validated_fingerprint_entries_hash` 备忘（以段集内容指纹为键，段不可变 ⇒ 同键同指纹，段一变即失配重算）。红测实测：2 个 delta 残留 + marker 缺失 + `checkpoint_total` 0→0。
+
+### C-12｜`write_tmp_and_sync` 写/刷/fsync 失败不清理 tmp——dotfile 无界累积
+`fs_utils.rs:395-411`：`create_new` 成功后 `write_all`/`flush`/`sync_all` 任一失败直接 `return Err`，**不删已建出的 tmp**；调用方只在 rename 失败时清理。tmp 名 `.{name}.tmp-{pid}-{nonce:016x}`，nonce 单调递增，全仓无启动清扫 → ENOSPC/EIO 落在写路径时每拍留一个 dotfile，永不回收（与 BUG #12 的 `.tmp-seg-*` 同型）。
+修复 `9eb985c`：失败分支 `drop(handle)` 后 `remove_file_if_exists`；`AlreadyExists` 分支不删（别人的文件）。红测用 `#[cfg(test)]` 路径匹配注入钩子（生产零开销）实测残留 `[".state.bin.tmp-172016-..."]` → 修复后为空。
+
+### C-13｜三路仲裁实际只有两路轮转——L0/L1 持续可触发时 `L2ToL2` 永不执行
+`planning.rs` 原 `transitions.sort_by_key(|t| Some(*t) == last)` 是**稳定排序 + 只把上次赢家移到队尾**，不等于轮转。逐状态：`last=L0 → [L1,L2,L0]`（L1 赢）→ `last=L1 → [L0,L2,L1]`（L0 赢）→ 回到 `last=L0`——**L2 恒在索引 1/2，位置 0 总有人赢**。三层同时持续可触发（持续灌入 + L1 backlog，恰是 L2 收敛存在的场景）时 L2 收敛完全停摆。
+修复 `6e618c9`：改为「从上次赢家的**后继**开始轮转」`(last_index+1) % len` + `rotate_left`。**关键细节**：`LAST_TRANSITION_*` 常量是 `0/1/2/3`（NONE=0），**不是数组索引**，直接用会整体偏移一位——修复按 `position()` 定位 transition 值，并在常量注释留下「tags are not array indices」防回归说明。
+红测实测序列：`["L0->L1","L1->L2","L0->L1","L1->L2", ...]` 12 拍零 L2；绿后完整轮转循环。
+
+### C-15｜`pending_series_ids` 子集为空时 `Ok(())`——本拍 root_changes 静默丢弃
+`registry_persistence/context.rs:205-215`：非空间集但 `persisted_series_ids.is_empty()` 时 `remove_pending_series_ids` 后直接 `return Ok(())`，**不调用 `persist_catalog_index`** → 本拍 `added_roots`/`removed_roots` 既不落 delta、也不进 `pending_changes`、也不置脏（对比上方 `pending_series_ids.is_empty()` 分支反而会 persist）。
+修复 `9eb985c`：改为 `return persist_catalog_index(...)`。锁重入已核实：`persistence_lock` 全仓仅 `context.rs:182/204` 两处加锁，下游均走 `_locked` 变体，`registry_catalog.rs` 无该锁引用 → 无死锁。
+触发面**未实证**（需 pending 里的 series id 全部在两次 persist 之间从 registry 消失），属防御性修正。
+
+### C-16｜合并支路丢弃 checkpoint outcome——`SkippedUnchanged` 被记成 `CheckpointConsolidated`
+`registry_catalog.rs:912-914` `Ok((fingerprint, _)) => Ok((fingerprint, CheckpointConsolidated))` 吞掉真实 outcome：内部若早退，本拍实际没做 checkpoint、阈值计数未归零、pending 未清，但 `registry_persistence.rs:131-141` 同时 +1 `catalog_persisted_total` 与 `catalog_checkpoint_total`。
+修复 `9eb985c`：透传 `Ok((fingerprint, outcome))`；因该变体不再被构造，clippy `never constructed` 迫使删除枚举变体与调用方 match 分支（`registry_persistence.rs` 3 行）。
+
+### C-14｜series 字节预算小于单条 entry 时缓存塌缩到 1 条（登记）
+`evict_over_limit` 的保底是 `slots.len() <= 1 → break`。若某段 `estimated_series_bytes` 单独超过 `catalog_series_cache_bytes` 且为最近 touch，则 `bytes_satisfied` 恒 false，逐条从最旧删起直到只剩该巨条目——**连带清空所有更小的条目**。此后每次插入小条目又触发淘汰，缓存长期稳定在 1 条 → `get_or_load_series` 对绝大多数段必然 miss，每笔 delta 的指纹重算退化为全量重读 `series.bin`（正是 N9 要消除的重读风暴）。
+与 X-4（旋钮置 0 禁用）同型但更隐蔽：旋钮看起来「有界可用」，实际等价禁用。默认 32MiB 需单段 ~33 万 series 才触发，故为登记项。文档只写「宁可越界也不全清」，未点明「附带清空全部小条目」这一半。
+
+### C-17｜close 的 128 拍上限被静默截断（登记）
+`shutdown.rs` `compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?` 返回值被丢弃；终止条件只看 `changes.is_empty()`，不校验段数是否下降。若输入段已是满预算段，N 段进 N 段出 → `changes` 每拍非空但段数不降，128 拍全烧在重写同一批满段上（每拍 GB 级读写），且**无任何日志/计数**表明「close 因上限提前收敛结束」。
+实际门槛很高（需 L1 段普遍达 8.4M 点），纯时长问题。修复建议：`passes == max` 时 `warn!` + 计数（10 分钟）。
+
+### X-6｜`CatalogLruMap::get` 在独占锁内深拷贝整值（登记）
+`registry_catalog.rs:213-221` `Some(slot.value.clone())` 在 `slots.lock()` 内完成；`build_series_fingerprint_from_sources` 每笔 delta 对**每个 source** 调一次 → 16.5k 段规模下每拍 16.5k 次全局锁 + `Vec<PersistedSeries>` 分配拷贝。槽值改 `Arc<V>` 可消掉锁内分配。
+
+### R-8 已实证（原为推测）
+崩溃门禁在本轮出现 `no acknowledged writes: child was killed before the first batch completed, harness would be vacuous`：`append`/`flush` 模式、seed `0xa5a50005` r4（delay 54ms）与 `0xa5a50004` r3（delay 3s），本分支 20 次运行中 2 次；干净 HEAD 对照 12/12 PASS、本分支对照 12/12 PASS，属**子进程启动抖动**（kill 延迟从 `spawn()` 起算，最小 54ms 可能早于首批 ack）。与 R-8 预测一致，登记为 flaky；根治方向：journal 首字节出现后再起算延迟。
+
+---
 
 ## 7. C-3 决策简报（唯一需架构裁决项）
 
