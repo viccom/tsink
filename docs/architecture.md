@@ -345,7 +345,7 @@ Each sealed chunk builds a `TimestampSearchIndex` — an array of anchor entries
   lane_numeric/          — float/int/bool/histogram chunks
     l0/                  — freshly flushed segments
     l1/                  — first compaction level
-    l2/                  — final compaction level
+    l2/                  — default terminal compaction level (see §11 L2→L2 convergence)
   lane_blob/             — bytes-value chunks (same level layout)
   wal/                   — WAL segment files
   series_index.bin       — binary RIDX v2 series registry snapshot
@@ -406,7 +406,8 @@ L0 segments    ← trigger: 4 L0 segments → compact → L1
     ▼
 L1 segments    ← trigger: 4 L1 segments → compact → L2
     ▼
-L2 segments    (cold-compacted, largest, longest time span)
+L2 segments    (cold-compacted, largest, longest time span; default terminal level)
+    ↺ size-tiered L2→L2 convergence once the L2 count exceeds l2_compaction_trigger (32)
 ```
 
 Each compaction pass:
@@ -414,6 +415,13 @@ Each compaction pass:
 1. **Planning** (`compactor/planning.rs`) — selects a window of up to 8 source segments at the triggering level.
 2. **Execution** (`compactor/execution.rs`) — merge-sorts all chunks, deduplicates overlapping samples, re-encodes with optimal codecs, writes new target-level segment.
 3. **Atomic replacement** — the replacement is staged in `.compaction-replacements/` and renamed into place. If the process crashes mid-replacement, `finalize_pending_compaction_replacements` cleans up the staging area at next startup.
+
+L2 is the default terminal level: no data leaves it, but once its segment count exceeds
+`l2_compaction_trigger` (32, `0` disables), background ticks run size-tiered **L2→L2
+convergence** — merging windows of at most 16 small legacy segments
+(`point_count ≤ output_segment_point_budget / 8`) back into L2 to shrink the terminal
+segment count. Close-time drains skip this work so a large legacy backlog cannot extend
+graceful shutdown.
 
 Compaction is tombstone-aware: tombstoned time ranges are excluded from the output segment, physically removing deleted data from disk.
 

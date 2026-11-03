@@ -20,8 +20,10 @@ three levels:
 
 Segments at the same level are independent: they may cover overlapping or non-overlapping
 time ranges and may belong to different series. The compactor merges segments within a
-level and writes the output one level higher. There is no compaction out of L2; L2
-segments age out only through retention expiry.
+level and writes the output one level higher. L2 is the default terminal level: no data
+moves out of it, but same-level (L2→L2) size-tiered convergence runs once the L2 segment
+count exceeds the convergence trigger (see [Terminal level convergence](#terminal-level-convergence-l2l2)).
+Segments still age out through retention expiry.
 
 The engine maintains two separate compactors — one for the **numeric lane** (float64
 series) and one for the **blob lane** (bytes and native histograms). Each compactor
@@ -50,11 +52,11 @@ Each `compact_once` call checks L0 first, then L1. Only one level is compacted p
 ## Window selection
 
 Rather than compacting all available source segments at once, each pass selects a
-**window** of up to `DEFAULT_SOURCE_WINDOW_SEGMENTS` (8) segments. The selection
+**window** of up to `DEFAULT_SOURCE_WINDOW_SEGMENTS` (16) segments. The selection
 algorithm:
 
 1. If any segments have overlapping time ranges, the algorithm identifies the smallest
-   cluster of overlapping segments and selects up to 8 of them by their original storage
+   cluster of overlapping segments and selects up to 16 of them by their original storage
    order. This ensures overlaps are resolved before anything else.
 2. If there are no overlaps, the algorithm takes the oldest `count_trigger` (≥ 2)
    segments sorted by segment ID.
@@ -89,6 +91,54 @@ segments: delta/XOR encoding for timestamps and values, with optional zstd compr
 The WAL highwater carried by an output segment is the **maximum** highwater across all
 source segments, allowing the WAL to reclaim space for any data already compacted to
 persistent segments.
+
+---
+
+## Terminal level convergence (L2→L2)
+
+L2 has no lower level to receive its output, so historically it was purely terminal:
+segments accumulated there forever and aged out only through retention. Engines upgraded
+in place (or configured with very low write rates) can therefore carry a large backlog of
+tiny legacy L2 segments. The **L2→L2 convergence** pass shrinks that backlog with
+size-tiered same-level merges that never rewrite the bulk of the terminal data:
+
+- **Candidates** — only segments whose `point_count` is at most
+  `output_segment_point_budget / 8` (1,048,576 points at the default budget of
+  8,388,608). Larger segments are never selected, so a pass can never mint a new
+  "large" segment.
+- **Trigger** — at least 2 eligible candidates AND the total L2 segment count strictly
+  above the convergence trigger (`l2_compaction_trigger`, default **32**; `0` disables
+  convergence entirely, restoring a purely terminal L2).
+- **Window** — candidates sorted by `(point_count, min_ts, segment_id)` ascending
+  (smallest and oldest fragments first), capped at `source_window_segments` (16) and at
+  a cumulative point total of `output_segment_point_budget / 8`. The merged output is
+  therefore never larger than a candidate, stays inside the candidate size class, and a
+  size-squeezed configuration terminates instead of re-merging its own outputs forever.
+- **Retention pre-exclusion** — segments whose `max_ts` already falls below the active
+  retention cutoff are excluded from candidacy: retention's next sweep deletes them
+  outright, so merging them would rewrite data that is about to disappear.
+- **Merge** — the selected window goes through the same k-way merge, deduplication,
+  tombstone filtering, and atomic replacement as any other pass; the output is written
+  back to L2.
+
+Convergence progress is deliberately spread over background ticks: a close-time drain
+structurally skips L2→L2 (a backlog of tens of thousands of terminal segments would
+otherwise extend graceful shutdown by an unbounded, data-dependent amount), and a
+background drain consumes at most one convergence window per lane per tick before
+reporting settled. Draining a 15.8k-segment legacy backlog therefore takes roughly
+15.8k / 16 ≈ 1000 ticks — at the default 5-second interval, on the order of an hour —
+instead of one long gate hold. Manual `compact_once` style passes and background passes
+are unaffected.
+
+The pass counter is exposed as `l2_to_l2_runs_total` in
+`CompactionObservabilitySnapshot`. To measure convergence over an existing production
+directory, copy the data directory and run the env-gated drill test
+`engine::storage_engine::tests::l2_convergence_drill::l2_convergence_drill`
+(`#[ignore]`; set `TSINK_CONVERGE_DATA_DIR` to the copy, optionally
+`TSINK_CONVERGE_CSV` / `TSINK_CONVERGE_TIMEOUT_SECS` / `TSINK_CONVERGE_POLL_SECS` /
+`TSINK_CONVERGE_SAMPLE_SERIES` — see the test's module docs). It records the L2 decay
+curve to CSV, then verifies a deterministic series sample returns point-identical
+results before and after convergence.
 
 ---
 
@@ -161,6 +211,7 @@ cumulative counters:
 | `source_points_total` | Cumulative input data points before dedup/tombstone filtering |
 | `output_points_total` | Cumulative output data points after filtering |
 | `duration_nanos_total` | Cumulative wall-clock time spent in compaction |
+| `l2_to_l2_runs_total` | Completed L2→L2 terminal-convergence passes |
 
 The ratio `output_points_total / source_points_total` indicates how much deduplication
 or tombstone removal is occurring over time.
@@ -172,10 +223,10 @@ or tombstone removal is occurring over time.
 | `StorageBuilder` method | Default | Effect |
 |---|---|---|
 | `with_chunk_points(n)` | 2048 | Maximum points per chunk. Also controls the output segment size budget (`n × 512` points per output segment). Larger values produce fewer, bigger segments and reduce compaction frequency but increase per-segment memory and I/O cost. |
+| `with_l2_compaction_trigger(n)` | 32 | L2 total segment count above which same-level terminal convergence may run. `0` disables convergence (L2 stays purely terminal). |
 
-There are no builder methods for the L0/L1 count triggers or the source window size; they
-are fixed at 4 and 8 respectively. The compaction interval is also fixed at 5 seconds in
-the engine defaults.
+There are no builder methods for the L0/L1 count triggers; they are fixed at 4. The
+compaction interval is also fixed at 5 seconds in the engine defaults.
 
 ---
 
