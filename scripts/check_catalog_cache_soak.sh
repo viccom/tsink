@@ -3,10 +3,11 @@
 #
 # Runs the #[ignore]d lib test catalog_cache_soak::catalog_cache_soak_long_run
 # in release mode: 30 series x 10 points/s with default knobs (catalog entry
-# cache 32768 / series cache 32 MiB, WAL PerAppend), sampling RSS and
-# catalog_cache_entries every 5 min. PASS requires RSS slope <= 0.5 MB/h
+# cache 32768 / series cache 32 MiB, WAL PerAppend), sampling RSS,
+# catalog_cache_entries (entries map only) and catalog_cache_series_slots
+# (observation only) every 5 min. PASS requires RSS slope <= 0.5 MB/h
 # (first 25% samples dropped as warmup; skipped with a warning under 4
-# samples) and catalog_cache_entries never above the capacity bound.
+# samples) and catalog_cache_entries never above the entry capacity bound.
 #
 # Usage:
 #   scripts/check_catalog_cache_soak.sh                 # full 2h gate (7200s)

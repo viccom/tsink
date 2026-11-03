@@ -221,6 +221,7 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             // observability_snapshot_impl 的补填），计数器快照路径恒 0。
             catalog_cache_evictions_total: 0,
             catalog_cache_entries: 0,
+            catalog_cache_series_slots: 0,
             // W3-T4 catalog 增量持久化：运行期三项随计数器读取；启动重放三项
             // 由 StartupFinalizePhase 播种进计数器后照常读取。
             catalog_delta_appended_total: counters
@@ -413,12 +414,17 @@ impl ChunkStorage {
             }),
             flush: {
                 // W2-T2：catalog 缓存计数器在缓存内部（不在 FlushObservabilityCounters），
-                // 计数器快照之外补填这两个字段。
+                // 计数器快照之外补填这三个字段。entries 与 series 两个 map 的常驻
+                // 槽位分开报——容量判据只对 entries 有意义（见字段文档）。
                 let mut flush = FlushObservabilitySnapshot::from(&self.observability.flush);
-                let (catalog_cache_evictions_total, catalog_cache_entries) =
-                    self.persisted.catalog_validate_cache.observability_totals();
+                let (
+                    catalog_cache_evictions_total,
+                    catalog_cache_entries,
+                    catalog_cache_series_slots,
+                ) = self.persisted.catalog_validate_cache.observability_totals();
                 flush.catalog_cache_evictions_total = catalog_cache_evictions_total;
                 flush.catalog_cache_entries = catalog_cache_entries;
+                flush.catalog_cache_series_slots = catalog_cache_series_slots;
                 flush
             },
             compaction: CompactionObservabilitySnapshot::from(&self.observability.compaction),

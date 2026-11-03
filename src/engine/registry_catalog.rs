@@ -368,13 +368,18 @@ impl CatalogEntryCache {
         }
     }
 
-    /// （累计淘汰条数, 当前驻留条目数）——entries 与 series 两 map 合计。
-    pub(super) fn observability_totals(&self) -> (u64, u64) {
+    /// `(累计淘汰条数, entries map 常驻槽位, series map 常驻槽位)`。
+    ///
+    /// 淘汰计数取双 map 合计（运维关心总淘汰量）；常驻槽位**必须分开报**：
+    /// entries 受条数容量约束（`with_catalog_entry_cache_capacity`），series 受
+    /// 字节预算约束、条数无上限——合计值套 entries-only 容量判据会报假的
+    /// 「缓存越界」（W2-T2 soak 判据曾因此绿得偶然）。
+    pub(super) fn observability_totals(&self) -> (u64, u64, u64) {
         (
             self.entries.evictions_total.load(Ordering::Relaxed)
                 + self.series.evictions_total.load(Ordering::Relaxed),
-            self.entries.resident.load(Ordering::Relaxed)
-                + self.series.resident.load(Ordering::Relaxed),
+            self.entries.resident.load(Ordering::Relaxed),
+            self.series.resident.load(Ordering::Relaxed),
         )
     }
 
@@ -1798,6 +1803,70 @@ mod catalog_entry_cache_tests {
                 .expect("real segment root must build an entry");
         }
         cache.entries_len()
+    }
+
+    /// 目标语义：`observability_totals()` 的 resident 只反映 **entries map**
+    /// （受 `with_catalog_entry_cache_capacity` 约束），不得把 series map 的
+    /// 常驻槽位（字节预算约束、条数无上限）并进来——否则 soak 判据拿 entries
+    /// 容量去卡双 map 合计，只要 series 有任意驻留就报假的「缓存越界」。
+    #[test]
+    fn catalog_cache_observability_resident_counts_entries_map_only() {
+        let cache = CatalogEntryCache::default();
+        for i in 0..2u64 {
+            cache
+                .entries
+                .insert(PathBuf::from(format!("/seg/entries-{i}")), None, 0);
+        }
+        for i in 0..5u64 {
+            cache
+                .series
+                .insert(PathBuf::from(format!("/seg/series-{i}")), Vec::new(), 0);
+        }
+        assert_eq!(cache.entries_len(), 2);
+        assert_eq!(cache.series_len(), 5);
+
+        let (evictions, entries_resident, series_resident) = cache.observability_totals();
+        assert_eq!(evictions, 0);
+        assert_eq!(
+            entries_resident, 2,
+            "entries resident gauge must count the entries map only (2), not entries + series (7)"
+        );
+        assert_eq!(
+            series_resident, 5,
+            "series slots are reported separately (byte-budget bound, no count cap)"
+        );
+    }
+
+    /// 淘汰计数保持双 map合计（运维关心总淘汰量，且与「容量越界」语义无关）。
+    #[test]
+    fn catalog_cache_observability_evictions_count_both_maps() {
+        let cache = CatalogEntryCache::with_capacity(2, 1);
+        // entries：条数容量 2，插 3 条 → 淘汰 1 条。
+        for i in 0..3u64 {
+            cache
+                .entries
+                .insert(PathBuf::from(format!("/seg/entries-{i}")), None, 8);
+        }
+        // series：字节预算 1，每条 8 字节 → 每次插入都超预算并淘汰。
+        for i in 0..3u64 {
+            cache
+                .series
+                .insert(PathBuf::from(format!("/seg/series-{i}")), Vec::new(), 8);
+        }
+
+        let entries_evictions = cache.entries.evictions_total.load(Ordering::Relaxed);
+        let series_evictions = cache.series.evictions_total.load(Ordering::Relaxed);
+        assert!(
+            entries_evictions > 0 && series_evictions > 0,
+            "both maps must have evicted (entries={entries_evictions}, series={series_evictions})"
+        );
+
+        let (evictions, _entries_resident, _series_resident) = cache.observability_totals();
+        assert_eq!(
+            evictions,
+            entries_evictions + series_evictions,
+            "evictions_total must stay the sum across both maps"
+        );
     }
 
     /// 淘汰水位必须是 ceil(3/4) = `capacity - capacity/4`：`capacity/4*3`

@@ -492,12 +492,19 @@ pub struct FlushObservabilitySnapshot {
     pub catalog_persisted_total: u64,
     #[serde(default)]
     pub catalog_persist_skipped_total: u64,
-    /// W2-T2 catalog 缓存：entries+series 双 map 累计淘汰条数，以及当前
-    /// 驻留条目数（gauge，快照采集时读取）。
+    /// W2-T2 catalog 缓存：entries+series 双 map 累计淘汰条数（counter）。
     #[serde(default)]
     pub catalog_cache_evictions_total: u64,
+    /// catalog entry 缓存（entries map）常驻槽位（gauge）。受
+    /// [`with_catalog_entry_cache_capacity`](StorageBuilder::with_catalog_entry_cache_capacity)
+    /// 的条数容量约束，稳态应 ≤ 配置容量；越过即说明容量低于部署段数。
     #[serde(default)]
     pub catalog_cache_entries: u64,
+    /// catalog series 元数据缓存（series map）常驻槽位（gauge）。受
+    /// [`with_catalog_series_cache_bytes`](StorageBuilder::with_catalog_series_cache_bytes)
+    /// 的字节预算约束，**条数无上限**——不可套 entries 的条数容量判据。
+    #[serde(default)]
+    pub catalog_cache_series_slots: u64,
     /// W3-T4 catalog 增量持久化：delta 追加笔数 / 累计 delta 字节 / 全量
     /// checkpoint 写入次数（冷路径重写与合并/强制锚点合计）。
     #[serde(default)]

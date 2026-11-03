@@ -2,8 +2,9 @@
 //!
 //! 本地手动长跑（`#[ignore]`，不入 CI）：以生产对照口径（30 series × 总速率
 //! 10 点/s、默认旋钮 32768 entries / 32 MiB series、WAL PerAppend）持续写入，
-//! 每 5min 采样一次 RSS 与 `catalog_cache_entries`，判定「常驻内存不随历史
-//! 段数增长」：RSS 斜率 ≤ 0.5 MB/h 且缓存驻留不超过容量上界。
+//! 每 5min 采样一次 RSS、`catalog_cache_entries`（entries map 常驻槽位）与
+//! `catalog_cache_series_slots`（series map 常驻槽位，观测值），判定「常驻内存
+//! 不随历史段数增长」：RSS 斜率 ≤ 0.5 MB/h 且 entries 常驻不超过 entries 容量上界。
 //!
 //! 跑法（推荐经驱动脚本，release 构建）：
 //!
@@ -20,7 +21,9 @@
 //!
 //! 判定口径：样本数 ≥ 4 时剔除前 25% 作为 warmup，对余下 RSS 样本做最小二乘，
 //! 斜率换算 MB/h 后断言 ≤ 0.5；样本数 < 4（短冒烟窗）跳过斜率判定只打警告。
-//! `catalog_cache_entries ≤ DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY` 任何时候都判定。
+//! `catalog_cache_entries ≤ DEFAULT_CATALOG_ENTRY_CACHE_CAPACITY` 任何时候都判定
+//! （只对 entries map——series slots 由字节预算约束、条数无上限，不设条数上界，
+//! 仅在 verdict 行作为观测值打印）。
 
 use super::*;
 use std::io::Write;
@@ -38,7 +41,10 @@ const PER_SERIES_STEP_NANOS: i64 = 3_000_000_000;
 struct SoakSample {
     elapsed_s: u64,
     rss_kb: u64,
+    /// entries map 常驻槽位（受 entries 条数容量约束，参与判据）。
     cache_entries: u64,
+    /// series map 常驻槽位（字节预算约束、条数无上限；仅观测，不参与判据）。
+    cache_series_slots: u64,
     cache_evictions_total: u64,
     /// 累计持久化段数（flush 快照）：单调递增，是驱动 catalog 增长的
     /// 「历史段数」口径；快照字段恒可得，无需 -1 回退。
@@ -87,6 +93,7 @@ fn take_sample(storage: &dyn Storage, elapsed_s: u64) -> SoakSample {
         elapsed_s,
         rss_kb: read_rss_kb(),
         cache_entries: snapshot.flush.catalog_cache_entries,
+        cache_series_slots: snapshot.flush.catalog_cache_series_slots,
         cache_evictions_total: snapshot.flush.catalog_cache_evictions_total,
         segment_count: snapshot.flush.persisted_segments_total,
     }
@@ -100,19 +107,21 @@ fn record_sample(
 ) {
     let sample = take_sample(storage, elapsed_s);
     println!(
-        "[soak] elapsed={}s rss_kb={} entries={} evictions={} segments={}",
+        "[soak] elapsed={}s rss_kb={} entries={} series_slots={} evictions={} segments={}",
         sample.elapsed_s,
         sample.rss_kb,
         sample.cache_entries,
+        sample.cache_series_slots,
         sample.cache_evictions_total,
         sample.segment_count,
     );
     writeln!(
         csv,
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{}",
         sample.elapsed_s,
         sample.rss_kb,
         sample.cache_entries,
+        sample.cache_series_slots,
         sample.cache_evictions_total,
         sample.segment_count,
     )
@@ -169,7 +178,7 @@ fn catalog_cache_soak_long_run() {
     let mut csv = std::fs::File::create(&csv_path).expect("create soak csv file");
     writeln!(
         csv,
-        "elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_evictions_total,segment_count"
+        "elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_series_slots,catalog_cache_evictions_total,segment_count"
     )
     .expect("write soak csv header");
 
@@ -225,6 +234,11 @@ fn catalog_cache_soak_long_run() {
         .map(|s| s.cache_entries)
         .max()
         .unwrap_or_default();
+    let max_series_slots = samples
+        .iter()
+        .map(|s| s.cache_series_slots)
+        .max()
+        .unwrap_or_default();
     let max_evictions = samples
         .iter()
         .map(|s| s.cache_evictions_total)
@@ -234,7 +248,8 @@ fn catalog_cache_soak_long_run() {
 
     let mut failures: Vec<String> = Vec::new();
 
-    // 缓存驻留上界判定（任何窗口都执行——这正是 W2-T2 的行为回归点）。
+    // entries 常驻上界判定（任何窗口都执行——这正是 W2-T2 的行为回归点）。
+    // series slots 由字节预算约束、条数无上限，不设条数上界（仅观测）。
     if max_entries > capacity {
         failures.push(format!(
             "catalog_cache_entries {max_entries} exceeded capacity bound {capacity}"
@@ -270,7 +285,7 @@ fn catalog_cache_soak_long_run() {
         .unwrap_or_else(|| "skipped(samples<4)".to_string());
     let verdict = if failures.is_empty() { "PASS" } else { "FAIL" };
     println!(
-        "catalog-cache-soak: {verdict} slope={slope_display} entries={max_entries}/{capacity} duration={duration_s}s evictions={max_evictions} samples={}",
+        "catalog-cache-soak: {verdict} slope={slope_display} entries={max_entries}/{capacity} series_slots={max_series_slots} duration={duration_s}s evictions={max_evictions} samples={}",
         samples.len(),
     );
 

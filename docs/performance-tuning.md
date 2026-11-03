@@ -336,10 +336,13 @@ Both caches are LRU (touch-order refresh, bulk eviction to a 3/4 watermark), and
 
 ### Observability
 
-The flush observability snapshot carries two fields (library API via `observability_snapshot()`; the server `/metrics` exporter does not yet publish them):
+The flush observability snapshot carries three fields (library API via `observability_snapshot()`; the server `/metrics` exporter does not yet publish them):
 
-- `catalog_cache_entries` — currently resident slots across both maps (gauge). Must stay at or below the configured entry capacity.
+- `catalog_cache_entries` — currently resident slots of the **entries map** (gauge). Bounded by the configured entry capacity, and it must stay at or below it.
+- `catalog_cache_series_slots` — currently resident slots of the **series map** (gauge). Bounded by the series **byte budget** rather than a slot count, so it has no count ceiling and must not be compared against the entry capacity. A large value just means many small series definitions are resident.
 - `catalog_cache_evictions_total` — cumulative evictions across both maps (counter). Steadily climbing means the capacity is below your segment count — raise it.
+
+The two resident gauges are reported separately on purpose: their limits are of different kinds (slot count vs bytes), and summing them into one number invites comparing the sum against a single capacity, which reports a false overrun as soon as any series slot is resident.
 
 ### Regression: long-run memory slope
 
@@ -350,7 +353,7 @@ scripts/check_catalog_cache_soak.sh                    # full 2 h gate (default)
 TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # short smoke run
 ```
 
-The harness writes 30 series at a total 10 points/s (the rs-iot production-matching profile) with default knobs and WAL `PerAppend`, sampling `elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_evictions_total,segment_count` every 5 min into `TSINK_SOAK_CSV` (default `/tmp/tsink-catalog-cache-soak.csv`). It drops the first 25 % of samples as warmup, fits a least-squares line to the rest, and passes only when the RSS slope is ≤ 0.5 MB/h and `catalog_cache_entries` never exceeds the capacity bound; under 4 samples (short windows) the slope judgement is skipped with a warning.
+The harness writes 30 series at a total 10 points/s (the rs-iot production-matching profile) with default knobs and WAL `PerAppend`, sampling `elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_series_slots,catalog_cache_evictions_total,segment_count` every 5 min into `TSINK_SOAK_CSV` (default `/tmp/tsink-catalog-cache-soak.csv`). It drops the first 25 % of samples as warmup, fits a least-squares line to the rest, and passes only when the RSS slope is ≤ 0.5 MB/h and `catalog_cache_entries` (entries map only) never exceeds the entry capacity bound; `catalog_cache_series_slots` is printed as an observation but carries no count assertion (the series map is byte-budgeted). Under 4 samples (short windows) the slope judgement is skipped with a warning.
 
 ---
 
