@@ -293,6 +293,13 @@ fn assert_aggregates_equal(baseline: &[SeriesAggregate], converged: &[SeriesAggr
 #[test]
 #[ignore = "env-gated convergence drill; see module docs (W4-T5)"]
 fn l2_convergence_drill() {
+    // 诊断基建：真实副本 fail-fast 时后台 worker 的 tracing ERROR 日志需有
+    // subscriber 才可见（env_logger 只桥 log crate，捕不到 tracing 事件；
+    // 否则 panic 只剩 StorageShuttingDown 表象，根因不可定位）。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let data_dir_env = std::env::var("TSINK_CONVERGE_DATA_DIR").ok();
     let synthetic_segments_env = std::env::var("TSINK_CONVERGE_SYNTHETIC_SEGMENTS").ok();
     let (data_dir, _temp_guard) = match (data_dir_env, synthetic_segments_env) {
