@@ -146,10 +146,12 @@ The `PerAppend` durability contract above is enforced empirically by `tests/cras
 # Quick sweep: 5 rounds per kill mode (4 modes = 20 crash/reopen cycles), ~6 s.
 cargo test --test crash_consistency_test
 
-# Gate script: 20 rounds per mode (80 cycles), ~6 s; fails on any violation.
+# Gate script: 20 rounds per mode (80 cycles), ~30 s; fails on any violation.
 scripts/check_crash_consistency.sh            # env: ITER (default 20), REPEAT (default 1), RUST_LOG (default warn)
 ITER=40 REPEAT=2 scripts/check_crash_consistency.sh
 ```
+
+The gate script **exports** `ITER` to the `cargo test` child process, so a bare run really performs the 20 rounds per mode (80 cycles) it announces — measured ~30 s, i.e. 4× the plain `cargo test` sweep. `scripts/check_crash_consistency.sh --dry-run` prints the `ITER` the child process will see, without running cargo; `scripts/tests/test_crash_gate_iter.sh` asserts on that output so a missing export cannot silently shrink the sweep again.
 
 `ITER` (environment variable) sets the rounds **per kill mode**; round `i` of every mode runs with seed `SEED_BASE + i` (`0xA5A5_0001 + i`), which drives a SplitMix64-derived kill delay, so sweeps are reproducible. `ITER=0` or a non-numeric value panics — a misconfigured crash gate must fail, not silently shrink the sweep.
 

@@ -3,6 +3,10 @@
 # tests/crash_consistency_test.rs — 4 kill modes x ITER rounds per run.
 #
 # Usage: [ITER=20] [REPEAT=1] [RUST_LOG=warn] scripts/check_crash_consistency.sh
+#        scripts/check_crash_consistency.sh --dry-run
+#
+# `--dry-run` runs no cargo: it prints the ITER that the `cargo test` child
+# process would see (regression guard: scripts/tests/test_crash_gate_iter.sh).
 #
 # NOTE: do NOT pass `--ignored --exact crash_child_mode` to cargo here. That
 # argv belongs to the *parent* test, which re-executes this test binary to
@@ -15,6 +19,23 @@ ITER="${ITER:-20}"
 REPEAT="${REPEAT:-1}"
 RUST_LOG="${RUST_LOG:-warn}"
 export RUST_LOG
+# ITER must be exported: `cargo test` runs the test binary as a child process,
+# and the test reads ITER from its own environment. Without this, a bare run
+# silently falls back to the test's DEFAULT_ITER (5) and the 80-round sweep
+# announced below is actually 20 rounds.
+export ITER
+
+if [[ "${1-}" == "--dry-run" ]]; then
+  # Report ITER from the child-process perspective, not from this shell: only
+  # exported variables appear in `env`, which is exactly what `cargo test`
+  # passes on to the test binary.
+  child_iter=$(env | grep -E '^ITER=') || {
+    echo "ITER is not exported; cargo test would not see it"
+    exit 1
+  }
+  echo "${child_iter}"
+  exit 0
+fi
 
 run_start=$SECONDS
 failures=0
