@@ -10,8 +10,12 @@
 //!
 //! ```text
 //! scripts/check_catalog_cache_soak.sh                     # 默认 7200s
-//! TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # 短冒烟
+//! SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh         # 短冒烟（旧别名）
+//! TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # 短冒烟（直接旋钮）
 //! ```
+//!
+//! 两种写法等价：脚本不会覆盖调用方已设的 `TSINK_SOAK_SECONDS`，
+//! `SOAK_SECONDS` 仅在 `TSINK_SOAK_SECONDS` 未设时作为别名转发。
 //!
 //! 环境变量：
 //! - `TSINK_SOAK_SECONDS`：写入持续秒数（默认 7200）。

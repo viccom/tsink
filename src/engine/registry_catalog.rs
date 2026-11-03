@@ -1271,8 +1271,12 @@ fn validate_catalog_checkpoint_with_deltas(
     };
 
     let mut reconstructed = actual.segments;
+    // 指纹缺失的判定必须以 checkpoint 自身为起点：旧版本主文件反序列化得到
+    // `None`（字段 `#[serde(default)]`），且**无 delta 可重放**时循环一次也不
+    // 执行——若把判定只放在循环体内，这条「升级后首次启动」的典型盘面会显示
+    // 回退计数 0（而启动确实逐段读了 series.bin）。
+    let mut fingerprint_fallback = actual.series_fingerprint.is_none();
     let mut fingerprint = actual.series_fingerprint;
-    let mut fingerprint_fallback = false;
     let mut replayed = 0u64;
     for (offset, (seq, delta_path)) in deltas
         .iter()

@@ -324,7 +324,10 @@ impl Compactor {
             .iter()
             .take(self.source_window_segments.max(2))
             .take_while(|candidate| {
-                cumulative_points += candidate.manifest.point_count;
+                // 饱和加：窗口上限最多 16 段，正常不可能溢出；与 execution.rs
+                // 的点数记账纪律一致，避免极端 manifest 值在 debug 构建里 panic。
+                cumulative_points =
+                    cumulative_points.saturating_add(candidate.manifest.point_count);
                 cumulative_points <= max_input_points
             })
             .copied()

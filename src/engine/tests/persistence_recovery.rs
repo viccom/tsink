@@ -4003,3 +4003,98 @@ fn reopen_floors_segment_id_allocator_at_max_persisted_dirname() {
          pre-close max (2); observed max L0 dirname id {l0_max_after}"
     );
 }
+
+/// C-8（红）：checkpoint 指纹为 `null` 且**没有**任何 delta 可重放时，
+/// `catalog_delta_fingerprint_fallback_total` 必须计 1。
+///
+/// 这是「从旧版本升级」的典型盘面：旧版 catalog 主文件不带
+/// `series_fingerprint`（字段 `#[serde(default)]` ⇒ 反序列化为 `None`），
+/// 上一会话正常关闭后 delta 目录已被清理（无 delta 可重放）。启动校验通过
+/// （段集匹配），快路径确实关闭（每个段都要全量读 `series.bin`），但当前实现
+/// 把 `fingerprint_fallback` 只放在 delta 重放循环里赋值 ⇒ 无 delta 时恒
+/// `false` ⇒ 计数器显示 0，与 `docs/storage-engine.md`「指纹为 null 也要计数」
+/// 的约定不符。
+///
+/// 盘面构造：建实例 → 写段 → close（生成带指纹的 checkpoint 并清理 delta）→
+/// 手工把主文件 `series_fingerprint` 改成 `null` → 删除 delta 目录（连 marker
+/// 一起，`checkpoint_seq` 回落到 0）→ reopen → 读快照断言计数。
+#[test]
+fn catalog_fingerprint_fallback_counts_null_checkpoint_without_deltas() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "null-fingerprint")];
+
+    // 第一开：基线数据 + close（强制 checkpoint：主文件带指纹、delta 清理）。
+    {
+        let storage = catalog_delta_builder(data_path).build().unwrap();
+        settle_past_catalog_persist_throttle();
+        for idx in 0..3 {
+            insert_catalog_delta_series(&storage, &format!("catalog-null-fp-{idx}"), &labels, 1, 4);
+        }
+        storage.close().unwrap();
+    }
+
+    // 盘面自证：主文件存在且确实带指纹（否则这条用例构造的不是「旧版本」场景）。
+    let checkpoint = std::fs::read(&catalog_file).expect("close must leave a catalog checkpoint");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&checkpoint).expect("catalog checkpoint must be valid JSON");
+    assert!(
+        !value["series_fingerprint"].is_null(),
+        "precondition: a fresh close writes a checkpoint that carries a series fingerprint"
+    );
+    assert!(
+        value["segments"]
+            .as_array()
+            .map(|segments| !segments.is_empty())
+            .unwrap_or(false),
+        "precondition: the checkpoint must carry the on-disk segments"
+    );
+
+    // 模拟旧版本盘面：指纹字段为 null（旧版序列化没有该字段 ⇒ serde default
+    // 同样得到 None；两种构造等价，这里取显式 null 以固定盘面形状）。
+    value["series_fingerprint"] = serde_json::Value::Null;
+    std::fs::write(&catalog_file, serde_json::to_vec_pretty(&value).unwrap())
+        .expect("the null-fingerprint checkpoint must be writable");
+    // 无 delta：上一会话正常关闭已清理 delta 文件，这里把目录（含 marker）一并
+    // 删除，保证重放循环一次也不执行。
+    let _ = std::fs::remove_dir_all(&delta_dir);
+    assert!(
+        !delta_dir.exists(),
+        "precondition: the crash-free disk state carries no delta directory"
+    );
+
+    // 重开：段集匹配 ⇒ 校验通过，但指纹缺失 ⇒ 回退计数必须为 1。
+    let reopened = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed on a valid catalog with a null fingerprint");
+    let snapshot = reopened.observability_snapshot();
+    assert_eq!(
+        snapshot.flush.catalog_delta_fingerprint_fallback_total, 1,
+        "a null checkpoint fingerprint with no delta to replay must count one fallback \
+         (startup reads every segment's series.bin), got {}",
+        snapshot.flush.catalog_delta_fingerprint_fallback_total
+    );
+    assert_eq!(
+        snapshot.flush.catalog_delta_replayed_total, 0,
+        "no delta exists on this disk state, so no replay may be counted"
+    );
+    assert_eq!(
+        snapshot.flush.catalog_delta_apply_fallback_total, 0,
+        "the catalog validated, so no apply fallback may be counted"
+    );
+
+    // 数据面自证：指纹回退只影响启动快慢，不影响数据。
+    for idx in 0..3 {
+        assert_catalog_delta_series_window(
+            &reopened,
+            &format!("catalog-null-fp-{idx}"),
+            &labels,
+            1,
+            4,
+        );
+    }
+    reopened.close().unwrap();
+}

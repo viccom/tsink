@@ -45,7 +45,13 @@ The overlap trigger exists because overlapping segments break the sorted-segment
 assumption that queries rely on: merging them eagerly keeps the persisted view coherent
 and avoids returning duplicates at query time.
 
-Each `compact_once` call checks L0 first, then L1. Only one level is compacted per call.
+Each `compact_once` call walks three transitions — L0→L1, L1→L2 and L2→L2 (terminal
+convergence) — in a rotating order rather than a fixed one, and stops at the first
+eligible one, so at most one transition is compacted per call. The rotation is
+level-fair arbitration (`planning.rs`, `compact_once_scoped`): the transition that
+compacted last is moved to the back of the queue, so a continuously triggering
+transition (L0→L1 under sustained writes) cannot starve the others. Close-drain passes
+skip the L2→L2 entry entirely so a legacy terminal backlog cannot extend shutdown.
 
 ---
 
@@ -240,7 +246,7 @@ or tombstone removal is occurring over time.
 
 | `StorageBuilder` method | Default | Effect |
 |---|---|---|
-| `with_chunk_points(n)` | 2048 | Maximum points per chunk. Also controls the output segment size budget (`n × 512` points per output segment). Larger values produce fewer, bigger segments and reduce compaction frequency but increase per-segment memory and I/O cost. |
+| `with_chunk_points(n)` | 2048 | Maximum points per chunk. It controls chunk granularity only — the output segment point budget is independent of it: a fixed 8,388,608 points (8× the 1M-point L0 flush shard), overridable with `with_output_segment_point_budget`. Larger values produce fewer, bigger chunks and reduce compaction frequency but increase per-segment memory and I/O cost. |
 | `with_l2_compaction_trigger(n)` | 32 | L2 total segment count above which same-level terminal convergence may run. `0` disables convergence (L2 stays purely terminal) at zero cost: no L2 manifest is surveyed. Likewise no survey happens while the L2 segment count stays at or below `n`. |
 
 There are no builder methods for the L0/L1 count triggers; they are fixed at 4. The

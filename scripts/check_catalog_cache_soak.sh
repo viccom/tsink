@@ -12,9 +12,12 @@
 # Usage:
 #   scripts/check_catalog_cache_soak.sh                 # full 2h gate (7200s)
 #   SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh  # short smoke run
+#   TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh  # same, direct knob
 #
 # Env knobs:
-#   SOAK_SECONDS  duration forwarded to TSINK_SOAK_SECONDS (default 7200)
+#   TSINK_SOAK_SECONDS  duration forwarded to the test (default 7200); a value
+#                 already set by the caller is respected, not overwritten
+#   SOAK_SECONDS  fallback alias for TSINK_SOAK_SECONDS (default 7200)
 #   SOAK_CSV      csv path forwarded to TSINK_SOAK_CSV
 #                 (default /tmp/tsink-catalog-cache-soak.csv)
 #
@@ -23,8 +26,9 @@
 # here (a bare `catalog_cache_soak` matches nothing under --exact).
 set -euo pipefail
 
-SOAK_SECONDS="${SOAK_SECONDS:-7200}"
-export TSINK_SOAK_SECONDS="$SOAK_SECONDS"
+# Caller-supplied TSINK_SOAK_SECONDS wins; SOAK_SECONDS stays supported as the
+# legacy alias, and 7200 is the default.
+export TSINK_SOAK_SECONDS="${TSINK_SOAK_SECONDS:-${SOAK_SECONDS:-7200}}"
 if [[ -n "${SOAK_CSV:-}" ]]; then
   export TSINK_SOAK_CSV="$SOAK_CSV"
 fi
@@ -32,7 +36,7 @@ CSV_PATH="${TSINK_SOAK_CSV:-/tmp/tsink-catalog-cache-soak.csv}"
 
 TEST_NAME="engine::storage_engine::tests::catalog_cache_soak::catalog_cache_soak_long_run"
 
-echo "==> catalog-cache soak: ${SOAK_SECONDS}s, csv=${CSV_PATH}"
+echo "==> catalog-cache soak: ${TSINK_SOAK_SECONDS}s, csv=${CSV_PATH}"
 log="$(mktemp /tmp/tsink-catalog-cache-soak.XXXXXX.log)"
 trap 'rm -f "$log"' EXIT
 

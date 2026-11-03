@@ -412,7 +412,7 @@ L2 segments    (cold-compacted, largest, longest time span; default terminal lev
 
 Each compaction pass:
 
-1. **Planning** (`compactor/planning.rs`) — selects a window of up to 8 source segments at the triggering level.
+1. **Planning** (`compactor/planning.rs`) — selects a window of up to 16 source segments at the triggering level.
 2. **Execution** (`compactor/execution.rs`) — merge-sorts all chunks, deduplicates overlapping samples, re-encodes with optimal codecs, writes new target-level segment.
 3. **Atomic replacement** — the replacement is staged in `.compaction-replacements/` and renamed into place. If the process crashes mid-replacement, `finalize_pending_compaction_replacements` cleans up the staging area at next startup.
 

@@ -350,8 +350,11 @@ The `#[ignore]`d soak test (`catalog_cache_soak::catalog_cache_soak_long_run`, n
 
 ```bash
 scripts/check_catalog_cache_soak.sh                    # full 2 h gate (default)
-TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # short smoke run
+SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # short smoke run
+TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # same, direct knob
 ```
+
+Both spellings work: `TSINK_SOAK_SECONDS` is the knob the test itself reads and is never overwritten by the script, and `SOAK_SECONDS` is a legacy alias forwarded to it when `TSINK_SOAK_SECONDS` is unset.
 
 The harness writes 30 series at a total 10 points/s (the rs-iot production-matching profile) with default knobs and WAL `PerAppend`, sampling `elapsed_s,rss_kb,catalog_cache_entries,catalog_cache_series_slots,catalog_cache_evictions_total,segment_count` every 5 min into `TSINK_SOAK_CSV` (default `/tmp/tsink-catalog-cache-soak.csv`). It drops the first 25 % of samples as warmup, fits a least-squares line to the rest, and passes only when the RSS slope is ≤ 0.5 MB/h and `catalog_cache_entries` (entries map only) never exceeds the entry capacity bound; `catalog_cache_series_slots` is printed as an observation but carries no count assertion (the series map is byte-budgeted). Under 4 samples (short windows) the slope judgement is skipped with a warning.
 
@@ -475,7 +478,7 @@ tsink-server --memory-limit 2684354560 --data-path ./var/tsink
 
 ## 13. Monitoring performance
 
-All internal counters are exposed at `GET /metrics` in Prometheus format. The most useful ones for performance diagnosis:
+Most internal counters are exposed at `GET /metrics` in Prometheus format. The catalog cache/delta counters (`catalog_cache_entries`, `catalog_cache_series_slots`, `catalog_cache_evictions_total`, the `catalog_delta_*` family) and the L2-convergence counters (`l2_to_l2_runs_total` and friends) are library-API only today — read them from `Storage::observability_snapshot()`; they are not yet exported through the server's Prometheus endpoint. The most useful ones that *are* exposed:
 
 ### Write throughput and latency
 

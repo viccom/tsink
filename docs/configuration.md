@@ -2,6 +2,8 @@
 
 Complete listing of every configuration knob in tsink — the embedded library API, the server CLI flags, and the environment variables that tune ingestion, clustering, and background workers.
 
+The catalog cache knobs (`with_catalog_entry_cache_capacity`, `with_catalog_series_cache_bytes`) and the L2-convergence knob (`with_l2_compaction_trigger`) are documented with their defaults and sizing guidance in [performance-tuning §8 Catalog caches](performance-tuning.md#8-catalog-caches) and [compaction §Tuning](compaction.md#tuning) rather than duplicated here.
+
 Sections are ordered from most commonly used to most advanced.
 
 ---
@@ -33,7 +35,7 @@ Sections are ordered from most commonly used to most advanced.
 
 ## 1. Embedded library — `StorageBuilder`
 
-These are the options exposed through the `StorageBuilder` Rust API and the equivalent `TsinkStorageBuilder` Python bindings. See the [embedded library guide](embedded-library.md) and [Python bindings guide](python-bindings.md) for usage examples.
+These are the options exposed through the `StorageBuilder` Rust API. The `TsinkStorageBuilder` Python bindings mirror this table only where they implement the method — `crates/tsink-uniffi/src/builder.rs` is the authoritative list — so treat "equivalent" as scoped to the rows the bindings actually carry. See the [embedded library guide](embedded-library.md) and [Python bindings guide](python-bindings.md) for usage examples. Notably, the FFI builder does **not** yet expose the catalog cache knobs (`with_catalog_entry_cache_capacity`, `with_catalog_series_cache_bytes`), the catalog-delta throttles (`with_catalog_delta_max_count`, `with_catalog_delta_max_bytes`, `with_catalog_persist_interval`), the L2-convergence knob (`with_l2_compaction_trigger`), or the compaction window/output-budget knobs (`with_source_window_segments`, `with_output_segment_point_budget`) — those are Rust-API only for now.
 
 ### Storage & persistence
 
@@ -46,7 +48,7 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 | `with_catalog_delta_max_count(n)` | `usize` | `100` | Pending segment-catalog delta count at which the pending changes consolidate into a full catalog checkpoint instead of becoming another delta file. The change that reaches the threshold is absorbed by that checkpoint (`3` means the third change never becomes a delta file). Values below `1` behave as `1`: every change consolidates straight into a full checkpoint and no delta files are written. |
 | `with_catalog_delta_max_bytes(n)` | `u64` | `1 MiB` | Serialized byte total of pending segment-catalog deltas at which the pending changes consolidate into a full catalog checkpoint. The change that would exceed the total is absorbed by that checkpoint, so `0` consolidates every change directly into a full checkpoint. |
 
-The catalog persists incrementally (see [Segment Catalog](storage-engine.md#segment-catalog) in the storage-engine internals): each publish tick appends one delta file (`O(changes)` work), and the two `catalog_delta_max_*` knobs only decide *when* pending deltas fold back into the full checkpoint — they never gate, delay, or drop a publish. `with_catalog_persist_interval(duration)` (default `30s`) is a separate throttle for the cold path only: full-catalog rebuilds issued without a reported change set (startup finalize, full-scan publishes) run at most once per interval, further deduplicated by a content fingerprint. Delta appends are never throttled by it, and threshold-triggered consolidations plus shutdown/checkpoint anchors ignore it entirely.
+The catalog persists incrementally (see [Segment Catalog](storage-engine.md#segment-catalog) in the storage-engine internals): each publish tick appends one delta file (`O(changes + series)` work — added entries come from the segment-entry cache, while the whole-registry series fingerprint is recomputed on every append, so cost is linear in the total series count, independent of segment count, and includes a deep copy of the cached series metadata), and the two `catalog_delta_max_*` knobs only decide *when* pending deltas fold back into the full checkpoint — they never gate, delay, or drop a publish. `with_catalog_persist_interval(duration)` (default `30s`) is a separate throttle for the cold path only: full-catalog rebuilds issued without a reported change set (startup finalize, full-scan publishes) run at most once per interval, further deduplicated by a content fingerprint. Delta appends are never throttled by it, and threshold-triggered consolidations plus shutdown/checkpoint anchors ignore it entirely.
 
 ### Retention & tiering
 
