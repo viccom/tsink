@@ -168,10 +168,21 @@ impl Compactor {
         }
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 
-        // "The previous winner goes to the back": keep the natural order but
-        // move the transition that ran last to the end, so the two (now
-        // three) transitions rotate fairly instead of a continuously
-        // triggering one monopolizing every pass.
+        // True round-robin, not "the previous winner goes to the back": the
+        // next pass starts at the transition *after* the previous winner and
+        // walks forward (wrapping), so every transition gets the head of the
+        // queue in turn.
+        //
+        // Why the old `sort_by_key(Some(*t) == last)` was not equivalent: it
+        // only pushed the previous winner to the tail, leaving the other two
+        // in their natural order (stable sort). With L0->L1 and L1->L2 both
+        // continuously eligible — the steady state this arbitration exists
+        // for (sustained ingest plus an L1 backlog) — that ping-pongs:
+        // last=L0 -> [L1,L2,L0] -> L1 wins; last=L1 -> [L0,L2,L1] -> L0 wins;
+        // back to last=L0. L2ToL2 sits at index 1 or 2 while position 0 is
+        // always occupied by an eligible transition, so terminal convergence
+        // never ran. Rotating from the successor makes the three entries take
+        // turns (L0,L1,L2 -> L1,L2,L0 -> L2,L0,L1 -> ...).
         let last = LevelTransition::from_arbitration_tag(
             self.last_compacted_transition.load(Ordering::Acquire),
         );
@@ -180,7 +191,14 @@ impl Compactor {
             LevelTransition::L1ToL2,
             LevelTransition::L2ToL2,
         ];
-        transitions.sort_by_key(|transition| Some(*transition) == last);
+        if let Some(last) = last {
+            let last_index = transitions
+                .iter()
+                .position(|transition| *transition == last)
+                .expect("arbitration tag round-trips to a known transition");
+            let rotation = (last_index + 1) % transitions.len();
+            transitions.rotate_left(rotation);
+        }
 
         for transition in transitions {
             if scope == PassScope::CloseDrain && transition == LevelTransition::L2ToL2 {

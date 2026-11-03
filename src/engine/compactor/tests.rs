@@ -226,6 +226,94 @@ fn l0_backlog_is_not_starved_by_level_rotation() {
         .is_empty());
 }
 
+/// 三路仲裁必须是**真轮转**：L0→L1 / L1→L2 / L2→L2 三层同时持续可触发时，
+/// 三种 transition 都必须在有限次数内各轮到一次。
+///
+/// 红态（「上次赢家移队尾」）：只有上次赢家被判为 `true` 排到最后，稳定排序
+/// 让其余两个保持自然序。`last=L0 → [L1,L2,L0]`（L1 赢）→ `last=L1 →
+/// [L0,L2,L1]`（L0 赢）→ 回到 `last=L0`……L0/L1 交替、L2 恒在索引 1/2 而
+/// 位置 0 总有人赢，L2ToL2 永不执行。
+///
+/// fixture：三层各预置远超触发阈值的段数（L0 60 / L1 40 / L2 100，阈值
+/// L0=4、L1=4、L2=2），同层段的时间窗互不重叠，所以每层只走 count 触发、
+/// 窗口固定（L0/L1 每次消耗 4 段产 1 段，L2 每次消耗 16 段产 1 段）。即使
+/// 某一层每拍都赢，12 次 pass 也消耗不到阈值以下：三层在整个 N 次 pass 期间
+/// 始终可触发，序列只由仲裁顺序决定。
+#[test]
+fn three_way_arbitration_round_robin_reaches_every_transition() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "rotation")])
+        .unwrap()
+        .series_id;
+
+    for index in 0..60u64 {
+        let ts = index as i64 * 10;
+        write_level_segment(
+            &temp_dir,
+            0,
+            index + 1,
+            series_id,
+            &registry,
+            &[(ts, 1.0), (ts + 1, 2.0)],
+        );
+    }
+    for index in 0..40u64 {
+        let ts = 10_000 + index as i64 * 10;
+        write_level_segment(
+            &temp_dir,
+            1,
+            100 + index,
+            series_id,
+            &registry,
+            &[(ts, 1.0), (ts + 1, 2.0)],
+        );
+    }
+    for index in 0..100u64 {
+        let ts = 1_000_000 + index as i64 * 10;
+        write_level_segment(
+            &temp_dir,
+            2,
+            200 + index,
+            series_id,
+            &registry,
+            &[(ts, 1.0), (ts + 1, 2.0)],
+        );
+    }
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(1000)),
+    )
+    .with_l2_compaction_trigger(2);
+
+    const PASSES: usize = 12;
+    let mut observed = Vec::with_capacity(PASSES);
+    for pass in 0..PASSES {
+        let stats = compactor.compact_once_with_changes().unwrap().stats;
+        let transition = match (stats.source_level, stats.target_level) {
+            (Some(0), Some(1)) => "L0->L1",
+            (Some(1), Some(2)) => "L1->L2",
+            (Some(2), Some(2)) => "L2->L2",
+            other => panic!(
+                "第 {pass} 次 pass：三层都在触发阈值之上，必须有 transition 赢下这一拍，\
+                 实际 {other:?}（stats={stats:?}）"
+            ),
+        };
+        observed.push(transition);
+    }
+
+    for expected in ["L0->L1", "L1->L2", "L2->L2"] {
+        assert!(
+            observed.contains(&expected),
+            "{expected} 在 {PASSES} 次 pass 内一次都没发生——三层同时持续可触发时必须真轮转\
+             （从上次赢家的后继开始排列），而不是「上次赢家移队尾」。实际序列：{observed:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // W4-T1（红）：L2 终层收敛三测。L2 目前是终层（只有 L0→L1 / L1→L2 两个
 // transition），三测的红态都源于「无 L2ToL2 transition → L2 段数不降」；

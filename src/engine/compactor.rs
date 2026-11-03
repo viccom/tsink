@@ -64,11 +64,12 @@ const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Level-fair arbitration state: which level transition compacted last.
-/// The next pass orders the transitions so the one that ran last is tried
-/// last ("the previous winner goes to the back of the queue"), so a
-/// continuously-triggering transition cannot starve the others (the
-/// 4640-segment L1 backlog root cause; `L2ToL2` joined the rotation with
-/// W4-T4's terminal-level convergence).
+/// The next pass starts the rotation at the transition *after* the one that
+/// ran last and walks forward (wrapping), so a continuously-triggering
+/// transition cannot starve the others (the 4640-segment L1 backlog root
+/// cause; `L2ToL2` joined the rotation with W4-T4's terminal-level
+/// convergence). Note these tags are not array indices — planning maps the
+/// tag back to the transition and rotates by its position.
 const LAST_TRANSITION_NONE: u8 = 0;
 const LAST_TRANSITION_L0_TO_L1: u8 = 1;
 const LAST_TRANSITION_L1_TO_L2: u8 = 2;

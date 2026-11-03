@@ -48,10 +48,13 @@ and avoids returning duplicates at query time.
 Each `compact_once` call walks three transitions — L0→L1, L1→L2 and L2→L2 (terminal
 convergence) — in a rotating order rather than a fixed one, and stops at the first
 eligible one, so at most one transition is compacted per call. The rotation is
-level-fair arbitration (`planning.rs`, `compact_once_scoped`): the transition that
-compacted last is moved to the back of the queue, so a continuously triggering
-transition (L0→L1 under sustained writes) cannot starve the others. Close-drain passes
-skip the L2→L2 entry entirely so a legacy terminal backlog cannot extend shutdown.
+level-fair arbitration (`planning.rs`, `compact_once_scoped`): the next pass starts at
+the transition *after* the one that compacted last and walks forward (wrapping), so
+three transitions take turns (L0→L1, L1→L2, L2→L2, then L1→L2, L2→L2, L0→L1, …). That
+is a true round-robin — with L0→L1 and L1→L2 both continuously eligible, merely moving
+the previous winner to the back of the queue would ping-pong between those two and
+starve L2→L2 forever. Close-drain passes skip the L2→L2 entry entirely so a legacy
+terminal backlog cannot extend shutdown.
 
 ---
 
