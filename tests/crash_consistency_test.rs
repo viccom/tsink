@@ -64,7 +64,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -615,10 +615,82 @@ fn spawn_kill_child(
     thread::sleep(delay);
     child.kill().expect("SIGKILL crash child");
     let status = child.wait().expect("reap crash child");
+    match classify_child_exit(status) {
+        ChildExit::ParentKilled => {}
+        ChildExit::SelfCrashed(signal) => panic!(
+            "crash child (mode {mode} phase {phase}) died from signal {signal}, not the parent's SIGKILL ({status:?}); \
+             the kill did not land where the harness expects (child crash / memory-safety defect), see {}",
+            log_path.display()
+        ),
+        ChildExit::Exited(code) => panic!(
+            "crash child (mode {mode} phase {phase}) exited on its own with code {code} ({status:?}); \
+             protocol violation or child panic, see {}",
+            log_path.display()
+        ),
+    }
+}
+
+/// How a reaped crash child actually ended.
+///
+/// The gate's contract is "the parent's SIGKILL ended the child". Anything
+/// else means the kill did not land where the harness believes, and the
+/// round's crash scene is not the one under test. A child dying from its own
+/// crash signal (tsink segment files are mmap'd, so a memory-safety defect
+/// surfaces as SIGSEGV/SIGBUS) must never pass as `ParentKilled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    /// Terminated by the parent's SIGKILL.
+    ParentKilled,
+    /// Died from some other signal.
+    SelfCrashed(i32),
+    /// Exited normally with an exit code.
+    Exited(i32),
+}
+
+/// SIGKILL: the signal the parent uses (`Child::kill`) and therefore the only
+/// death that proves the kill landed where the harness intends.
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+fn classify_child_exit(status: ExitStatus) -> ChildExit {
+    // Unix: death by signal and exit code are distinct wait-status shapes,
+    // and `code().is_none()` alone cannot tell SIGKILL from SIGSEGV/SIGBUS
+    // (both are "no exit code").
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return if signal == SIGKILL {
+                ChildExit::ParentKilled
+            } else {
+                ChildExit::SelfCrashed(signal)
+            };
+        }
+    }
+    // Non-Unix fallback: wait statuses carry no signal, so the best available
+    // signal is "no exit code". This cannot distinguish a self-crash, which is
+    // a capability boundary of the platform, not a decision.
+    match status.code() {
+        Some(code) => ChildExit::Exited(code),
+        None => ChildExit::ParentKilled,
+    }
+}
+
+/// Regression guard for the kill gate itself: a child that dies from a signal
+/// other than the parent's SIGKILL must not be classified as `ParentKilled`.
+#[cfg(unix)]
+#[test]
+fn crash_child_kill_status_must_be_sigkill() {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("kill -SEGV $$")
+        .status()
+        .expect("spawn sh to raise SIGSEGV in itself");
+    let exit = classify_child_exit(status);
     assert!(
-        status.code().is_none(),
-        "crash child (mode {mode} phase {phase}) exited on its own ({status:?}); protocol violation or child panic, see {}",
-        log_path.display()
+        !matches!(exit, ChildExit::ParentKilled),
+        "a child that died from SIGSEGV was classified as {exit:?} ({status:?}) — \
+         a self-inflicted crash must never pass as the parent's SIGKILL"
     );
 }
 
