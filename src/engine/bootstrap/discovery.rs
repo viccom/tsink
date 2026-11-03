@@ -26,6 +26,9 @@ pub(super) struct StartupRegistryState {
 
 pub(super) struct StartupInventoryState {
     pub(super) segment_inventory: SegmentInventory,
+    /// W4-T5fix (D2)：启动扫描见到的最大 `seg-<hex>` dirname id（见
+    /// `StartupRecoveredSegmentInventory::max_dirname_segment_id`）。
+    pub(super) max_dirname_segment_id: u64,
     pub(super) startup_quarantined: Vec<StartupQuarantinedSegment>,
 }
 
@@ -98,6 +101,7 @@ impl StartupInventoryState {
         )?;
         let inventory = Self {
             segment_inventory: startup_inventory.inventory,
+            max_dirname_segment_id: startup_inventory.max_dirname_segment_id,
             startup_quarantined: startup_inventory.quarantined,
         };
         if !inventory.startup_quarantined.is_empty() {

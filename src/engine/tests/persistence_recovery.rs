@@ -3517,3 +3517,130 @@ fn catalog_delta_stale_checkpoint_replays_idempotently() {
     assert_no_duplicate_catalog_entries(&after);
     reopened.close().unwrap();
 }
+
+/// Highest `seg-<hex>` dirname id under one level directory (`0` if none).
+fn max_segment_dirname_id(level_dir: &Path) -> u64 {
+    std::fs::read_dir(level_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            u64::from_str_radix(name.strip_prefix("seg-")?, 16).ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// W4-T5fix (D2): the recovered segment-id allocator must floor at the max
+/// `seg-*` dirname id present on disk, not only at the manifest ids it
+/// happened to load.
+///
+/// Fixture: a valid segment dir whose *manifest* declares id 1 but whose
+/// *dirname* occupies id 2 (`seg-0000000000000002`). This is the degraded
+/// on-disk shape the W4-T5 real-copy drill hit: the persisted allocator
+/// bookkeeping trails the real dirname max (interrupted runs, non-atomic
+/// copies of live directories, cross-version debris). Recovery derives
+/// `next = max(loaded manifest ids) + 1 = 2` — exactly the occupied dirname —
+/// so the first post-reopen persist published `seg-0000000000000002` and died
+/// with `InvalidConfiguration("segment directory already exists: …")`. The
+/// fix floors the recovered allocator at `max(dirname ids) + 1`.
+#[test]
+fn reopen_floors_segment_id_allocator_at_max_persisted_dirname() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let lane_root = data_path.join(NUMERIC_LANE_ROOT);
+    let level_dir = |level: u8| lane_root.join("segments").join(format!("L{level}"));
+
+    // Baseline instance: one real close so the registry snapshot and a real
+    // id-1 L0 segment exist on disk.
+    let labels = vec![Label::new("host", "allocator-drift")];
+    let rows_for = |base_ts: i64| -> Vec<Row> {
+        (0..4)
+            .map(|offset| {
+                Row::with_labels(
+                    "allocator-drift-metric",
+                    labels.clone(),
+                    DataPoint::new(base_ts + offset, offset as f64 + 0.5),
+                )
+            })
+            .collect()
+    };
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(data_path)
+            // Keep background ticks from racing the test-driven close persist.
+            .with_flush_interval(Duration::from_secs(3600))
+            .with_compaction_interval(Duration::from_secs(3600))
+            .build()
+            .expect("baseline storage must open on a fresh dir");
+        storage.insert_rows(&rows_for(1_000)).unwrap();
+        storage.close().expect("baseline close");
+    }
+
+    // Craft the divergence in L0 (the level close-time persist publishes to):
+    // write a real L0 segment with id 1 into an off-lane staging base, then
+    // move its dirname into the lane as id 2. The manifest (and all payload
+    // files) stay keyed to id 1, so recovery still counts manifest id 1 while
+    // the L0 dirname space is occupied up to id 2.
+    let registry = SeriesRegistry::load_persisted_state(&data_path.join(SERIES_INDEX_FILE_NAME))
+        .expect("registry snapshot must load")
+        .expect("baseline close must persist the series registry")
+        .registry;
+    let series_id = registry
+        .resolve_or_insert("allocator-drift-metric", &labels)
+        .expect("drift series must resolve")
+        .series_id;
+    let mut chunks = HashMap::new();
+    chunks.insert(
+        series_id,
+        vec![make_persisted_numeric_chunk(
+            series_id,
+            &[(10_000, 1.0), (10_001, 2.0), (10_002, 3.0)],
+        )],
+    );
+    let drift_base = data_path.join("drift-staging");
+    SegmentWriter::new(&drift_base, 0, 1)
+        .expect("drift segment writer")
+        .write_segment(&registry, &chunks)
+        .expect("drift segment write");
+    std::fs::rename(
+        drift_base
+            .join("segments")
+            .join("L0")
+            .join("seg-0000000000000001"),
+        level_dir(0).join("seg-0000000000000002"),
+    )
+    .expect("drift dirname move");
+
+    // Fixture sanity: the L0 dirname space reaches id 2 while every manifest
+    // id on disk is 1.
+    assert_eq!(max_segment_dirname_id(&level_dir(0)), 2);
+
+    // Reopen: manifest-derived next would be 2 — exactly the occupied dirname.
+    let storage = StorageBuilder::new()
+        .with_data_path(data_path)
+        .with_flush_interval(Duration::from_secs(3600))
+        .with_compaction_interval(Duration::from_secs(3600))
+        .build()
+        .expect("reopen must succeed on the drifted dir");
+
+    // Close persist allocates from the recovered allocator. Before the fix
+    // this published id 2 and failed with
+    // `InvalidConfiguration("segment directory already exists: …seg-0000000000000002")`;
+    // after the fix the allocator starts above the on-disk dirname max and
+    // every published segment avoids conflicts with existing dirs.
+    storage.insert_rows(&rows_for(2_000)).unwrap();
+    storage
+        .close()
+        .expect("close persist must publish above the on-disk max dirname id");
+
+    // The new segment's dirname must not collide with any pre-existing dir:
+    // id 2 was the max before close, so the fresh segment must sit above it.
+    let l0_max_after = max_segment_dirname_id(&level_dir(0));
+    assert!(
+        l0_max_after > 2,
+        "close persist must have published an L0 segment with dirname id above the \
+         pre-close max (2); observed max L0 dirname id {l0_max_after}"
+    );
+}

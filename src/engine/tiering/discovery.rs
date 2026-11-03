@@ -17,6 +17,21 @@ use crate::engine::segment::{
 pub(in crate::engine::storage_engine) struct StartupRecoveredSegmentInventory {
     pub(in crate::engine::storage_engine) inventory: SegmentInventory,
     pub(in crate::engine::storage_engine) quarantined: Vec<StartupQuarantinedSegment>,
+    /// W4-T5fix (D2)：启动扫描覆盖的全部 lane × tier × level 里最大的
+    /// `seg-<hex>` dirname id（无任何段目录时为 0）。恢复分配器下界的托底
+    /// 依据——manifest 加载计数会漏掉被跳过/隔离/去重丢弃的目录，dirname
+    /// 是盘上唯一不被任何加载结果影响的占位事实。复用启动已有的 dir
+    /// listing 计算，零额外文件 IO（纯字符串解析）。
+    pub(in crate::engine::storage_engine) max_dirname_segment_id: u64,
+}
+
+/// Parses the segment id encoded in a `seg-<hex>` segment dirname. Mirrors
+/// the `seg-{id:016x}` writer format (`segment::types::SegmentLayout`) and
+/// the hex parsing precedent in `registry_catalog` replay; non-`seg-` names
+/// and non-hex suffixes (staging/quarantine debris) yield `None`.
+fn segment_dirname_segment_id(file_name: &std::ffi::OsStr) -> Option<u64> {
+    let hex = file_name.to_str()?.strip_prefix("seg-")?;
+    u64::from_str_radix(hex, 16).ok()
 }
 
 pub(in crate::engine::storage_engine) fn build_segment_inventory_startup_recoverable(
@@ -27,14 +42,18 @@ pub(in crate::engine::storage_engine) fn build_segment_inventory_startup_recover
     let resolver = SegmentPathResolver::new(numeric_lane_path, blob_lane_path, tiered_storage);
     let mut deduped = SegmentInventoryAccumulator::default();
     let mut quarantined = Vec::new();
+    let mut max_dirname_segment_id = 0u64;
 
     for target in resolver.inventory_scan_targets() {
-        scan_startup_segment_roots_recoverable(&target, &mut deduped, &mut quarantined)?;
+        let target_max =
+            scan_startup_segment_roots_recoverable(&target, &mut deduped, &mut quarantined)?;
+        max_dirname_segment_id = max_dirname_segment_id.max(target_max);
     }
 
     Ok(StartupRecoveredSegmentInventory {
         inventory: deduped.finish(),
         quarantined,
+        max_dirname_segment_id,
     })
 }
 
@@ -104,8 +123,12 @@ fn scan_startup_segment_roots_recoverable(
     target: &SegmentScanTarget,
     deduped: &mut SegmentInventoryAccumulator,
     quarantined: &mut Vec<StartupQuarantinedSegment>,
-) -> Result<()> {
+) -> Result<u64> {
+    let mut max_dirname_segment_id = 0u64;
     for root in list_segment_dirs(&target.base_path)? {
+        if let Some(dirname_id) = root.file_name().and_then(segment_dirname_segment_id) {
+            max_dirname_segment_id = max_dirname_segment_id.max(dirname_id);
+        }
         let manifest = match read_segment_manifest(&root) {
             Ok(manifest) => manifest,
             Err(err) if is_not_found_error(&err) => {
@@ -133,7 +156,7 @@ fn scan_startup_segment_roots_recoverable(
         });
     }
 
-    Ok(())
+    Ok(max_dirname_segment_id)
 }
 
 fn is_not_found_error(err: &TsinkError) -> bool {

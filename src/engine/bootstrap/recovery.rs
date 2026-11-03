@@ -29,6 +29,8 @@ impl StartupRecoveryPhase {
             mut registry,
             mut inventory,
         } = discovered;
+        // W4-T5fix (D2)：托底值在 inventory 被部分 move 之前取出。
+        let max_dirname_segment_id = inventory.max_dirname_segment_id;
 
         let (validated_catalog, catalog_delta_stats) = validate_startup_registry_catalog(
             plan.paths().series_index_path.as_deref(),
@@ -49,6 +51,7 @@ impl StartupRecoveryPhase {
             validated_catalog.as_ref(),
             &mut loaded_segments,
         )?;
+        floor_next_segment_id_at_max_dirname(&mut loaded_segments, max_dirname_segment_id);
 
         Ok(StartupRecoveryState {
             registry,
@@ -73,6 +76,34 @@ impl StartupRecoveryState {
     pub(super) fn loaded_segments(&self) -> &LoadedSegmentIndexes {
         &self.loaded_segments
     }
+}
+
+/// W4-T5fix (D2)：把恢复出的段 id 分配器下界托底到盘上最大 `seg-<hex>`
+/// dirname id + 1。
+///
+/// 恢复侧的 `next_segment_id` 只由成功加载的 manifest 的 `segment_id` 推导；
+/// 任何「盘上 dirname 占位 id 超过已计数 manifest id」的实例（中断运行残留、
+/// 活目录的非原子拷贝、跨版本遗留、被跳过/隔离/去重丢弃的目录），下一次
+/// 创建段就会撞上 `InvalidConfiguration("segment directory already exists")`
+/// （W4-T5 真实副本 drill 确定性暴露）。dirname 是盘上唯一不受加载结果
+/// 影响的占位事实，而启动本来就要 list 全部 lane × tier × level 的段目录，
+/// 该托底零额外文件 IO。`next` 已 ≥ 托底值时行为完全不变。
+fn floor_next_segment_id_at_max_dirname(
+    loaded_segments: &mut LoadedSegmentIndexes,
+    max_dirname_segment_id: u64,
+) {
+    let dirname_floor = max_dirname_segment_id.saturating_add(1).max(1);
+    if dirname_floor <= loaded_segments.next_segment_id {
+        return;
+    }
+    warn!(
+        recovered_next_segment_id = loaded_segments.next_segment_id,
+        max_dirname_segment_id,
+        floored_next_segment_id = dirname_floor,
+        "Recovered segment id allocator trails the max on-disk segment dirname; \
+         raising the allocator lower bound to avoid publishing a colliding segment"
+    );
+    loaded_segments.next_segment_id = dirname_floor;
 }
 
 /// 启动校验入口：返回校验结论与 W3-T4 delta 重放统计。

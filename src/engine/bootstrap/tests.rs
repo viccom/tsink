@@ -178,6 +178,7 @@ fn inventory_state_apply_quarantines_removes_roots_from_visible_inventory() {
             inventory_entry(keep_root.clone(), 1),
             inventory_entry(bad_root.clone(), 2),
         ]),
+        max_dirname_segment_id: 0,
         startup_quarantined: Vec::new(),
     };
 
