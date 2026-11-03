@@ -52,7 +52,6 @@ impl StartupRecoveryPhase {
             &mut loaded_segments,
         )?;
         floor_next_segment_id_at_max_dirname(&mut loaded_segments, max_dirname_segment_id);
-
         Ok(StartupRecoveryState {
             registry,
             loaded_segments,
