@@ -195,6 +195,14 @@ pub fn list_segment_dirs(base: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
     collect_segment_dirs(base.as_ref(), 0..=2u8)
 }
 
+/// Counts one level's segment directories with a directory listing only (no
+/// manifest is opened). Compaction planning uses this as a cheap pre-gate for
+/// the L2→L2 transition: the level's size can be compared against the
+/// convergence trigger without paying one manifest read per segment.
+pub(crate) fn count_level_segment_dirs(base: impl AsRef<Path>, level: u8) -> Result<usize> {
+    Ok(collect_segment_dirs(base.as_ref(), std::iter::once(level))?.len())
+}
+
 pub fn load_segment(path: impl AsRef<Path>) -> Result<LoadedSegment> {
     let segment = load_segment_dir(path.as_ref())?;
     Ok(LoadedSegment {

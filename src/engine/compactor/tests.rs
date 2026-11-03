@@ -678,6 +678,80 @@ fn l2_compaction_terminates_when_only_large_segments_remain() {
 }
 
 // ---------------------------------------------------------------------------
+// L2ToL2 触发门控的成本面：不需要收敛的拍不得做 manifest survey。
+// 旧实现无条件先 `load_level_compaction_candidates`（每段一次 open+read+
+// parse），`count_trigger == 0` 与「段数 ≤ 阈值」两种必然不收敛的拍也要把
+// 全部 L2 manifest 读一遍——关闭收敛（l2_trigger=0）时每个后台拍（5s）对
+// 16.5k 段白读 16.5k 次，永久持续。两测用 `level_manifest_read_count`
+// （thread-local，planning.rs 埋点）断言 survey 次数为 0。
+// ---------------------------------------------------------------------------
+
+/// `l2_trigger = 0`（关闭收敛）：L2 有 20 个小段也不得读任何 manifest。
+#[test]
+fn l2_trigger_zero_skips_manifest_survey() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-trigger-zero")])
+        .unwrap()
+        .series_id;
+    write_l2_small_segments(&temp_dir, &registry, series_id, 20);
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    )
+    .with_l2_compaction_trigger(0);
+
+    super::planning::reset_level_manifest_read_count();
+    let stats = compactor.compact_once_with_stats().unwrap();
+    let reads = super::planning::level_manifest_read_count();
+
+    assert!(
+        !stats.compacted,
+        "l2_trigger=0 必须永久关闭收敛，实际 {stats:?}"
+    );
+    assert_eq!(
+        reads, 0,
+        "l2_trigger=0 的拍不得做 L2 manifest survey（每段一次 open+read+parse），\
+         实际读了 {reads} 次 manifest（20 段）"
+    );
+}
+
+/// L2 段数（20）不超过默认触发阈值（32）：同样不得读任何 manifest。
+#[test]
+fn l2_count_at_or_below_trigger_skips_manifest_survey() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "l2-below-trigger")])
+        .unwrap()
+        .series_id;
+    write_l2_small_segments(&temp_dir, &registry, series_id, 20);
+
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    );
+
+    super::planning::reset_level_manifest_read_count();
+    let stats = compactor.compact_once_with_stats().unwrap();
+    let reads = super::planning::level_manifest_read_count();
+
+    assert!(
+        !stats.compacted,
+        "20 段 ≤ 默认触发阈值 32，不得收敛，实际 {stats:?}"
+    );
+    assert_eq!(
+        reads, 0,
+        "L2 段数 ≤ 触发阈值的拍不得做 L2 manifest survey，\
+         实际读了 {reads} 次 manifest（20 段）"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // W4-T3（表征绿）：L2 替换 marker 的崩溃幂等重放。计划将 T3 标「红」，但所
 // 测机制（`finalize_pending_compaction_replacements` 对 `<data>/
 // .compaction-replacements/` 内 marker 的启动重放，execution.rs）已存在且

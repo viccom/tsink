@@ -1,5 +1,25 @@
 use super::*;
 
+// Test instrumentation: counts segment-manifest reads performed by the level
+// survey (`load_level_compaction_candidates`) on the current thread.
+// Thread-local so parallel tests cannot pollute each other's counts. The L2→L2
+// gate tests reset it to assert that a pass which cannot trigger pays no
+// manifest I/O at all (one open+read+parse per L2 segment otherwise).
+#[cfg(test)]
+thread_local! {
+    static LEVEL_MANIFEST_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_level_manifest_read_count() {
+    LEVEL_MANIFEST_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn level_manifest_read_count() -> u64 {
+    LEVEL_MANIFEST_READS.with(std::cell::Cell::get)
+}
+
 /// Which level transition compacted most recently, as recorded by
 /// [`Compactor::compact_once_with_changes`] through its arbitration pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +207,23 @@ impl Compactor {
         let source_level = level_to_u8(source);
         let target_level = level_to_u8(target);
 
+        if transition == LevelTransition::L2ToL2 {
+            // Cost gate before the survey: a convergence pass that provably
+            // cannot trigger must not pay for one manifest open+read+parse per
+            // L2 segment (16.5k reads per 5s tick, zero output, forever, when
+            // convergence is disabled). `0` disables convergence outright; a
+            // directory count at or below the trigger cannot exceed it in the
+            // survey either, since candidates ⊆ directories (the survey only
+            // drops directories that vanished concurrently). Anything above
+            // the trigger falls through to the full survey, so trigger
+            // semantics stay byte-for-byte the same.
+            if count_trigger == 0
+                || count_level_segment_dirs(&self.data_path, source_level)? <= count_trigger
+            {
+                return Ok(None);
+            }
+        }
+
         // Survey the level from manifests only (one lightweight read per
         // segment), then defer the full payload load to the selected window.
         let mut candidates = load_level_compaction_candidates(&self.data_path, source_level)?;
@@ -350,6 +387,8 @@ pub(super) fn load_level_compaction_candidates(
             continue;
         }
 
+        #[cfg(test)]
+        LEVEL_MANIFEST_READS.with(|count| count.set(count.get() + 1));
         match read_segment_manifest(&root) {
             Ok(manifest) => {
                 if manifest.level != level {

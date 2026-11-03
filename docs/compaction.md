@@ -109,6 +109,13 @@ size-tiered same-level merges that never rewrite the bulk of the terminal data:
 - **Trigger** — at least 2 eligible candidates AND the total L2 segment count strictly
   above the convergence trigger (`l2_compaction_trigger`, default **32**; `0` disables
   convergence entirely, restoring a purely terminal L2).
+- **Trigger gate cost** — the gate is decided before the level survey, from the L2
+  segment directory count alone (a directory listing; no manifest is opened). `0` and a
+  directory count at or below the trigger therefore cost **zero manifest reads** on
+  every background tick: disabling convergence is a true zero-cost switch, not a
+  convergence pass that surveys every L2 manifest and then declines to merge. The
+  survey (one open+read+parse per segment) runs only when the directory count already
+  exceeds the trigger.
 - **Window** — candidates sorted by `(point_count, min_ts, segment_id)` ascending
   (smallest and oldest fragments first), capped at `source_window_segments` (16) and at
   a cumulative point total of `output_segment_point_budget / 8`. The merged output is
@@ -223,7 +230,7 @@ or tombstone removal is occurring over time.
 | `StorageBuilder` method | Default | Effect |
 |---|---|---|
 | `with_chunk_points(n)` | 2048 | Maximum points per chunk. Also controls the output segment size budget (`n × 512` points per output segment). Larger values produce fewer, bigger segments and reduce compaction frequency but increase per-segment memory and I/O cost. |
-| `with_l2_compaction_trigger(n)` | 32 | L2 total segment count above which same-level terminal convergence may run. `0` disables convergence (L2 stays purely terminal). |
+| `with_l2_compaction_trigger(n)` | 32 | L2 total segment count above which same-level terminal convergence may run. `0` disables convergence (L2 stays purely terminal) at zero cost: no L2 manifest is surveyed. Likewise no survey happens while the L2 segment count stays at or below `n`. |
 
 There are no builder methods for the L0/L1 count triggers; they are fixed at 4. The
 compaction interval is also fixed at 5 seconds in the engine defaults.

@@ -11,7 +11,7 @@ use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
 use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
-    is_not_found_error, list_segment_dirs, load_segment_for_compaction,
+    count_level_segment_dirs, is_not_found_error, list_segment_dirs, load_segment_for_compaction,
     load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,
     PersistedSeries, SegmentManifest, SegmentValidationContext, SegmentWriter,
 };

@@ -1624,7 +1624,9 @@ impl StorageBuilder {
     /// most `source_window_segments` candidates (segments with
     /// `point_count <= output_segment_point_budget / 8`), so large segments
     /// are never rewritten. `0` disables convergence (L2 stays purely
-    /// terminal). Defaults to 32.
+    /// terminal) at zero background cost: the gate is decided from the L2
+    /// segment directory count before any manifest is opened, so a disabled
+    /// or below-trigger level is never surveyed. Defaults to 32.
     #[must_use]
     pub fn with_l2_compaction_trigger(mut self, trigger: usize) -> Self {
         self.l2_compaction_trigger = trigger;
