@@ -542,6 +542,10 @@ pub struct CompactionObservabilitySnapshot {
     pub passthrough_chunks_total: u64,
     pub passthrough_points_total: u64,
     pub duration_nanos_total: u64,
+    /// W4-T4: completed L2→L2 terminal-convergence passes (drains the legacy
+    /// terminal-level segment surplus across background ticks).
+    #[serde(default)]
+    pub l2_to_l2_runs_total: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1163,6 +1167,7 @@ pub struct StorageBuilder {
     drain_time_budget: Duration,
     source_window_segments: usize,
     output_segment_point_budget: usize,
+    l2_compaction_trigger: usize,
     metadata_shard_count: Option<u32>,
     #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
@@ -1214,6 +1219,7 @@ impl Default for StorageBuilder {
             source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
             output_segment_point_budget:
                 crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            l2_compaction_trigger: crate::engine::compactor::DEFAULT_L2_TRIGGER,
             metadata_shard_count: None,
             #[cfg(test)]
             background_threads_enabled_override: None,
@@ -1605,6 +1611,19 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets the L2 terminal-level convergence trigger: the L2 total segment
+    /// count above which background compaction starts merging same-level
+    /// small segments to shrink the terminal segment count. A pass merges at
+    /// most `source_window_segments` candidates (segments with
+    /// `point_count <= output_segment_point_budget / 8`), so large segments
+    /// are never rewritten. `0` disables convergence (L2 stays purely
+    /// terminal). Defaults to 32.
+    #[must_use]
+    pub fn with_l2_compaction_trigger(mut self, trigger: usize) -> Self {
+        self.l2_compaction_trigger = trigger;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_current_time_override_for_tests(mut self, timestamp: i64) -> Self {
@@ -1752,6 +1771,10 @@ impl StorageBuilder {
 
     pub(crate) fn output_segment_point_budget(&self) -> usize {
         self.output_segment_point_budget
+    }
+
+    pub(crate) fn l2_compaction_trigger(&self) -> usize {
+        self.l2_compaction_trigger
     }
 
     pub(crate) fn max_active_partition_heads_per_series(&self) -> usize {

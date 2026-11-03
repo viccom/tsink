@@ -97,6 +97,11 @@ impl StorageObservabilityCounters {
             self.compaction
                 .success_total
                 .fetch_add(1, Ordering::Relaxed);
+            if stats.source_level == Some(2) && stats.target_level == Some(2) {
+                self.compaction
+                    .l2_to_l2_runs_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             self.compaction.noop_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -295,6 +300,11 @@ pub(super) struct CompactionObservabilityCounters {
     pub(super) passthrough_chunks_total: AtomicU64,
     pub(super) passthrough_points_total: AtomicU64,
     pub(super) duration_nanos_total: AtomicU64,
+    /// W4-T4: completed L2→L2 terminal-convergence passes (source_level ==
+    /// target_level == 2, compacted). The convergence backlog drains across
+    /// background ticks, so this grows gradually on instances with a legacy
+    /// L2 segment surplus.
+    pub(super) l2_to_l2_runs_total: AtomicU64,
 }
 
 #[derive(Default)]

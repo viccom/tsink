@@ -81,10 +81,10 @@ pub(in crate::engine::storage_engine) use construction::{
     PendingPersistedSegmentDiff, RemoteCatalogRefreshState,
 };
 pub(in crate::engine::storage_engine) use core_impl::{
-    current_unix_millis_u64, duration_to_timestamp_units, elapsed_nanos_u64, lane_for_value,
-    partition_id_for_timestamp, persisted_chunk_payload, saturating_sub_fetch,
-    saturating_u64_from_usize, value_heap_bytes, CatalogContext, ChunkContext,
-    LifecyclePublicationContext, MemoryDeltaBytes, PersistedRefreshContext,
+    current_unix_millis_u64, current_unix_timestamp_units, duration_to_timestamp_units,
+    elapsed_nanos_u64, lane_for_value, partition_id_for_timestamp, persisted_chunk_payload,
+    saturating_sub_fetch, saturating_u64_from_usize, value_heap_bytes, CatalogContext,
+    ChunkContext, LifecyclePublicationContext, MemoryDeltaBytes, PersistedRefreshContext,
     VisibilityStateMemoryBaseline, WriteAdmissionControlContext, WriteApplyContext,
     WriteApplyMemoryAccountingContext, WriteApplyPublicationContext, WriteApplyRegistryContext,
     WriteApplyShardMutationContext, WriteApplyWalContext, WriteCommitContext,

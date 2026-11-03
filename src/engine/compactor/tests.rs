@@ -1953,3 +1953,31 @@ fn make_histogram_chunk(series_id: u64, timestamps: &[i64]) -> Chunk {
         wal_highwater: WalHighWatermark::default(),
     }
 }
+
+#[test]
+fn close_drain_defers_l2_terminal_convergence() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "scratch-close")])
+        .unwrap()
+        .series_id;
+    write_l2_small_segments(&temp_dir, &registry, series_id, 40);
+    let compactor = Compactor::new_with_segment_id_allocator(
+        temp_dir.path(),
+        2048,
+        Arc::new(AtomicU64::new(1000)),
+    );
+    for _ in 0..5 {
+        let stats = compactor.compact_once_for_close().unwrap().stats;
+        assert!(
+            !stats.compacted,
+            "close drain must defer L2 convergence, got {stats:?}"
+        );
+    }
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert_eq!(l2.len(), 40, "close drain must not touch the L2 backlog");
+    let stats = compactor.compact_once_with_changes().unwrap().stats;
+    assert!(stats.compacted, "background entry must still converge");
+    assert_eq!((stats.source_level, stats.target_level), (Some(2), Some(2)));
+}

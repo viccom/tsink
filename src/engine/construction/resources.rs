@@ -57,6 +57,38 @@ impl PendingPersistedSegmentDiff {
     }
 }
 
+/// Builds the retention-cutoff provider consumed by the compactors' L2→L2
+/// candidate filter (`None` = retention never enforced, no exclusion).
+///
+/// Fidelity note: retention's own sweep computes its cutoff from the
+/// *recency reference* `max(max_bounded_observed_timestamp, now)`, which is
+/// ≥ wall-clock `now`. This provider uses wall-clock `now` alone (the
+/// visibility state does not exist yet at construction time), so its cutoff
+/// is always ≤ the sweep's: everything it excludes would be expired by the
+/// next sweep too, while the residual merge window (segments expired by the
+/// sweep but not yet by this provider) is bounded by the observed-vs-now
+/// gap and converges as the sweep catches up. Excluding slightly less is the
+/// safe direction — it can only cost one redundant rewrite, never data.
+fn l2_retention_cutoff_provider(
+    options: &ChunkStorageOptions,
+) -> Option<Arc<dyn Fn() -> Option<i64> + Send + Sync>> {
+    if !options.retention_enforced {
+        return None;
+    }
+    let retention_window = options.retention_window;
+    let timestamp_precision = options.timestamp_precision;
+    #[cfg(test)]
+    let current_time_override = options.current_time_override;
+    Some(Arc::new(move || {
+        #[cfg(test)]
+        let now = current_time_override
+            .unwrap_or_else(|| current_unix_timestamp_units(timestamp_precision));
+        #[cfg(not(test))]
+        let now = current_unix_timestamp_units(timestamp_precision);
+        Some(now.saturating_sub(retention_window))
+    }))
+}
+
 impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn prepare_construction_resources(
         chunk_point_cap: usize,
@@ -73,6 +105,7 @@ impl ChunkStorage {
         // Compaction's segment-replacement marker operations serialize against
         // the flush persist pipeline through this lock; see CoordinationState.
         let segment_replacement_lock = Arc::new(Mutex::new(()));
+        let retention_cutoff_provider = l2_retention_cutoff_provider(options);
         let numeric_compactor = numeric_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
                 path,
@@ -82,6 +115,8 @@ impl ChunkStorage {
             .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
             .with_source_window_segments(options.source_window_segments)
             .with_output_segment_point_budget(options.output_segment_point_budget)
+            .with_l2_compaction_trigger(options.l2_compaction_trigger)
+            .with_retention_cutoff_provider_opt(retention_cutoff_provider.clone())
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -92,6 +127,8 @@ impl ChunkStorage {
             .with_segment_replacement_lock(Arc::clone(&segment_replacement_lock))
             .with_source_window_segments(options.source_window_segments)
             .with_output_segment_point_budget(options.output_segment_point_budget)
+            .with_l2_compaction_trigger(options.l2_compaction_trigger)
+            .with_retention_cutoff_provider_opt(retention_cutoff_provider.clone())
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));

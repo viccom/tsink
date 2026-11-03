@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum LevelTransition {
     L0ToL1,
     L1ToL2,
+    L2ToL2,
 }
 
 impl LevelTransition {
@@ -13,6 +14,7 @@ impl LevelTransition {
         match self {
             Self::L0ToL1 => CompactionLevel::L0,
             Self::L1ToL2 => CompactionLevel::L1,
+            Self::L2ToL2 => CompactionLevel::L2,
         }
     }
 
@@ -20,6 +22,7 @@ impl LevelTransition {
         match self {
             Self::L0ToL1 => CompactionLevel::L1,
             Self::L1ToL2 => CompactionLevel::L2,
+            Self::L2ToL2 => CompactionLevel::L2,
         }
     }
 
@@ -27,6 +30,7 @@ impl LevelTransition {
         match self {
             Self::L0ToL1 => compactor.l0_trigger,
             Self::L1ToL2 => compactor.l1_trigger,
+            Self::L2ToL2 => compactor.l2_trigger,
         }
     }
 
@@ -34,8 +38,35 @@ impl LevelTransition {
         match self {
             Self::L0ToL1 => super::LAST_TRANSITION_L0_TO_L1,
             Self::L1ToL2 => super::LAST_TRANSITION_L1_TO_L2,
+            Self::L2ToL2 => super::LAST_TRANSITION_L2_TO_L2,
         }
     }
+
+    /// The transition whose arbitration tag matches, for rebuilding the
+    /// rotation order after a pass recorded the previous winner.
+    fn from_arbitration_tag(tag: u8) -> Option<Self> {
+        match tag {
+            super::LAST_TRANSITION_L0_TO_L1 => Some(Self::L0ToL1),
+            super::LAST_TRANSITION_L1_TO_L2 => Some(Self::L1ToL2),
+            super::LAST_TRANSITION_L2_TO_L2 => Some(Self::L2ToL2),
+            _ => None,
+        }
+    }
+}
+
+/// Which compaction work a single pass may take on. Terminal-level (L2→L2)
+/// convergence is background progress work only, so close-time passes defer
+/// it: a legacy backlog of tens of thousands of terminal segments would
+/// otherwise keep the close drain `compact_until_settled` looping on
+/// convergence passes (16 segments per pass, ~1000 passes at 15.8k segments)
+/// and stretch graceful shutdown by an unbounded, data-dependent amount.
+/// The background worker picks convergence up one window per tick instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassScope {
+    /// Standalone and background passes: every eligible transition may run.
+    All,
+    /// Close drain passes: L2→L2 convergence is deferred to the background.
+    CloseDrain,
 }
 
 /// A manifest-only view of a persisted segment, used to survey a level for
@@ -88,13 +119,25 @@ pub(super) trait CompactionSelectionEntry {
 
 impl Compactor {
     /// Level-fair arbitration: whichever transition compacted last is tried
-    /// second on the next pass. Under sustained writes L0->L1 stays eligible
+    /// last on the next pass. Under sustained writes L0->L1 stays eligible
     /// forever, so a first-win policy starves L1->L2 and the L1 backlog grows
     /// without bound (observed: 4640 segments after a 7h run). Round-robin
-    /// keeps both transitions making progress while each level's own trigger
+    /// keeps every transition making progress while each level's own trigger
     /// semantics (count threshold / time overlap, minimum 2 segments) stay
     /// unchanged; a level that is not eligible simply yields the pass.
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
+        self.compact_once_scoped(PassScope::All)
+    }
+
+    /// Close-drain variant of [`Compactor::compact_once_with_changes`]:
+    /// terminal-level (L2→L2) convergence is deferred to the background
+    /// worker so a legacy L2 backlog cannot extend graceful shutdown (see
+    /// [`PassScope::CloseDrain`]).
+    pub(in crate::engine) fn compact_once_for_close(&self) -> Result<CompactionOutcome> {
+        self.compact_once_scoped(PassScope::CloseDrain)
+    }
+
+    fn compact_once_scoped(&self, scope: PassScope) -> Result<CompactionOutcome> {
         {
             // Marker application deletes source segment directories, so it must
             // serialize against the flush persist pipeline's registry catalog
@@ -105,15 +148,24 @@ impl Compactor {
         }
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 
-        let prefer_l1_to_l2 = self.last_compacted_transition.load(Ordering::Acquire)
-            == super::LAST_TRANSITION_L0_TO_L1;
-        let transitions = if prefer_l1_to_l2 {
-            [LevelTransition::L1ToL2, LevelTransition::L0ToL1]
-        } else {
-            [LevelTransition::L0ToL1, LevelTransition::L1ToL2]
-        };
+        // "The previous winner goes to the back": keep the natural order but
+        // move the transition that ran last to the end, so the two (now
+        // three) transitions rotate fairly instead of a continuously
+        // triggering one monopolizing every pass.
+        let last = LevelTransition::from_arbitration_tag(
+            self.last_compacted_transition.load(Ordering::Acquire),
+        );
+        let mut transitions = [
+            LevelTransition::L0ToL1,
+            LevelTransition::L1ToL2,
+            LevelTransition::L2ToL2,
+        ];
+        transitions.sort_by_key(|transition| Some(*transition) == last);
 
         for transition in transitions {
+            if scope == PassScope::CloseDrain && transition == LevelTransition::L2ToL2 {
+                continue;
+            }
             if let Some(outcome) = self.try_compact_level(transition, &tombstones)? {
                 self.last_compacted_transition
                     .store(transition.arbitration_tag(), Ordering::Release);
@@ -138,6 +190,11 @@ impl Compactor {
         // Survey the level from manifests only (one lightweight read per
         // segment), then defer the full payload load to the selected window.
         let mut candidates = load_level_compaction_candidates(&self.data_path, source_level)?;
+
+        if transition == LevelTransition::L2ToL2 {
+            return self.try_compact_l2_convergence(count_trigger, candidates, tombstones);
+        }
+
         if candidates.len() < 2 {
             return Ok(None);
         }
@@ -155,8 +212,103 @@ impl Compactor {
             return Ok(None);
         }
 
+        self.load_window_and_compact(source_level, target_level, &window, tombstones)
+    }
+
+    /// L2 terminal-level convergence (size-tiered): rewrites only segments
+    /// small enough that merging them shrinks the segment count, never the
+    /// bulk of the terminal data. Plan semantics:
+    /// - candidates: segments with `point_count <= max_input_points`
+    ///   (`output_segment_point_budget / 8`);
+    /// - trigger: at least 2 candidates AND the L2 total segment count above
+    ///   `l2_trigger` (0 disables convergence entirely);
+    /// - window: candidates sorted by `(point_count, min_ts)` ascending
+    ///   (smallest and oldest fragments first), capped at
+    ///   `source_window_segments` AND at a cumulative point total of
+    ///   `max_input_points` — so the merged output itself is never larger
+    ///   than a candidate, stays inside the candidate pool's size class
+    ///   (a pass never mints a new "large" segment) and a size-squeezed
+    ///   configuration terminates instead of re-merging its own outputs
+    ///   forever;
+    /// - retention pre-exclusion: segments whose `max_ts` is already below
+    ///   the active retention cutoff are dropped from candidacy — retention's
+    ///   next sweep deletes them outright, so merging them would rewrite data
+    ///   that is about to disappear.
+    fn try_compact_l2_convergence(
+        &self,
+        count_trigger: usize,
+        candidates: Vec<SegmentSelectionMeta>,
+        tombstones: &TombstoneMap,
+    ) -> Result<Option<CompactionOutcome>> {
+        if count_trigger == 0 || candidates.len() <= count_trigger {
+            return Ok(None);
+        }
+
+        let max_input_points = (self.output_segment_point_budget / 8).max(1);
+        let retention_cutoff = self.active_retention_cutoff();
+        let mut eligible: Vec<&SegmentSelectionMeta> = candidates
+            .iter()
+            .filter(|candidate| candidate.manifest.point_count <= max_input_points)
+            .filter(|candidate| {
+                // Retention's own expiry judgment (`max_ts < retention
+                // cutoff`, cf. tiering policy `desired_tier_for_manifest`);
+                // manifests without timestamps are retained by retention and
+                // stay eligible here.
+                match (candidate.manifest.max_ts, retention_cutoff) {
+                    (Some(max_ts), Some(cutoff)) => max_ts >= cutoff,
+                    _ => true,
+                }
+            })
+            .collect();
+        if eligible.len() < 2 {
+            return Ok(None);
+        }
+
+        eligible.sort_by(|a, b| {
+            a.manifest
+                .point_count
+                .cmp(&b.manifest.point_count)
+                .then_with(|| {
+                    a.manifest
+                        .min_ts
+                        .cmp(&b.manifest.min_ts)
+                        .then_with(|| a.manifest.segment_id.cmp(&b.manifest.segment_id))
+                })
+        });
+
+        // Ascending prefix: stop at the window cap or once one more segment
+        // would push the cumulative window total past `max_input_points`.
+        let mut cumulative_points = 0usize;
+        let window: Vec<&SegmentSelectionMeta> = eligible
+            .iter()
+            .take(self.source_window_segments.max(2))
+            .take_while(|candidate| {
+                cumulative_points += candidate.manifest.point_count;
+                cumulative_points <= max_input_points
+            })
+            .copied()
+            .collect();
+        if window.len() < 2 {
+            return Ok(None);
+        }
+
+        self.load_window_and_compact(
+            level_to_u8(CompactionLevel::L2),
+            level_to_u8(CompactionLevel::L2),
+            &window,
+            tombstones,
+        )
+    }
+
+    fn load_window_and_compact(
+        &self,
+        source_level: u8,
+        target_level: u8,
+        window: &[&SegmentSelectionMeta],
+        tombstones: &TombstoneMap,
+    ) -> Result<Option<CompactionOutcome>> {
         let mut segments = Vec::with_capacity(window.len());
-        for candidate in &window {
+        for candidate in window {
             if let Some(segment) = load_segment_for_compaction(&candidate.root)? {
                 segments.push(segment);
             }

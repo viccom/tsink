@@ -4508,3 +4508,49 @@ fn warm_catalog_persist_path_needs_no_segment_or_catalog_reads() {
 
     storage.close().unwrap();
 }
+
+#[test]
+fn compaction_drain_takes_single_l2_to_l2_window_and_counts_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("drain_l2_convergence", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    for segment_index in 0..6usize {
+        let base_ts = segment_index as i64 * 100;
+        let points = (base_ts..base_ts + 100)
+            .map(|ts| (ts, ts as f64))
+            .collect::<Vec<_>>();
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            2,
+            segment_index as u64 + 1,
+            &points,
+        );
+    }
+    let compactor =
+        crate::engine::compactor::Compactor::new(&lane_path, 8).with_l2_compaction_trigger(2);
+    let pass = ChunkStorage::drain_compactors_with_budget(
+        Some(&compactor),
+        None,
+        None,
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    assert_eq!(
+        pass.compaction_runs, 1,
+        "L2ToL2 must not keep the drain running"
+    );
+    assert_eq!(
+        pass.l2_to_l2_runs, 1,
+        "the single convergence pass must be counted"
+    );
+    assert!(
+        !pass.backlog_remains,
+        "terminal convergence must not flag a backlog"
+    );
+}

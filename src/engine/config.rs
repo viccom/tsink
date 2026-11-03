@@ -77,6 +77,10 @@ pub(super) struct ChunkStorageOptions {
     /// chunk point cap. Default:
     /// [`DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET`](crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET).
     pub(super) output_segment_point_budget: usize,
+    /// L2 terminal-level convergence trigger (L2 total segment count above
+    /// which same-level convergence passes may run; `0` disables). Default:
+    /// [`DEFAULT_L2_TRIGGER`](crate::engine::compactor::DEFAULT_L2_TRIGGER).
+    pub(super) l2_compaction_trigger: usize,
     pub(super) background_threads_enabled: bool,
     pub(super) background_fail_fast: bool,
     pub(super) metadata_shard_count: Option<u32>,
@@ -179,6 +183,7 @@ impl Default for ChunkStorageOptions {
             source_window_segments: crate::engine::compactor::DEFAULT_SOURCE_WINDOW_SEGMENTS,
             output_segment_point_budget:
                 crate::engine::compactor::DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET,
+            l2_compaction_trigger: crate::engine::compactor::DEFAULT_L2_TRIGGER,
             background_threads_enabled: true,
             background_fail_fast: true,
             metadata_shard_count: None,
@@ -279,6 +284,7 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             drain_time_budget: builder.drain_time_budget(),
             source_window_segments: builder.source_window_segments(),
             output_segment_point_budget: builder.output_segment_point_budget(),
+            l2_compaction_trigger: builder.l2_compaction_trigger(),
             background_threads_enabled: {
                 let enabled = has_data_path || needs_compute_only_refresh_worker;
                 #[cfg(test)]

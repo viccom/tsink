@@ -32,7 +32,7 @@ impl<'a> LifecycleShutdownContext<'a> {
         let _compaction_guard = self.compaction_gate();
         let mut passes = 0usize;
         for _ in 0..max_passes.max(1) {
-            let changes = ChunkStorage::compact_compactors_with_changes(
+            let changes = ChunkStorage::compact_compactors_for_close_with_changes(
                 self.numeric_compactor,
                 self.blob_compactor,
                 Some(self.observability),
@@ -64,6 +64,10 @@ pub(in crate::engine::storage_engine) struct CompactionDrainPass {
     pub(in crate::engine::storage_engine) compaction_runs: usize,
     pub(in crate::engine::storage_engine) l0_to_l1_runs: usize,
     pub(in crate::engine::storage_engine) l1_to_l2_runs: usize,
+    /// Terminal-level convergence passes taken within this drain. L2→L2
+    /// never keeps the drain running (see `drain_compactors_with_budget`),
+    /// so per lane this is at most 1 per drain call.
+    pub(in crate::engine::storage_engine) l2_to_l2_runs: usize,
     pub(in crate::engine::storage_engine) backlog_remains: bool,
 }
 
@@ -93,6 +97,15 @@ impl ChunkStorage {
     /// `budget + one pass`, bounding how long close/manual compaction waits.
     /// Each lane gets its own full budget so a permanently backlogged numeric
     /// lane cannot starve the blob lane out of its turns.
+    ///
+    /// L2→L2 terminal convergence is different: a pass that took one is
+    /// counted (`l2_to_l2_runs`) and then ends the lane's loop without
+    /// setting `backlog_remains`. Terminal convergence is background progress
+    /// work spread over the compaction ticks (a 15.8k-segment legacy backlog
+    /// needs ~1000 window passes; draining it inside one call would hold the
+    /// compaction gate for the whole time budget and starve close/manual
+    /// compaction), so one drain call takes at most one convergence window
+    /// per lane and reports settled.
     pub(in crate::engine::storage_engine) fn drain_compactors_with_budget(
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
@@ -112,6 +125,13 @@ impl ChunkStorage {
                 match (stats.source_level, stats.target_level) {
                     (Some(0), Some(1)) => pass.l0_to_l1_runs += 1,
                     (Some(1), Some(2)) => pass.l1_to_l2_runs += 1,
+                    (Some(2), Some(2)) => {
+                        // Terminal convergence: never keeps the drain
+                        // running and never flags a backlog — the next
+                        // compaction tick picks up the next window.
+                        pass.l2_to_l2_runs += 1;
+                        break;
+                    }
                     _ => {}
                 }
                 if Instant::now() >= deadline {
@@ -125,26 +145,48 @@ impl ChunkStorage {
         Ok(pass)
     }
 
-    pub(in super::super) fn compact_compactors_with_changes(
+    /// Close-drain compaction: one pass per compactor, deferring terminal
+    /// (L2→L2) convergence to the background worker so a legacy L2 backlog
+    /// cannot extend graceful shutdown.
+    pub(in super::super) fn compact_compactors_for_close_with_changes(
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
         observability: Option<&StorageObservabilityCounters>,
     ) -> Result<PendingPersistedSegmentDiff> {
         let mut changes = PendingPersistedSegmentDiff::default();
         if let Some(compactor) = numeric_compactor {
-            changes.merge(Self::run_compactor_once(compactor, observability)?);
+            changes.merge(Self::run_close_compactor_once(compactor, observability)?);
         }
         if let Some(compactor) = blob_compactor {
-            changes.merge(Self::run_compactor_once(compactor, observability)?);
+            changes.merge(Self::run_close_compactor_once(compactor, observability)?);
         }
         Ok(changes)
     }
 
-    fn run_compactor_once(
+    fn run_close_compactor_once(
         compactor: &Compactor,
         observability: Option<&StorageObservabilityCounters>,
     ) -> Result<PendingPersistedSegmentDiff> {
-        Ok(Self::run_compactor_pass_once(compactor, observability)?.0)
+        let started = Instant::now();
+        match compactor.compact_once_for_close() {
+            Ok(outcome) => {
+                let stats = outcome.stats;
+                if let Some(obs) = observability {
+                    obs.record_compaction_result(stats, elapsed_nanos_u64(started));
+                }
+                let mut changes = PendingPersistedSegmentDiff::default();
+                if stats.compacted {
+                    changes.record_changes(outcome.output_roots, outcome.source_roots);
+                }
+                Ok(changes)
+            }
+            Err(err) => {
+                if let Some(obs) = observability {
+                    obs.record_compaction_error(elapsed_nanos_u64(started));
+                }
+                Err(err)
+            }
+        }
     }
 
     fn run_compactor_pass_once(

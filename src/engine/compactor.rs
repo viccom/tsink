@@ -32,10 +32,11 @@ pub(in crate::engine) use self::execution::finalize_pending_compaction_replaceme
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
-/// W4-T4 planned default: L2 terminal-level convergence triggers while the L2
-/// segment count exceeds this value (0 disables convergence). Stored but not
-/// consumed until the `L2ToL2` transition lands.
-const DEFAULT_L2_TRIGGER: usize = 32;
+/// L2 terminal-level convergence trigger: the L2 total segment count above
+/// which same-level convergence passes may run (0 disables convergence
+/// entirely, keeping the pre-W4-T4 terminal behavior). Default exposure:
+/// [`StorageBuilder::with_l2_compaction_trigger`](crate::storage::StorageBuilder::with_l2_compaction_trigger).
+pub(crate) const DEFAULT_L2_TRIGGER: usize = 32;
 /// Source window: how many same-level segments one compaction pass may merge.
 /// Raised from 8 to 16 so a single pass amortizes the per-pass fixed costs
 /// (marker directory scan, tombstone parse, full-level survey, drain-budget
@@ -63,12 +64,15 @@ const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Level-fair arbitration state: which level transition compacted last.
-/// `LAST_TRANSITION_L0_TO_L1` / `LAST_TRANSITION_L1_TO_L2` make the next pass
-/// prefer the other transition first, so a continuously-triggering L0->L1
-/// cannot starve L1->L2 (the 4640-segment L1 backlog root cause).
+/// The next pass orders the transitions so the one that ran last is tried
+/// last ("the previous winner goes to the back of the queue"), so a
+/// continuously-triggering transition cannot starve the others (the
+/// 4640-segment L1 backlog root cause; `L2ToL2` joined the rotation with
+/// W4-T4's terminal-level convergence).
 const LAST_TRANSITION_NONE: u8 = 0;
 const LAST_TRANSITION_L0_TO_L1: u8 = 1;
 const LAST_TRANSITION_L1_TO_L2: u8 = 2;
+const LAST_TRANSITION_L2_TO_L2: u8 = 3;
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
@@ -114,7 +118,7 @@ pub enum CompactionLevel {
     L2,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Compactor {
     data_path: PathBuf,
     point_cap: usize,
@@ -125,10 +129,9 @@ pub struct Compactor {
     source_window_segments: usize,
     l0_trigger: usize,
     l1_trigger: usize,
-    /// W4-T4 stub: L2 terminal-level convergence trigger (segment count).
-    /// Stored only — L2 is still terminal (no `L2ToL2` transition) and nothing
-    /// reads this until W4-T4 wires the transition.
-    #[allow(dead_code)]
+    /// L2 terminal-level convergence trigger (segment count above which a
+    /// same-level convergence pass may run; `0` disables convergence).
+    /// Consumed by the `L2ToL2` transition's `count_trigger` in planning.
     l2_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
     last_compacted_transition: Arc<AtomicU8>,
@@ -137,6 +140,41 @@ pub struct Compactor {
     /// pipeline's registry catalog build. `None` for standalone compactors
     /// (tests, retention rewriters) that own their data path exclusively.
     segment_replacement_lock: Option<Arc<Mutex<()>>>,
+    /// Optional provider of the *active* retention cutoff in storage
+    /// timestamp units (`None` = retention is not enforced). The L2→L2
+    /// candidate filter drops segments whose `max_ts` is already below the
+    /// cutoff: retention's next sweep would delete them outright, so merging
+    /// them would only rewrite data that is about to disappear. Standalone
+    /// compactors (tests, retention rewriters) leave this unset, which
+    /// disables the exclusion.
+    retention_cutoff_provider: Option<Arc<dyn Fn() -> Option<i64> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Compactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compactor")
+            .field("data_path", &self.data_path)
+            .field("point_cap", &self.point_cap)
+            .field(
+                "output_segment_point_budget",
+                &self.output_segment_point_budget,
+            )
+            .field("source_window_segments", &self.source_window_segments)
+            .field("l0_trigger", &self.l0_trigger)
+            .field("l1_trigger", &self.l1_trigger)
+            .field("l2_trigger", &self.l2_trigger)
+            .field("next_segment_id", &self.next_segment_id)
+            .field("last_compacted_transition", &self.last_compacted_transition)
+            .field(
+                "segment_replacement_lock",
+                &self.segment_replacement_lock.is_some(),
+            )
+            .field(
+                "retention_cutoff_provider",
+                &self.retention_cutoff_provider.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Compactor {
@@ -152,6 +190,7 @@ impl Compactor {
             next_segment_id: None,
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
+            retention_cutoff_provider: None,
         }
     }
 
@@ -171,6 +210,7 @@ impl Compactor {
             next_segment_id: Some(next_segment_id),
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
+            retention_cutoff_provider: None,
         }
     }
 
@@ -192,15 +232,32 @@ impl Compactor {
         self
     }
 
-    /// W4-T4 stub: sets the L2 terminal-level convergence trigger (the L2
-    /// total segment count above which same-level convergence runs; 0
-    /// disables). Default: [`DEFAULT_L2_TRIGGER`] (32). Stored only for now —
-    /// L2 is still terminal, so no transition consumes it until W4-T4 lands;
-    /// the `StorageBuilder` knob is introduced together with the transition.
+    /// Sets the L2 terminal-level convergence trigger: the L2 total segment
+    /// count above which a same-level convergence pass may run (a pass also
+    /// needs at least 2 eligible small-segment candidates). `0` disables
+    /// convergence, restoring the pre-W4-T4 behavior where L2 is purely
+    /// terminal. Default: [`DEFAULT_L2_TRIGGER`] (32).
     #[must_use]
     pub fn with_l2_compaction_trigger(mut self, trigger: usize) -> Self {
         self.l2_trigger = trigger;
         self
+    }
+
+    /// Wires the provider of the active retention cutoff (storage timestamp
+    /// units; `None` = retention currently not enforced). Used only by the
+    /// L2→L2 candidate filter to skip segments retention is about to delete.
+    pub fn with_retention_cutoff_provider_opt(
+        mut self,
+        provider: Option<Arc<dyn Fn() -> Option<i64> + Send + Sync>>,
+    ) -> Self {
+        self.retention_cutoff_provider = provider;
+        self
+    }
+
+    /// Active retention cutoff right now (`None` when no provider is wired or
+    /// retention is currently not enforced).
+    pub(super) fn active_retention_cutoff(&self) -> Option<i64> {
+        (self.retention_cutoff_provider.as_ref()?)()
     }
 
     /// Wires this compactor into a live engine's segment-replacement lock so
