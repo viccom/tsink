@@ -3,7 +3,8 @@
 > **性质**：对已完成批次（`origin/master..master`，26 笔提交，44d1dd9→76fb802）的**独立复核报告**，非实施计划。修复项另开 `docs/plans/` 走 TDD。
 > **权威计划**：`docs/plans/2026-10-30-edge-hardening-catalog-terminal-crash.md`（其「实施状态」表为进度权威）。
 > **方法**：三路只读深度审查子代理（W1 / W2+W3 / W4，第一轮）+ 两路横切面审查（旋钮观测文档 / 并发异常资源，第二轮）；主会话对**每一条**缺陷级结论做第一手取证——读代码行、穷举写点、实测运行、必要时自证伪。凡未能第一手复现的结论，标注「未复现」而非「确认」。
-> **基线**：HEAD `76fb802`，工作树干净。
+> **基线**：初版报告基线 HEAD `76fb802`；第二轮横切面基线 HEAD `15951e1`。
+> **状态**：初版 7 项确认缺陷中 6 项已修复（C-1/C-2/C-4/C-5/C-6 + R-1），第二轮新增 4 项（C-7~C-10）待修。逐项状态见 §6。
 
 ## 0. 复核证据总表
 
@@ -140,7 +141,101 @@
 5. `docs/performance-tuning.md:341` 与 `catalog_cache_soak.rs:238-240`：`catalog_cache_entries` 为双 map 合计却按 entries-only 容量判界，须拆分或改名（见 C-5）。
 6. `docs/performance-tuning.md` 「bulk eviction to a 3/4 watermark」与 `registry_catalog.rs:286` 的先除后乘不符（见 C-6）。
 
-## 5. 修复优先级
+## 5. 第二轮横切面审查新增发现（基线 `15951e1`，全部经主会话第一手复核）
+
+### C-7｜soak 短跑命令被脚本无条件覆盖——「600 秒冒烟」实际跑 2 小时
+
+**证据链**
+1. `scripts/check_catalog_cache_soak.sh:26-27`：`SOAK_SECONDS="${SOAK_SECONDS:-7200}"` 后 `export TSINK_SOAK_SECONDS="$SOAK_SECONDS"`——**无条件覆盖**调用方环境里的 `TSINK_SOAK_SECONDS`。
+2. `docs/performance-tuning.md:353` 与 `src/engine/tests/catalog_cache_soak.rs:13` 都给出 `TSINK_SOAK_SECONDS=600 scripts/check_catalog_cache_soak.sh   # short smoke run`。
+3. 脚本自己的头注释（`:14`）用的是正确形式 `SOAK_SECONDS=600`——只有文档与测试注释写错变量名。
+4. 实测复刻该环境处理段：`TSINK_SOAK_SECONDS=600` → 子进程看到 `7200`；`SOAK_SECONDS=600` → `600`。
+
+**影响**：按文档做短冒烟的人实际跑 2 小时；且 10 分钟窗只有 3 个样本 → 走「跳过斜率」分支，与 2h 判据强度完全不同（判据假象）。
+**修复**：文档/注释改 `SOAK_SECONDS=600`，或脚本改为 `export TSINK_SOAK_SECONDS="${TSINK_SOAK_SECONDS:-${SOAK_SECONDS:-7200}}"`（两者都做最稳）。
+
+### C-8｜`catalog_delta_fingerprint_fallback_total` 在「无 delta + 指纹为 null」时不计数——升级场景计数器漏计
+
+**证据链**
+1. `registry_catalog.rs:1254-1255`：`let mut fingerprint = actual.series_fingerprint; let mut fingerprint_fallback = false;`
+2. `:1301-1302`（循环内）：`fingerprint = delta.series_fingerprint; fingerprint_fallback = fingerprint.is_none();`
+3. **无 delta 时循环体不执行** → `fingerprint_fallback` 恒 `false`，即使 `actual.series_fingerprint` 为 `None`。
+4. `PersistedRegistryCatalogFile.series_fingerprint` 带 `#[serde(default)]`（`:81-83`）→ 旧版本 catalog 反序列化即为 `None`。
+5. 文档 `storage-engine.md:440` 明确写「or when the fingerprint is `null`/unrecomputable — startup loads series metadata from every segment instead（counter `catalog_delta_fingerprint_fallback_total`）」。
+6. 实际行为：快路径确实关闭（`recovery.rs` 的 `should_load_segment_series` 要求 `Some(fingerprint)`），但计数器不 +1。
+
+**影响**：升级自旧版本（无 delta + 指纹 null）时，运维看到 `catalog_delta_fingerprint_fallback_total == 0` 会误判「快路径健康」，而实际每次启动都在全量读 `series.bin`。属**最典型的一次性升级场景**。
+**修复**：`let mut fingerprint_fallback = actual.series_fingerprint.is_none();`
+
+### C-9｜计划状态行宣称「已修正 architecture.md 窗口 8→16」，实物未改
+
+**证据链**
+1. `docs/plans/2026-10-30-edge-hardening-catalog-terminal-crash.md:61`（W4-T5 行）写「architecture.md 层级图更新（**连带修正窗口 8→16 陈旧值**）」。
+2. 实际 `docs/architecture.md:415` 仍为 `selects a window of up to 8 source segments`；`docs/storage-engine.md:361` 仍为 `source_window_segments (default 8)`。
+3. `git diff origin/master..master -- docs/architecture.md | grep -c 'up to 8'` = **0**——该行一字未动。
+4. 代码真值 `compactor.rs:49` `DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 16`（origin/master 亦已是 16，属既有文档漂移）。
+
+**影响**：状态表与实物不符（声称修了但没修），且两处文档对使用者的窗口参数描述错误一倍。
+**修复**：改两处文档为 16；并在计划状态行如实改写（或标注「未修」）。
+
+### C-10｜`with_chunk_points` 文档仍称控制输出段预算 `n × 512`，该关联已失效
+
+**证据链**
+1. `docs/compaction.md:243`：`with_chunk_points(n)` …「Also controls the output segment size budget (`n × 512` points per output segment)」。
+2. 代码 `compactor.rs:51-61` 注释明文：`It used to be chunk_point_cap * 512 … It is now 8x the L0 flush shard size`；`DEFAULT_OUTPUT_SEGMENT_POINT_BUDGET = 8_388_608` 固定，`chunk_points` 不再影响输出预算。
+3. 同一张表 `:244` 本批次刚新增了 `with_l2_compaction_trigger` 行——编辑过该表却留下上方错误关联。
+
+**影响**：使用者按 `n×512` 估算输出段大小会差一个数量级。
+**修复**：删除该关联句，改为「输出段预算固定 8,388,608 点（L0 flush shard 8 倍），由 `with_output_segment_point_budget` 覆盖」。
+
+### 第二轮「文档不符」清单（不单列编号，按文件汇总）
+
+| # | 位置 | 不符内容 |
+|---|---|---|
+| D-1 | `bootstrap/recovery.rs:146-148` vs `storage-engine.md:436` | 「主文件缺失 + 有 delta」被计为「delta 链回退」，归因误导（每次启动至多 +1，非漏计） |
+| D-2 | `storage.rs:524-526` / `metrics.rs:277-279` vs `segment_maps.rs:200-205` | 计数器计「NotFound 事件」而非「成功重试」——resolver 返回 None 时也计数；测试 `segment_map_residency.rs:360-366` 反而固化了该口径 |
+| D-3 | `storage-engine.md:426` / `configuration.md:49` | 称 delta 路径 `O(changes)`，实为 `O(changes + series)`（每笔 delta 全量重算指纹，含 `Vec<PersistedSeries>` 深拷贝） |
+| D-4 | `compaction.md:48` | 仍写「checks L0 first, then L1」，实为三路含 `L2ToL2`（`planning.rs:176-182`） |
+| D-5 | `configuration.md:3` | 自述「Complete listing of every configuration knob」，缺 3 个新旋钮（`catalog_entry_cache_capacity` / `catalog_series_cache_bytes` / `l2_compaction_trigger`） |
+| D-6 | `configuration.md:35` | 称本表是 Rust API 与 Python 绑定的「equivalent」，但 `tsink-uniffi` builder 无这 5 个新旋钮、`UFlushObservabilitySnapshot` 无 8 个新计数器 |
+| D-7 | `performance-tuning.md:478` | 「All internal counters are exposed at GET /metrics」被本批次 8 个新计数器证伪（既有绝对断言） |
+
+### 第二轮「风险」清单（代码面，未单列编号）
+
+| # | 位置 | 内容 |
+|---|---|---|
+| X-1 | `compactor/planning.rs:326-329` | 累计点数用裸 `+=`，同仓执行路径一律 `saturating_add`（`execution.rs:307-309`）——损坏 manifest 且 budget 极大时 debug panic/release 回绕 |
+| X-2 | `storage.rs:1616-1620` vs `compactor.rs:222` | builder 侧无夹紧、Compactor 侧夹 `.max(1)`；`with_output_segment_point_budget(0)` 静默退化为「每点一段 + L2 收敛关闭」 |
+| X-3 | `registry_catalog.rs:247-251` vs `:381` | gauge 读侧不持锁，并发下可瞬时观察到 `capacity+1`（soak 5min 采样几乎不可能命中） |
+| X-4 | `registry_catalog.rs:863` + `series_cache_bytes=0` | series 缓存禁用时每笔 delta 全量 `series.bin` 磁盘重读（文档称「escape hatch」未点明放大倍数） |
+| X-5 | `shutdown.rs:66-71,132` | `CompactionDrainPass::l2_to_l2_runs` 生产态无消费者（仅测试读），建议 `#[cfg(test)]` 或删 |
+
+---
+
+## 6. 修复状态（截至 2026-11-04）
+
+| 项 | 状态 | 提交 |
+|---|---|---|
+| C-1 门禁 export ITER | ✅ 已修 | `b3c894c` |
+| C-2 kill 断言 signal | ✅ 已修 | `d168f01` |
+| C-6 淘汰水位 | ✅ 已修 | `fd356d0` |
+| C-5 缓存 gauge 口径 | ✅ 已修 | `10e2b20` |
+| R-1 L2 成本门 + 边界登记 | ✅ 已修 | `8692cfe` + `162bc58` |
+| C-4 冷路径 delta 感知 | ✅ 已修 | `15951e1` |
+| R-2 合并失败降级 / R-4 超时 | ✅ 已修 | `da5d76d` |
+| **C-7 soak 短跑命令** | ✅ 已修 | `3ee1fb2` |
+| **C-8 指纹回退计数漏计** | ✅ 已修 | `3ee1fb2` |
+| **C-9 窗口 8→16 文档漂移** | ✅ 已修 | `3ee1fb2` |
+| **C-10 chunk_points 关联失效** | ✅ 已修 | `3ee1fb2` |
+| D-1~D-7 文档不符 | ✅ 已修 | `3ee1fb2` |
+| X-1 裸 `+=` 改饱和 | ✅ 已修 | `3ee1fb2` |
+| X-2~X-5 风险 | ⏳ 登记待排期 | — |
+| C-3 删源时序根治 | ⏳ 需设计决策 | — |
+| R-3 Gate 2 去重遮蔽 | ⏳ 需增强断言或登记边界 | — |
+| R-5/R-6/R-7/R-8/R-9 | ⏳ 登记待排期 | — |
+| 计划状态表（`plan:61` 的窗口声称） | ⏳ 待主会话订正 | — |
+
+## 7. 修复优先级
 
 | 优先 | 事项 | 量级 |
 |---|---|---|

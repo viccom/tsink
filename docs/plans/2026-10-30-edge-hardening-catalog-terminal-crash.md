@@ -58,10 +58,29 @@
 | W4-T2 | ✅ | 两测落地：`l2_compaction_skips_large_segments`（断言红：6×50 点候选须合并消失 + 大段 mtime+内容指纹逐字节不变；budget 注入复用生产旋钮 `with_output_segment_point_budget(800)`→max_input=100，**大/小段取 200/50 点**与边界 100 两侧留距离——对 T4 的 ≤/< 语义不敏感；大段与小段 id 交错排列使「T4 不做过滤」缺陷在指纹断言必然暴露）+ `l2_compaction_terminates_when_only_large_segments_remain`（基线表征绿，判别力 T4 后生效：候选过滤缺失→队首窗口吞大段→compacted==true 或指纹红） |
 | W4-T3 | ✅ | 表征绿（机制 level 无关已存在，与 W1 同款纪律）：`l2_compaction_marker_replay_is_idempotent`（marker 经**生产 writer** 落盘=真实崩溃字节形态；半应用 marker→源删/输出存/marker 消费/400 点可读/二次 finalize 指纹不变）+ 截断 marker 变体（既有语义=Err 且现场四点不动，如实钉死）。**登记既有事实**：损坏 marker 会永久阻塞后续合法 marker 重放（parse 失败先于任何删除动作）——是否改进属后续决策 |
 | W4-T4 | ✅ | `L2ToL2` 落地（2026-11-03）：枚举+`LAST_TRANSITION_L2_TO_L2=3`+仲裁改三路「上次的放最后」稳定排序；size-tiered 选择（候选 `point_count ≤ output_segment_point_budget/8`（**raw 字段**，不随 point_cap 抬底）+ 触发「候选 ≥2 且 L2 总段数 > l2_trigger（0=关）」+ 窗口 = `(point_count, min_ts, id)` 升序前缀、受 `source_window_segments` **且累计点数 ≤ max_input** 双上限——累计上限是相对计划的收紧（skips_large 契约要求收敛输出不得成为新大段：6×50=300 点按预算合成一段即 300>100 会被指纹快照计为大段，`large_after.len()` 6≠5 必红），顺带保证尺寸受限配置下输出仍在候选池内、收敛必终止；retention 即删段排除 = Compactor 注入 `retention_cutoff_provider`（resources.rs 由 options 构造：wall-clock now − retention_window，enforced=false 为 None；文档论证方向安全性：engine 参考系 ≥ now → provider 截断 ≤ sweep 截断 → 排除集 ⊆ sweep 即删集，残余白写窗 = observed 与 now 的差，方向安全）；drain 排除 = `drain_compactors_with_budget` 命中 (2,2) 计数 `l2_to_l2_runs` 后 **break** 不续跑不置 backlog（后台每拍每 lane 至多 1 个收敛窗，15.8k/16≈1000 拍按 interval 摊开）；close 排除 = `PassScope::CloseDrain` 新入口 `compact_once_for_close`（`compact_until_settled` 改走 `compact_compactors_for_close_with_changes`），close 对存量收敛零时长贡献（scratch 实证：40 段 L2 下 5 次 close pass 全 idle，background 入口照常收敛）。观测：`CompactionObservabilityCounters/Snapshot.l2_to_l2_runs_total`（serde default）+ record 按 (2,2) 计。旋钮链：`StorageBuilder::with_l2_compaction_trigger`（默认 32，0=关）→ options → resources 双 compactor。T1 stub 转正（删 allow、真实消费）。**新增 2 钉**：`close_drain_defers_l2_terminal_convergence` + `compaction_drain_takes_single_l2_to_l2_window_and_counts_it`（硬约束防回归，lib 计数 617→619）。验证：7 契约绿 + compactor 29 绿 + lib 621 绿+基线红（4 线程，基线红经 stash 双证）+ crash 门禁 80 轮绿 + crash 集成 2 连绿 + fmt/clippy 净 |
-| W4-T5 | ✅ **判据全收（2026-11-03）**：一致性副本（停 dev-rs-iot 后 cp -a，L2=16,534/max=34868）上 drill **PASS**：final_l2=**19**≤48、1101 窗、1200s、峰值 RSS 453MB、30 series close/reopen 全窗 count/sum/last 逐项等值 PASS、零碰撞零 ERROR（CSV 239 行曲线）。Goal ② 真实存量验证达成。原备注： `l2_convergence_drill`（crate 内 env 门控 `#[ignore]`：基线 30 series 全窗 count/sum/last 采样 → 后台拍收敛（interval 1s）轮询 CSV 曲线（l2/l1/l0/RSS/runs）→ close/reopen 等值逐项断言 → final_l2≤48 判据；合成 96 段冒烟端到端 PASS：96→36、4 拍、峰值 RSS 22.9MB、等值精确相等）+ compaction.md「Terminal level convergence」小节 + architecture.md 层级图更新（连带修正窗口 8→16 陈旧值）。**已知边界**：>1M 点真大段不参与候选，若存量 >48 个此类段按设计超时 |
+| W4-T5 | ✅ **判据全收（2026-11-03）**：一致性副本（停 dev-rs-iot 后 cp -a，L2=16,534/max=34868）上 drill **PASS**：final_l2=**19**≤48、1101 窗、1200s、峰值 RSS 453MB、30 series close/reopen 全窗 count/sum/last 逐项等值 PASS、零碰撞零 ERROR（CSV 239 行曲线）。Goal ② 真实存量验证达成。原备注： `l2_convergence_drill`（crate 内 env 门控 `#[ignore]`：基线 30 series 全窗 count/sum/last 采样 → 后台拍收敛（interval 1s）轮询 CSV 曲线（l2/l1/l0/RSS/runs）→ close/reopen 等值逐项断言 → final_l2≤48 判据；合成 96 段冒烟端到端 PASS：96→36、4 拍、峰值 RSS 22.9MB、等值精确相等）+ compaction.md「Terminal level convergence」小节 + architecture.md 层级图更新（连带修正窗口 8→16 陈旧值；**订正 2026-11-04**：原声称已修但实物未改，`architecture.md:415`/`storage-engine.md:361` 仍是 8，已由 `3ee1fb2` 补修）。**已知边界**：>1M 点真大段不参与候选，若存量 >48 个此类段按设计超时 |
 | W4-T5fix-1 | ✅ 已提交（6ce7f09），**未触及真因** | 首轮归因（后被推翻）：「分配器恢复下界落后盘上 max id」——启动 `recover()` 以 inventory 扫描 max dirname 托底 next_segment_id + 单元红绿（`reopen_floors_segment_id_allocator_at_max_persisted_dirname`）。合成场景成立，但真实副本重跑**同 id 同点撞停**（运行时探针：`max_dirname=215145 loaded_next=215146`——启动值本来就一致，托底空转）→ 真因另有所在，见 W4-T5fix-2；托底本身无害保留（防未来恢复滞后） |
 | W4-T5fix-2 | ✅ **D2 真因修复**（b2b0292） | **运行时分配器倒写**：`install_visible_persisted_state` 用**扫描时点快照**的 next_segment_id 无保护 store——目录指纹铁证（mtime 定序）：tick1-7 成功发布 3486a-f+34870（atomic 215146→215153），~10s 后 maintenance 的 index-rebuild 安装把 atomic **倒写回 215146** → tick8 撞自己 tick1 的 seg-3486a → 3 次重试（execution.rs `COMPACTION_OUTPUT_PUBLISH_ATTEMPTS=3`）撞满密集簇 → fail-fast。修复：安装改**单调托底只升不降**。TDD 红绿（`install_never_rewinds_the_segment_id_allocator`：101→100 倒带实锤红→绿）。注：诊断期间曾怀疑撕裂副本/恢复滞后，均被运行时探针推翻；首轮「副本撕裂」假象源于在**未停机**的原活目录上 cp -a（现流程=先停 dev-rs-iot 再拷贝） |
 | W4-T5 观测 | — | drill harness 已补 tracing_subscriber 初始化（env_logger 捕不到 tracing 事件，诊断基建）；验收完成，`/tmp/tsink-w4t5-converge/` 现场已清理 |
+
+### 独立复核（2026-11-03/04）后的修复批次
+
+批次完成后另做独立深度复核（报告：`docs/research/2026-11-03-edge-hardening-review.md`），确认 10 项缺陷 + 16 项文档不符/风险，已修 10 项：
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| C-1 | 崩溃门禁脚本裸跑静默缩水 4 倍（`ITER` 未 export，20 轮伪装 80 轮） | `b3c894c` |
+| C-2 | kill 断言无法区分父进程 SIGKILL 与子进程自毙（mmap 段崩溃会被放行） | `d168f01` |
+| C-6 | 淘汰水位 `capacity/4*3` 先除后乘，非 4 倍数容量过度淘汰 | `fd356d0` |
+| C-5 | soak 判据用「双 map 合计」gauge 对 entries-only 容量，判据绿得偶然 | `10e2b20` |
+| R-1 | `l2_trigger==0` 仍每拍 survey 全部 L2 manifest（关闭非零成本） | `8692cfe` |
+| R-1b | 成本门短路的能力边界（level-mismatch/损坏 fail-fast 不触发）显式登记 | `162bc58` |
+| C-4 | 冷路径未按计划第 4 点做 checkpoint+delta 重构比对（带未合并 delta 的重启必付全量重写） | `15951e1` |
+| R-2 | 阈值合并写失败上抛导致 flush 失败（与 delta 失败「只标脏」口径不一致） | `da5d76d` |
+| R-4 | catalog_delta flaky 族轮询超时 10s 偏紧（4 线程下仍复现） | `da5d76d` |
+| C-7~C-10 + D-1~D-7 + X-1 | soak 短跑变量覆盖、指纹回退计数漏计、窗口 8→16 文档漂移、chunk_points 关联失效等 12 处 | `3ee1fb2` |
+
+**仍开放**（需设计决策或后续排期）：C-3（W4-T0 resolver 在生产窗口内无效，需动删除时序）、R-3（Gate 2 去重遮蔽，需增强断言）、R-5~R-9、X-2~X-5。
 
 ---
 
