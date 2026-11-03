@@ -217,6 +217,10 @@ impl Compactor {
             // drops directories that vanished concurrently). Anything above
             // the trigger falls through to the full survey, so trigger
             // semantics stay byte-for-byte the same.
+            //
+            // Accepted cost: no manifest is read here, so the survey's
+            // directory-vs-manifest level check and corrupt-manifest fail-fast
+            // are skipped (fingerprints on load + startup quarantine still gate integrity).
             if count_trigger == 0
                 || count_level_segment_dirs(&self.data_path, source_level)? <= count_trigger
             {

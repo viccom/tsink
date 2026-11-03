@@ -116,6 +116,17 @@ size-tiered same-level merges that never rewrite the bulk of the terminal data:
   convergence pass that surveys every L2 manifest and then declines to merge. The
   survey (one open+read+parse per segment) runs only when the directory count already
   exceeds the trigger.
+- **Gate cost boundary (deliberate trade-off)** — the short-circuit path reads no
+  manifest, so two checks that live inside the survey do not run on it: the
+  `segment directory level mismatch` validation (the only place in the engine that
+  compares a segment directory's level name against `manifest.level`), and the fail-fast
+  that rejects an unreadable manifest as `DataCorruption`. This is the price of the
+  zero-cost switch, not an omission: both are diagnostics for hand-edited directories or
+  upstream bugs rather than integrity gates. Integrity is covered independently — segment
+  file fingerprints are verified on every segment load (`verify_file_manifest_entry`),
+  startup recovery quarantines invalid segment directories, and loading a selected window
+  goes through the strict `SegmentLoadPolicy::FailOnInvalid(Compaction)` path. Both
+  survey-time checks return as soon as the L2 directory count rises above the trigger.
 - **Window** — candidates sorted by `(point_count, min_ts, segment_id)` ascending
   (smallest and oldest fragments first), capped at `source_window_segments` (16) and at
   a cumulative point total of `output_segment_point_budget / 8`. The merged output is

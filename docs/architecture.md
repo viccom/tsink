@@ -421,7 +421,10 @@ L2 is the default terminal level: no data leaves it, but once its segment count 
 convergence** — merging windows of at most 16 small legacy segments
 (`point_count ≤ output_segment_point_budget / 8`) back into L2 to shrink the terminal
 segment count. Close-time drains skip this work so a large legacy backlog cannot extend
-graceful shutdown.
+graceful shutdown. The trigger is gated on the L2 directory count before any manifest is
+read, so `0` and a count at or below the trigger cost nothing — at the price that the
+survey's own level-mismatch and corrupt-manifest checks do not run on that path (see
+`docs/compaction.md`).
 
 Compaction is tombstone-aware: tombstoned time ranges are excluded from the output segment, physically removing deleted data from disk.
 
