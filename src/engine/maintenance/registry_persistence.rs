@@ -154,7 +154,7 @@ impl ChunkStorage {
             | registry_catalog::CatalogPersistOutcome::SkippedValidatedFromFile
             | registry_catalog::CatalogPersistOutcome::DeltaWriteFailed => {
                 // DeltaWriteFailed 归入 skip 口径：消耗了一次尝试但无落盘效果
-                // （失败详情由 delta 路径 WARN 记录）。
+                // （失败详情由 delta 追加/阈值合并路径 WARN 记录）。
                 self.observability
                     .flush
                     .catalog_persist_skipped_total

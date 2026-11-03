@@ -2299,7 +2299,20 @@ fn startup_recovers_when_catalog_is_missing_or_corrupt() {
 /// W3-T4 计划定名的 catalog 增量目录（与 checkpoint 同目录，尚不存在）。
 const CATALOG_DELTA_DIR_NAME: &str = "series_index.catalog.d";
 
-const CATALOG_DELTA_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// catalog delta 族测试的轮询等待上界。
+///
+/// 绿态下谓词命中即返回（等待上界不影响耗时）；上界只在真实卡住时消耗。
+/// 原固定 10s 与真实失败耗时同量级（实测绿 ~1.4s、红 ~10.5s），在
+/// `--test-threads=8` 下 ext4 journal 多实例 fsync 排队会把正常路径推过 10s
+/// 造成假红。默认提到 30s，并允许 `TSINK_CATALOG_DELTA_POLL_TIMEOUT_MS` 覆盖
+/// （慢盘/CI 可调大，快速验证失败路径可调小）。
+fn catalog_delta_poll_timeout() -> Duration {
+    std::env::var("TSINK_CATALOG_DELTA_POLL_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+}
 
 use std::time::Instant;
 
@@ -2462,7 +2475,7 @@ fn catalog_delta_recovers_without_full_rewrite() {
         let storage = catalog_delta_builder(data_path).build().unwrap();
         settle_past_catalog_persist_throttle();
         insert_catalog_delta_series(&storage, "catalog-delta-30", &labels, 1, 4);
-        let produced_change = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        let produced_change = poll_until(catalog_delta_poll_timeout(), || {
             delta_dir.is_dir()
                 || std::fs::read(&catalog_file)
                     .map(|bytes| bytes != baseline.bytes)
@@ -2471,7 +2484,7 @@ fn catalog_delta_recovers_without_full_rewrite() {
         assert!(
             produced_change,
             "routine persist must record the new segment (delta or checkpoint change) \
-             within 10s"
+             within the poll timeout"
         );
 
         // 红态断言：两处红都收集到同一次失败输出里。
@@ -2546,12 +2559,12 @@ fn catalog_delta_replay_order_matters() {
             let metric = format!("catalog-replay-base-{round}");
             let ts_base = 1 + round * 10;
             insert_catalog_delta_series(&storage, &metric, &labels, ts_base, 4);
-            let published = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            let published = poll_until(catalog_delta_poll_timeout(), || {
                 count_lane_segments_at_level(&lane_path, 0) > round as usize
             });
             assert!(
                 published,
-                "baseline batch {round} must be published as an L0 segment within 10s"
+                "baseline batch {round} must be published as an L0 segment within the poll timeout"
             );
         }
         storage.close().unwrap();
@@ -2572,7 +2585,7 @@ fn catalog_delta_replay_order_matters() {
             .unwrap();
         settle_past_catalog_persist_throttle();
         insert_catalog_delta_series(&storage, "catalog-replay-add", &labels, 31, 4);
-        let round1_landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        let round1_landed = poll_until(catalog_delta_poll_timeout(), || {
             delta_dir.is_dir()
                 || std::fs::read(&catalog_file)
                     .map(|bytes| catalog_checkpoint_segment_count(&bytes) > baseline_count)
@@ -2580,7 +2593,7 @@ fn catalog_delta_replay_order_matters() {
         });
         assert!(
             round1_landed,
-            "round 1 (add) must reach the persisted catalog within 10s"
+            "round 1 (add) must reach the persisted catalog within the poll timeout"
         );
         // 红态断言（先目录存在 = 红点，再数量）：合并拍在 ≥1s 后，此处读到的
         // delta 目录只含轮 1 的 add。
@@ -2600,15 +2613,15 @@ fn catalog_delta_replay_order_matters() {
         // 消失 → 第 2 个 delta（无任何新增段，故不产生额外 add delta）。
         let round1_checkpoint = std::fs::read(&catalog_file).unwrap_or_default();
         let round1_count = catalog_checkpoint_segment_count(&round1_checkpoint);
-        let merged = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        let merged = poll_until(catalog_delta_poll_timeout(), || {
             count_lane_segments_at_level(&lane_path, 0) < 4
                 && count_lane_segments_at_level(&lane_path, 1) >= 1
         });
         assert!(
             merged,
-            "background compaction must merge the 4 L0 segments into L1 within 10s"
+            "background compaction must merge the 4 L0 segments into L1 within the poll timeout"
         );
-        let round2_landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        let round2_landed = poll_until(catalog_delta_poll_timeout(), || {
             catalog_delta_files(&delta_dir)
                 .map(|deltas| deltas.len() >= 2)
                 .unwrap_or(false)
@@ -2618,7 +2631,7 @@ fn catalog_delta_replay_order_matters() {
         });
         assert!(
             round2_landed,
-            "round 2 (remove) must reach the persisted catalog within 10s"
+            "round 2 (remove) must reach the persisted catalog within the poll timeout"
         );
         match catalog_delta_files(&delta_dir) {
             Err(err) => panic!(
@@ -2708,7 +2721,7 @@ fn catalog_delta_preserves_startup_fast_path() {
         // 制造 delta（复用例行 persist 链），然后重开验证快路径保持。
         settle_past_catalog_persist_throttle();
         insert_catalog_delta_series(&storage, "catalog-fast-post", &labels, 1, 4);
-        let produced_change = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+        let produced_change = poll_until(catalog_delta_poll_timeout(), || {
             delta_dir.is_dir()
                 || std::fs::read(&catalog_file)
                     .map(|bytes| bytes != baseline.bytes)
@@ -2717,7 +2730,7 @@ fn catalog_delta_preserves_startup_fast_path() {
         assert!(
             produced_change,
             "routine persist must record the new segment (delta or checkpoint change) \
-             within 10s"
+             within the poll timeout"
         );
         // 红态断言（前置）：delta 必须存在。
         match catalog_delta_files(&delta_dir) {
@@ -2843,14 +2856,14 @@ fn catalog_checkpoint_consolidates_deltas() {
                 1 + round as i64 * 10,
                 4,
             );
-            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            let landed = poll_until(catalog_delta_poll_timeout(), || {
                 catalog_delta_files(&delta_dir)
                     .map(|deltas| deltas.len() > round)
                     .unwrap_or(false)
             });
             assert!(
                 landed,
-                "round {round} must land as delta #{} under {} within 10s",
+                "round {round} must land as delta #{} under {} within the poll timeout",
                 round + 1,
                 delta_dir.display()
             );
@@ -2864,10 +2877,10 @@ fn catalog_checkpoint_consolidates_deltas() {
 
         // 第 3 轮达到阈值 → 全量 checkpoint 合并。
         insert_catalog_delta_series(&storage, "catalog-ckpt-2", &labels, 21, 4);
-        let consolidated = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || marker.exists());
+        let consolidated = poll_until(catalog_delta_poll_timeout(), || marker.exists());
         assert!(
             consolidated,
-            "reaching catalog_delta_max_count must write {} within 10s",
+            "reaching catalog_delta_max_count must write {} within the poll timeout",
             marker.display()
         );
         let checkpoint_seq = catalog_checkpoint_marker_seq(&marker)
@@ -2926,14 +2939,14 @@ fn catalog_checkpoint_consolidates_deltas() {
                 100 + extra as i64 * 10,
                 4,
             );
-            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            let landed = poll_until(catalog_delta_poll_timeout(), || {
                 catalog_delta_files(&delta_dir)
                     .map(|deltas| deltas.len() > extra)
                     .unwrap_or(false)
             });
             assert!(
                 landed,
-                "post-consolidation change {extra} must land as a fresh delta within 10s"
+                "post-consolidation change {extra} must land as a fresh delta within the poll timeout"
             );
         }
         let deltas = catalog_delta_files(&delta_dir).unwrap_or_default();
@@ -2984,10 +2997,10 @@ fn catalog_checkpoint_consolidates_deltas() {
             .unwrap();
         settle_past_catalog_persist_throttle();
         insert_catalog_delta_series(&storage, "catalog-ckpt-bytes", &labels, 1, 4);
-        let consolidated = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || bytes_marker.exists());
+        let consolidated = poll_until(catalog_delta_poll_timeout(), || bytes_marker.exists());
         assert!(
             consolidated,
-            "reaching catalog_delta_max_bytes must write {} within 10s",
+            "reaching catalog_delta_max_bytes must write {} within the poll timeout",
             bytes_marker.display()
         );
         assert!(
@@ -3055,7 +3068,7 @@ fn catalog_forced_checkpoint_writes_full_file() {
                 10 + round as i64 * 10,
                 4,
             );
-            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            let landed = poll_until(catalog_delta_poll_timeout(), || {
                 catalog_delta_files(&delta_dir)
                     .map(|deltas| deltas.len() > round)
                     .unwrap_or(false)
@@ -3137,6 +3150,211 @@ fn catalog_forced_checkpoint_writes_full_file() {
     }
 }
 
+/// R-2 红：阈值合并支路的写失败必须降级为「标脏重试」，不得使 flush 失败。
+///
+/// 场景：`catalog_delta_max_count = 2` ⇒ 第 2 笔变更走合并支路（全量 checkpoint
+/// 重写主文件）。此时把主文件路径替换成**目录**——rename(tmp, main) 必然失败，
+/// 且该手段对 root 同样有效（`chmod 0444` 在 root 下无效，仓库已有该坑）。
+/// 红态：合并支路的 `?` 把错误上抛 → 整条 flush 失败（`persist_segment_with_outcome`
+/// 返回 Err + 回滚已发布段根）。绿态：返回 Ok、outcome 降级、变更留在
+/// `pending_changes`，下一拍成功落盘。
+#[test]
+fn catalog_merge_write_failure_marks_dirty_instead_of_failing_flush() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let delta_dir = catalog_delta_dir(data_path);
+    let labels = vec![Label::new("host", "merge-degrade")];
+
+    // 第一开：基线 + 首笔变更（delta #1 落盘，阈值 2 未达）+ close 建立 checkpoint。
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_catalog_delta_max_count(2)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-merge-base", &labels, 1, 4);
+        let landed = poll_until(catalog_delta_poll_timeout(), || {
+            catalog_delta_files(&delta_dir)
+                .map(|deltas| !deltas.is_empty())
+                .unwrap_or(false)
+        });
+        assert!(
+            landed,
+            "precondition: the first change must land as delta #1 under {}",
+            delta_dir.display()
+        );
+        storage.close().unwrap();
+    }
+
+    // 第二开：主文件路径被目录占据 ⇒ 任何 checkpoint 重写（含合并支路）必然失败。
+    // 用一个无后台线程、可由测试驱动 persist 的实例，逐笔精确控制阈值。
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.flush_interval = Duration::from_secs(3600);
+    options.compaction_interval = Duration::from_secs(3600);
+    options.catalog_persist_interval = Duration::from_millis(50);
+    options.catalog_delta_max_count = 2;
+    options.seal_policy = super::super::config::SealPolicy::immediate();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        4,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+    settle_past_catalog_persist_throttle();
+
+    // 首笔变更：delta #1（阈值 2 未达，走 delta 追加，主文件不被触碰）。
+    let insert_merge_rows = |metric: &str, ts_base: i64| {
+        let rows: Vec<Row> = (ts_base..ts_base + 4)
+            .map(|ts| Row::with_labels(metric, labels.clone(), DataPoint::new(ts, ts as f64)))
+            .collect();
+        storage.insert_rows(&rows).unwrap();
+    };
+    insert_merge_rows("catalog-merge-a", 11);
+    storage.flush_all_active().unwrap();
+    let first = storage.persist_segment_with_outcome().unwrap();
+    assert!(
+        first.persisted,
+        "precondition: the first publish tick must persist a segment"
+    );
+    let landed = poll_until(catalog_delta_poll_timeout(), || {
+        catalog_delta_files(&delta_dir)
+            .map(|deltas| !deltas.is_empty())
+            .unwrap_or(false)
+    });
+    assert!(
+        landed,
+        "precondition: the first publish tick must append delta #1 under {}",
+        delta_dir.display()
+    );
+
+    // 把主文件路径变成目录：checkpoint 重写的 rename 必然失败（root 也有效）。
+    let blocked_main = catalog_file.clone();
+    std::fs::remove_file(&blocked_main).expect("baseline main file must exist before blocking");
+    std::fs::create_dir(&blocked_main).expect("a directory in place of the main file must build");
+    assert!(
+        blocked_main.is_dir(),
+        "blocking precondition: the main catalog path must be a directory"
+    );
+
+    // 第二笔变更：阈值 2 达到 ⇒ 合并支路 → 主文件重写失败。
+    insert_merge_rows("catalog-merge-b", 21);
+    storage.flush_all_active().unwrap();
+    let second = storage.persist_segment_with_outcome();
+
+    // 清理阻塞，避免影响后续断言/重开。
+    let merge_result = match second {
+        Ok(outcome) => {
+            std::fs::remove_dir(&blocked_main).ok();
+            Ok(outcome)
+        }
+        Err(err) => {
+            std::fs::remove_dir(&blocked_main).ok();
+            Err(err)
+        }
+    };
+    let outcome = merge_result.unwrap_or_else(|err| {
+        panic!(
+            "R-2: a failed threshold consolidation must degrade to mark-dirty, not fail the \
+             flush; the publish tick returned {err:?}"
+        )
+    });
+    assert!(
+        outcome.persisted,
+        "the segment itself must still publish; only the catalog write degrades"
+    );
+
+    // 降级自证：变更没有丢——下一拍（主文件已恢复可写）必须把积压变更一起落盘。
+    // 合并支路成功 ⇒ 主文件承载全部段；delta 追加成功 ⇒ delta 数增长到 2。
+    settle_past_catalog_persist_throttle();
+    insert_merge_rows("catalog-merge-c", 31);
+    storage.flush_all_active().unwrap();
+    let third = storage
+        .persist_segment_with_outcome()
+        .expect("the retry publish tick must succeed once the main file is writable again");
+    assert!(
+        third.persisted,
+        "the retry publish tick must publish its segment"
+    );
+    let recovered = poll_until(catalog_delta_poll_timeout(), || {
+        let main_ok = std::fs::read(&blocked_main)
+            .ok()
+            .map(|bytes| catalog_checkpoint_segment_count(&bytes) > 0)
+            .unwrap_or(false);
+        let deltas = catalog_delta_files(&delta_dir)
+            .map(|d| d.len())
+            .unwrap_or(0);
+        main_ok || deltas >= 2
+    });
+    assert!(
+        recovered,
+        "the dirty-marked changes must be retried by the next publish beat: neither a \
+         consolidated main file nor two deltas appeared under {}",
+        data_path.display()
+    );
+
+    // 数据面自证：重启后积压变更的数据都可查（catalog 只是缓存，段数据不丢）。
+    storage.close().ok();
+    let reopened = catalog_delta_builder(data_path).build().unwrap();
+    assert_catalog_delta_series_window(&reopened, "catalog-merge-a", &labels, 11, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-merge-b", &labels, 21, 4);
+    assert_catalog_delta_series_window(&reopened, "catalog-merge-c", &labels, 31, 4);
+    reopened.close().unwrap();
+}
+
+/// R-2 反向锚点：降级**只**适用于例行发布拍的合并支路；close 的强制 checkpoint
+/// 仍必须真实失败。关停时无法持久化 catalog 是运维必须知道的错误，不能静默吞掉
+/// （否则「关停成功」的假象会掩盖盘面不可写）。
+#[test]
+fn catalog_close_forced_checkpoint_still_fails_when_unwritable() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let catalog_file = data_catalog_checkpoint_file(data_path);
+    let labels = vec![Label::new("host", "close-anchor")];
+
+    {
+        let storage = catalog_delta_builder(data_path)
+            .with_compaction_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        settle_past_catalog_persist_throttle();
+        insert_catalog_delta_series(&storage, "catalog-close-anchor", &labels, 1, 4);
+        storage.close().unwrap();
+    }
+    assert!(
+        catalog_file.is_file(),
+        "precondition: the baseline close must leave a catalog main file"
+    );
+
+    // 先正常重开（启动校验需要读主文件），再把主文件路径换成目录 ⇒ close 的
+    // 强制 checkpoint 重写必然失败。
+    let storage = catalog_delta_builder(data_path)
+        .with_compaction_interval(Duration::from_secs(60))
+        .build()
+        .expect("reopen must succeed while the main file is still readable");
+    std::fs::remove_file(&catalog_file).expect("baseline main file must exist");
+    std::fs::create_dir(&catalog_file).expect("a directory in place of the main file must build");
+
+    let close_result = storage.close();
+    std::fs::remove_dir(&catalog_file).ok();
+
+    let err = close_result.expect_err(
+        "close must surface the forced-checkpoint write failure; only routine publish ticks degrade",
+    );
+    assert!(
+        matches!(err, TsinkError::IoWithPath { .. }),
+        "close must report the underlying I/O failure, got {err:?}"
+    );
+}
+
 // ---- W3-T3（红）：崩溃窗口降级 ------------------------------------------------
 //
 // 崩溃窗盘面不由 close 产生（close 必然强制合并并清 delta，语义见 W3-T2），而是
@@ -3186,14 +3404,14 @@ fn catalog_delta_crash_window_fixture(
         settle_past_catalog_persist_throttle();
         for (round, metric) in delta_metrics.iter().enumerate() {
             insert_catalog_delta_series(&storage, metric, labels, 11 + round as i64 * 10, 4);
-            let landed = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+            let landed = poll_until(catalog_delta_poll_timeout(), || {
                 catalog_delta_files(&delta_dir)
                     .map(|deltas| deltas.len() > round)
                     .unwrap_or(false)
             });
             assert!(
                 landed,
-                "delta round {round} ({metric}) must land under {} within 10s",
+                "delta round {round} ({metric}) must land under {} within the poll timeout",
                 delta_dir.display()
             );
             let newest = catalog_delta_files(&delta_dir)
@@ -3304,12 +3522,12 @@ fn catalog_delta_missing_falls_back_to_rebuild() {
     assert_catalog_delta_series_window(&storage, "catalog-fallback-c", &labels, 21, 4);
 
     // 回退语义（绿态判据，W3-T4 实现）：catalog 强制重写 + 残留 delta 清理。
-    let rebuilt_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+    let rebuilt_in_time = poll_until(catalog_delta_poll_timeout(), || {
         std::fs::read(data_catalog_checkpoint_file(data_path))
             .map(|bytes| bytes != baseline.bytes)
             .unwrap_or(false)
     });
-    let cleaned_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+    let cleaned_in_time = poll_until(catalog_delta_poll_timeout(), || {
         catalog_delta_files(&delta_dir)
             .map(|deltas| deltas.is_empty())
             .unwrap_or(true)
@@ -3385,12 +3603,12 @@ fn catalog_delta_truncated_falls_back_to_rebuild() {
     assert_catalog_delta_series_window(&storage, "catalog-truncated-c", &labels, 21, 4);
 
     // 回退语义（绿态判据，W3-T4 实现）：catalog 强制重写 + 全部 delta 清理。
-    let rebuilt_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+    let rebuilt_in_time = poll_until(catalog_delta_poll_timeout(), || {
         std::fs::read(data_catalog_checkpoint_file(data_path))
             .map(|bytes| bytes != baseline.bytes)
             .unwrap_or(false)
     });
-    let cleaned_in_time = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+    let cleaned_in_time = poll_until(catalog_delta_poll_timeout(), || {
         catalog_delta_files(&delta_dir)
             .map(|deltas| deltas.is_empty())
             .unwrap_or(true)
@@ -3640,14 +3858,14 @@ fn catalog_cold_path_validates_stale_checkpoint_with_deltas_in_place() {
     // 更新，而不是退化成「下一拍再全量重写」。
     settle_past_catalog_persist_throttle();
     insert_catalog_delta_series(&reopened, "catalog-cold-d", &labels, 31, 4);
-    let appended = poll_until(CATALOG_DELTA_POLL_TIMEOUT, || {
+    let appended = poll_until(catalog_delta_poll_timeout(), || {
         catalog_delta_files(&delta_dir)
             .map(|deltas| deltas.len() > captured.len())
             .unwrap_or(false)
     });
     assert!(
         appended,
-        "the post-reopen publish tick must append a delta under {} within 10s",
+        "the post-reopen publish tick must append a delta under {} within the poll timeout",
         delta_dir.display()
     );
     let after_publish = std::fs::read(&catalog_file)

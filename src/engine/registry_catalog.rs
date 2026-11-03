@@ -559,8 +559,8 @@ pub(super) enum CatalogPersistOutcome {
     /// 冷启动/备忘失效：读文件做 entries 比对，命中即采纳文件指纹（零重写，
     /// 且不读取 segment 的 series.bin——保持「catalog 有效即可恢复」语义）。
     SkippedValidatedFromFile,
-    /// delta 写盘失败：catalog 已标脏（下拍重试/强制 checkpoint），不使
-    /// flush 失败（catalog 是派生缓存）。
+    /// catalog 写盘失败（delta 追加或阈值合并）：catalog 已标脏（下拍重试/
+    /// 强制 checkpoint），不使 flush 失败（catalog 是派生缓存）。
     DeltaWriteFailed,
 }
 
@@ -787,8 +787,9 @@ fn persist_registry_catalog_checkpoint(
 /// 没有下一拍可重试，delta 必须随拍落盘。
 ///
 /// 顺序纪律：段 rename + 目录 fsync 已由发布管线完成 → delta 原子写（tmp +
-/// rename + 父目录 fsync）→ 返回成功。delta 写失败只标脏（下拍重试/达阈值即
-/// 强制 checkpoint），不使 flush 失败——catalog 是派生缓存。
+/// rename + 父目录 fsync）→ 返回成功。delta 追加**或阈值合并**的写失败都只标脏
+/// （下拍重试/达阈值即再试合并），不使 flush 失败——catalog 是派生缓存。close /
+/// 显式锚点的强制 checkpoint 不走这里，仍按真实失败上抛。
 #[allow(clippy::too_many_arguments)]
 fn persist_registry_catalog_delta(
     snapshot_path: &Path,
@@ -891,7 +892,13 @@ fn persist_registry_catalog_delta(
             || state.delta_bytes_since_checkpoint.saturating_add(bytes_len) > delta_max_bytes
     };
     if threshold_reached {
-        let (fingerprint, _) = persist_registry_catalog_checkpoint(
+        // 合并支路的写失败与 delta 追加失败同一口径：catalog 是派生缓存（启动可从
+        // 段目录重建；WAL 前缀回收由 flush 的 durability 水位驱动，不依赖 catalog），
+        // 合并失败只标脏下拍重试，不使 flush 失败。此处传入的 `force=true` 是
+        // 「合并即全量、无视节流」语义（吸收 absorbed_checkpoint_seq=Some），
+        // 不是 close/显式锚点的强制刷新——后者走 `persist_registry_catalog_throttled`
+        // 的 force 分支，仍按真实失败上抛（关停时无法持久化必须报错）。
+        return match persist_registry_catalog_checkpoint(
             snapshot_path,
             sources,
             entry_cache,
@@ -901,8 +908,21 @@ fn persist_registry_catalog_delta(
             true,
             Some(seq),
             series_fingerprint,
-        )?;
-        return Ok((fingerprint, CatalogPersistOutcome::CheckpointConsolidated));
+        ) {
+            Ok((fingerprint, _)) => {
+                Ok((fingerprint, CatalogPersistOutcome::CheckpointConsolidated))
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    seq,
+                    "Catalog checkpoint consolidation failed; marking the catalog dirty for the next publish beat"
+                );
+                let mut state = memo.state.lock();
+                state.pending_changes = merged_changes;
+                Ok((None, CatalogPersistOutcome::DeltaWriteFailed))
+            }
+        };
     }
 
     if let Err(err) = append_catalog_delta_file(snapshot_path, seq, &bytes) {
