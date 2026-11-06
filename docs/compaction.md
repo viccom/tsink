@@ -179,43 +179,102 @@ they are permanently excluded from the output segments.
 
 ---
 
-## Atomic segment replacement
+## Atomic segment replacement (deferred source deletion)
 
-Compaction writes output segments to disk first, then atomically swaps them in to replace
-the source segments. This two-phase protocol makes interruptions safe:
+Compaction writes output segments to disk first, then publishes a replacement marker and
+hides the source directories from scans. The source directories themselves are deleted
+only after the replacement is live in the in-memory persisted index. This protocol makes
+interruptions safe:
 
 1. **Write outputs** — each output segment is written to a new directory under the lane
    root. If writing fails, any partial output directories are removed (rollback).
-2. **Write replacement marker** — a JSON file is written atomically to
-   `.compaction-replacements/replace-<ts>-<nonce>.json`. The marker lists the relative
-   paths of both source and output segments.
-3. **Apply replacement** — the source segment directories are removed and the marker file
-   is deleted.
+2. **Write replacement marker + sentinels (stage one)** — a JSON file is written
+   atomically to `.compaction-replacements/replace-<ts>-<nonce>.json`. The marker lists
+   the relative paths of both source and output segments. Immediately afterwards an empty
+   sentinel file `.pending-replacement-delete` is created (`create_new`) inside **every
+   source segment directory**. If the sentinel cannot be written, the marker is removed
+   and the pass fails: the invariant is "marker on disk ⟹ every source directory carries
+   its sentinel".
+3. **Apply replacement (stage two)** — the source segment directories are removed (the
+   sentinel goes with them) and the marker file is deleted. This runs only once **every**
+   output root named by the marker is visible in the persisted index
+   (`segments_by_root`), i.e. once the replacement is actually the live view.
 
-If the process is interrupted between steps 2 and 3, the marker file survives on disk.
-The next `compact_once` call (or startup) calls `finalize_pending_compaction_replacements`
-which replays all pending markers in sorted order, completing any interrupted
-replacements. An output-side manifest must exist for the replacement to be applied; if
-it does not, the replacement is treated as a corruption error.
+The sentinel is what makes the window safe. `collect_segment_dirs`
+(`src/engine/segment/loader.rs`) is the single funnel every segment-directory listing
+goes through — window selection, inventory scans, startup scans and the retention sweep
+all call it (directly or via `list_segment_dirs` / `count_level_segment_dirs`). It skips
+any `seg-*` directory containing the sentinel, at the cost of one `stat` per candidate
+directory of the levels being listed. So a source segment waiting for stage two is
+invisible to every scan (it cannot be re-selected into a window — which would otherwise
+merge an already-replaced segment again — and cannot be reported as a live segment by
+inventory or retention) while still being present on disk, hence still readable.
 
-### Known read window between step 3 and the index refresh
+### Why stage two is gated on the index, and where it runs
 
-Step 3 deletes the source segment directories, but the in-memory persisted index is only
-updated on the next maintenance tick (`apply_persisted_catalog_transition_phase`). That
-leaves a short window in which the index still references a source segment whose files
-are gone. A query that reaches that segment inside the window and whose chunk mapping was
-already evicted by the mmap budget fails with `NotFound` instead of returning data — the
-query is transiently rejected, never silently wrong, and a retry once the index has
-refreshed succeeds.
+Stage two runs at the **start of the next compaction pass**
+(`compact_once_scoped` → `finalize_pending_compaction_replacements_gated`), inside the
+compaction worker and under the segment-replacement gate it already holds. It is not
+triggered from the catalog-refresh path, and in particular not from the flush persist
+pipeline, which calls `apply_known_dirty_persisted_refresh_if_pending` while already
+holding the segment-replacement gate — taking that gate again there would re-enter the
+same mutex on one thread. Lock order stays `maintenance > compaction > segment
+replacement`.
 
-`SegmentMapRemapResolver` (W4-T0) does not close this window: slots are assigned
-monotonically and never re-bound (`install.rs`), so re-resolving a slot against the
-still-stale index yields the same deleted path. The counter
-`persisted_remap_not_found_total` therefore measures *how often the window is hit*, not
-how often it was repaired. Two ways to shrink the window exist — defer source deletion
-into a hidden staging directory until after the index refresh, or tolerate the error at
-the query layer — neither is implemented today; closing it is tracked as review item C-3
-in `docs/research/2026-11-03-edge-hardening-review.md`.
+The gate itself is a predicate over the live persisted index, wired by the engine
+(`construction/resources.rs`) as `Some(...)` using `try_read` (a contended index simply
+defers deletion one tick rather than stalling the pass). Standalone compactors and the
+startup replay in `bootstrap/discovery.rs` leave it `None`, which means **unconditional
+replay**: at startup no index exists yet and a crash residue must be completed without
+waiting for anything.
+
+Markers are applied in sorted (timestamp) order and the scan **stops** at the first
+marker whose outputs are not yet visible. This is not an optimization: markers can chain
+(an L0→L1 output can be consumed by a later L1→L2 pass), so applying a later marker
+while an earlier one is still pending would delete that earlier marker's output
+directories as "sources" and permanently strand it. Stopping preserves publish order; the
+cost is that the later marker waits one more tick.
+
+If the process is interrupted after stage one, the marker survives on disk. Startup
+replay (`finalize_pending_compaction_replacements`, unconditional) completes it. An
+output-side manifest must exist for the replacement to be applied; if it does not, the
+replacement is treated as a corruption error.
+
+### Read window: closed by deferred deletion (C-3)
+
+Earlier builds deleted the source directories at marker publication, while the in-memory
+persisted index was only updated on the next maintenance tick
+(`apply_persisted_catalog_transition_phase`). A query that reached a source segment
+inside that window whose chunk mapping had already been evicted by the mmap budget failed
+with `NotFound` instead of returning data — transiently rejected, never silently wrong,
+but still a user-visible error. That window is now closed: the source directories are
+still on disk when the index is stale, so a re-map succeeds and the query returns the
+same points it would have before the replacement.
+
+`SegmentMapRemapResolver` (W4-T0) does not contribute to closing it (slots are assigned
+monotonically and never re-bound, so re-resolving against a stale index yields the same
+path); the counter `persisted_remap_not_found_total` now only measures genuinely lost
+files. Review item C-3 in `docs/research/2026-11-03-edge-hardening-review.md` is resolved
+by this mechanism.
+
+### Accepted boundary: deletion is one tick late, and can survive close
+
+Deletion now trails the index refresh by up to one compaction pass (default 5 s, or the
+next pass of a drain). Inside that window the source directories still occupy disk
+space — one pass's source window (≤ `source_window_segments` segments) — and are
+readable but scan-invisible. That is the intended trade: the data stays correct and
+queryable, at the cost of transiently duplicated bytes on disk. If the persisted-index
+refresh keeps failing, the marker stays pending and those source directories stay on
+disk (still invisible and readable) until a refresh succeeds; nothing accumulates beyond
+the pending markers' own source sets, since scan-invisible sources are never re-selected
+into a window.
+
+On `close()`, `compact_until_settled` runs its passes and then
+`sync_persisted_segments_from_disk_if_dirty` installs the outputs into the index; no
+compaction pass runs afterwards, so a marker whose outputs only became visible during
+that final refresh keeps its source directories and sentinels on disk until the next
+open. Startup replay (unconditional) removes them at the next boot, so the residue is
+bounded by one shutdown and never accumulates.
 
 ---
 

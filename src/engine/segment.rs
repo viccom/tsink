@@ -17,6 +17,7 @@ pub use self::loader::{
     read_segment_manifest,
 };
 pub(crate) use self::postings::SegmentPostingsIndex;
+pub(crate) use self::types::PENDING_REPLACEMENT_DELETE_SENTINEL;
 pub use self::types::{
     IndexedSegment, LoadedSegment, LoadedSegmentIndexes, LoadedSegments, PersistedSeries,
     SegmentLayout, SegmentManifest,

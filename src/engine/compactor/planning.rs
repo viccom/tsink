@@ -159,12 +159,21 @@ impl Compactor {
 
     fn compact_once_scoped(&self, scope: PassScope) -> Result<CompactionOutcome> {
         {
+            // Deferred-deletion stage two (C-3): a marker written by an earlier
+            // pass is applied here — its source directories are deleted — only
+            // once every output root is visible in the persisted index
+            // (`finalize_pending_replacements_gated`). This is the pass-start
+            // position the previous design used to *replay* markers
+            // unconditionally, which deleted the source directories a pass
+            // earlier than the index refresh; the gate makes that position safe
+            // without adding a lock or a new call site.
+            //
             // Marker application deletes source segment directories, so it must
             // serialize against the flush persist pipeline's registry catalog
             // build. The rest of the pass (survey, window load, merge, output
             // writes) does not delete anything and runs outside this gate.
             let _replacement_guard = self.segment_replacement_guard();
-            finalize_pending_compaction_replacements(&self.data_path)?;
+            self.finalize_pending_replacements_gated()?;
         }
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 

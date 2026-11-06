@@ -414,7 +414,7 @@ Each compaction pass:
 
 1. **Planning** (`compactor/planning.rs`) — selects a window of up to 16 source segments at the triggering level.
 2. **Execution** (`compactor/execution.rs`) — merge-sorts all chunks, deduplicates overlapping samples, re-encodes with optimal codecs, writes new target-level segment.
-3. **Atomic replacement** — the replacement is staged in `.compaction-replacements/` and renamed into place. If the process crashes mid-replacement, `finalize_pending_compaction_replacements` cleans up the staging area at next startup.
+3. **Deferred replacement** — a replacement marker is written to `.compaction-replacements/` and each source directory is marked with a `.pending-replacement-delete` sentinel, which hides it from every segment-directory scan while leaving the files on disk (so reads keep working). The source directories are deleted at the start of the next pass, once every output root is visible in the persisted index. If the process crashes mid-replacement, startup calls `finalize_pending_compaction_replacements`, which replays all pending markers unconditionally (no index exists yet).
 
 L2 is the default terminal level: no data leaves it, but once its segment count exceeds
 `l2_compaction_trigger` (32, `0` disables), background ticks run size-tiered **L2→L2

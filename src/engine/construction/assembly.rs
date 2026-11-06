@@ -25,6 +25,7 @@ impl StorageStateAssembly {
     ) -> Self {
         let StorageAssemblyResources {
             series_index_path,
+            persisted_index,
             next_segment_id,
             numeric_compactor,
             blob_compactor,
@@ -45,6 +46,7 @@ impl StorageStateAssembly {
                 numeric_lane_path,
                 blob_lane_path,
                 series_index_path.clone(),
+                persisted_index,
                 next_segment_id,
                 numeric_compactor,
                 blob_compactor,
@@ -102,6 +104,7 @@ impl StorageStateAssembly {
         numeric_lane_path: Option<PathBuf>,
         blob_lane_path: Option<PathBuf>,
         series_index_path: Option<PathBuf>,
+        persisted_index: Arc<RwLock<PersistedIndexState>>,
         next_segment_id: Arc<AtomicU64>,
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
@@ -118,7 +121,7 @@ impl StorageStateAssembly {
         observability: Arc<StorageObservabilityCounters>,
     ) -> PersistedStorageState {
         PersistedStorageState {
-            persisted_index: Arc::new(RwLock::new(PersistedIndexState::default())),
+            persisted_index,
             // W2-T2：长寿 catalog 缓存按 StorageBuilder 旋钮构造（0 = 不缓存）；
             // bootstrap 的一次性缓存不受影响。
             catalog_validate_cache: registry_catalog::CatalogEntryCache::from_knobs(

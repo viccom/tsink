@@ -42,6 +42,17 @@ impl SegmentLayout {
     }
 }
 
+/// 哨兵文件名：compaction 已发布替换（marker 落盘）但**尚未**删除的源段目录
+/// 内的标记文件。段目录扫描（`collect_segment_dirs`，所有列举路径的唯一收口）
+/// 跳过含该文件的目录，使「待删源段」在选窗、inventory、启动扫描与 retention
+/// sweep 里都不可见——源段目录本身留在盘上，直到内存持久化索引刷新完成
+/// （延迟删除，消除 compaction 后查询 NotFound 窗口，C-3）。
+///
+/// 权威待删清单仍是 `.compaction-replacements/` 内的 marker（含输出段列表，
+/// 崩溃兜底用）；哨兵只是「扫描不可见」的快速标记，两者由同一发布序列维护：
+/// 阶段一先写 marker 再写哨兵，阶段二先删源目录（含哨兵）再删 marker。
+pub(crate) const PENDING_REPLACEMENT_DELETE_SENTINEL: &str = ".pending-replacement-delete";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentManifest {
     pub segment_id: u64,

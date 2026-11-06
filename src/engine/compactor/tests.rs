@@ -2143,3 +2143,166 @@ fn close_drain_defers_l2_terminal_convergence() {
     assert!(stats.compacted, "background entry must still converge");
     assert_eq!((stats.source_level, stats.target_level), (Some(2), Some(2)));
 }
+
+/// C-3（延迟删除）：pending replacement 的源段目录**仍在盘上**（延迟删除窗口，
+/// 查询可读），但必须从所有段目录扫描里消失。
+///
+/// 窗口态模拟：marker 已落盘、每个源段目录内带哨兵——等价于「compaction 已
+/// 发布替换、索引刷新前的维护窗口」的生产现场。若扫描仍能看到这些源段，
+/// 选窗就会把「已经被替换」的源段再合并一次（源段被合并进新输出，marker
+/// 随后删除的却仍是同一批源段 → 数据重复/丢失），inventory 与 retention
+/// sweep 也会与 marker 的待删清单打架。
+///
+/// 断言面用 `load_segments_for_level` / `count_level_segment_dirs` /
+/// `list_segment_dirs`——三者都经 `collect_segment_dirs`，即全部扫描路径的
+/// 唯一收口。
+#[test]
+fn pending_replacement_sources_are_excluded_from_candidates() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "pending-source-exclusion")])
+        .unwrap()
+        .series_id;
+
+    // L2 里 4 个小源段（ts 首尾相接 [0,400)）+ 1 个合并输出段（同 400 点）。
+    write_l2_small_segments(&temp_dir, &registry, series_id, 4);
+    let merged_points: Vec<(i64, f64)> = (0..400i64).map(|ts| (ts, ts as f64)).collect();
+    write_level_segment(&temp_dir, 2, 1000, series_id, &registry, &merged_points);
+
+    let mut source_roots = Vec::new();
+    let mut output_root = None;
+    for segment in load_segments_for_level(temp_dir.path(), 2).unwrap() {
+        if segment.manifest.segment_id == 1000 {
+            output_root = Some(segment.root.clone());
+        } else {
+            source_roots.push(segment.root.clone());
+        }
+    }
+    let output_root = output_root.expect("fixture 必须含输出段");
+    assert_eq!(source_roots.len(), 4, "fixture 必须恰好 4 个源段");
+
+    // 生产写入路径的产物：marker（权威待删清单）+ 每源段目录内的哨兵
+    // （扫描不可见标记）。直接调用生产写入函数，不手工拼装。
+    execution::write_compaction_replacement_marker(
+        temp_dir.path(),
+        &source_roots,
+        std::slice::from_ref(&output_root),
+    )
+    .unwrap();
+
+    // 窗口态前置：源段目录与哨兵都在盘（延迟删除 = 文件还在，查询仍可读）。
+    // 哨兵名按契约写字面量（与 `segment::PENDING_REPLACEMENT_DELETE_SENTINEL`
+    // 同值）：本测要能在未实现的 HEAD 上编译并断言失败，而不是编译错误。
+    for root in &source_roots {
+        assert!(root.exists(), "窗口态前置：源段必须仍在盘");
+        assert!(
+            root.join(".pending-replacement-delete").exists(),
+            "窗口态前置：源段必须带哨兵：{}",
+            root.display()
+        );
+    }
+
+    // 核心断言：pending 源段对扫描不可见，只剩输出段。
+    let visible = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert_eq!(
+        visible.len(),
+        1,
+        "pending 源段必须被排除出候选，实际可见 {} 段（含源段时会被重复合并）",
+        visible.len()
+    );
+    assert_eq!(
+        visible[0].manifest.segment_id, 1000,
+        "唯一可见段必须是输出段"
+    );
+    assert_eq!(
+        crate::engine::segment::count_level_segment_dirs(temp_dir.path(), 2).unwrap(),
+        1,
+        "L2 目录计数（选窗前的廉价预闸）也必须只看到输出段"
+    );
+    let listed = crate::engine::segment::list_segment_dirs(temp_dir.path()).unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "全量段目录列举（inventory/启动扫描）也必须只看到输出段，实际 {} 项",
+        listed.len()
+    );
+
+    // marker 未被消费：删除还没发生（阶段二在索引刷新后的下一拍）。
+    let marker_dir = temp_dir.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    assert_eq!(
+        fs::read_dir(&marker_dir).unwrap().count(),
+        1,
+        "marker 必须仍待处理"
+    );
+}
+
+/// C-3 不变式（双向）：**哨兵存在 ⟺ marker 存在**。
+///
+/// 正向由 `pending_replacement_sources_are_excluded_from_candidates` 覆盖
+/// （写 marker 即写哨兵）。这里覆盖反向的失败路径：某个源段的哨兵写不进去时，
+/// 整拍必须失败**且**已经写下的哨兵要被撤掉、marker 不能留下。否则那些源段
+/// 会永久对扫描不可见（无 marker 就无人删它们），比整拍失败严重得多。
+///
+/// 注入方式：把一个源段目录换成普通文件，使其 `join(SENTINEL)` 的父路径不是
+/// 目录 → `create_new` 报 NotADirectory（真实写失败，不依赖权限或 mock）。
+#[test]
+fn sentinel_write_failure_rolls_back_marker_and_sentinels() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "sentinel-rollback")])
+        .unwrap()
+        .series_id;
+
+    write_l2_small_segments(&temp_dir, &registry, series_id, 2);
+    let merged_points: Vec<(i64, f64)> = (0..200i64).map(|ts| (ts, ts as f64)).collect();
+    write_level_segment(&temp_dir, 2, 1000, series_id, &registry, &merged_points);
+
+    let mut source_roots = Vec::new();
+    let mut output_root = None;
+    for segment in load_segments_for_level(temp_dir.path(), 2).unwrap() {
+        if segment.manifest.segment_id == 1000 {
+            output_root = Some(segment.root.clone());
+        } else {
+            source_roots.push(segment.root.clone());
+        }
+    }
+    let output_root = output_root.expect("fixture 必须含输出段");
+    assert_eq!(source_roots.len(), 2, "fixture 必须恰好 2 个源段");
+
+    // 第一个源段正常（哨兵会写成功），第二个源段换成普通文件（哨兵写必然失败，
+    // 且失败发生在第一个之后 → 触发回滚分支）。
+    let broken_root = source_roots[1].clone();
+    fs::remove_dir_all(&broken_root).unwrap();
+    fs::write(&broken_root, b"not a directory").unwrap();
+
+    let result = execution::write_compaction_replacement_marker(
+        temp_dir.path(),
+        &source_roots,
+        std::slice::from_ref(&output_root),
+    );
+    assert!(
+        result.is_err(),
+        "哨兵写失败必须让 marker 发布整拍失败，实际 {result:?}"
+    );
+
+    // 反向不变式：不留 marker、不留任何哨兵。
+    let marker_dir = temp_dir.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    assert_eq!(
+        fs::read_dir(&marker_dir)
+            .map(|dir| dir.count())
+            .unwrap_or(0),
+        0,
+        "哨兵写失败必须回滚 marker（否则源段永久不可见且无人删）"
+    );
+    assert!(
+        !source_roots[0].join(".pending-replacement-delete").exists(),
+        "已写入的哨兵必须被回滚：{}",
+        source_roots[0].display()
+    );
+
+    // 现场可读：正常源段与输出段仍完整。
+    assert!(source_roots[0].join("manifest.bin").exists());
+    assert!(output_root.join("manifest.bin").exists());
+}

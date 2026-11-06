@@ -78,6 +78,11 @@ const LAST_TRANSITION_L2_TO_L2: u8 = 3;
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
 
+/// "Is this segment root already visible in the live persisted index?"
+/// predicate wired by the engine for C-3 deferred deletion; see
+/// [`Compactor::replacement_output_visible`].
+pub(crate) type ReplacementOutputVisibility = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompactionReplacementMarker {
     version: u16,
@@ -149,6 +154,23 @@ pub struct Compactor {
     /// compactors (tests, retention rewriters) leave this unset, which
     /// disables the exclusion.
     retention_cutoff_provider: Option<Arc<dyn Fn() -> Option<i64> + Send + Sync>>,
+    /// Optional predicate answering "is this compaction *output* segment root
+    /// already visible in the live persisted index?".
+    ///
+    /// C-3 deferred deletion: source segments are no longer removed when the
+    /// replacement marker is published. They stay on disk (readable, so a
+    /// query whose chunk mapping was evicted by the mmap budget can re-map
+    /// instead of failing with `NotFound`) but are hidden from every directory
+    /// scan by a per-source-directory sentinel. The marker is applied — sources
+    /// deleted — only once every output root has entered the persisted index,
+    /// which is the point where the replacement is actually live.
+    ///
+    /// `None` = unconditional replay: standalone compactors (tests, retention
+    /// rewriters) and the *startup* replay (`bootstrap/discovery.rs`), where no
+    /// index exists yet and a crash-residue marker must be completed without
+    /// waiting for anything. `Some` = gated: a live engine wires the persisted
+    /// index read here (see `construction/resources.rs`).
+    replacement_output_visible: Option<ReplacementOutputVisibility>,
 }
 
 impl std::fmt::Debug for Compactor {
@@ -174,6 +196,10 @@ impl std::fmt::Debug for Compactor {
                 "retention_cutoff_provider",
                 &self.retention_cutoff_provider.is_some(),
             )
+            .field(
+                "replacement_output_visible",
+                &self.replacement_output_visible.is_some(),
+            )
             .finish()
     }
 }
@@ -192,6 +218,7 @@ impl Compactor {
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
             retention_cutoff_provider: None,
+            replacement_output_visible: None,
         }
     }
 
@@ -212,6 +239,7 @@ impl Compactor {
             last_compacted_transition: Arc::new(AtomicU8::new(LAST_TRANSITION_NONE)),
             segment_replacement_lock: None,
             retention_cutoff_provider: None,
+            replacement_output_visible: None,
         }
     }
 
@@ -267,6 +295,26 @@ impl Compactor {
     pub fn with_segment_replacement_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
         self.segment_replacement_lock = Some(lock);
         self
+    }
+
+    /// Wires the "output root is already in the persisted index" predicate
+    /// that gates applying a pending replacement marker (C-3 deferred
+    /// deletion). See the field docs on [`Compactor`]: `None` keeps the
+    /// unconditional crash-replay semantics (startup / standalone compactors).
+    pub fn with_replacement_output_visibility(
+        mut self,
+        visible: Option<ReplacementOutputVisibility>,
+    ) -> Self {
+        self.replacement_output_visible = visible;
+        self
+    }
+
+    /// Applies every pending replacement marker whose outputs are already live
+    /// (see [`Compactor::replacement_output_visible`]); unwired compactors
+    /// apply unconditionally. Caller must hold the segment-replacement gate.
+    pub(super) fn finalize_pending_replacements_gated(&self) -> Result<()> {
+        let gate = self.replacement_output_visible.as_deref();
+        self::execution::finalize_pending_compaction_replacements_gated(&self.data_path, gate)
     }
 
     /// Acquires the segment-replacement gate for the caller's next marker

@@ -3,6 +3,9 @@ use std::time::Instant;
 
 pub(in crate::engine::storage_engine) struct StorageAssemblyResources {
     pub(in crate::engine::storage_engine) series_index_path: Option<PathBuf>,
+    /// The one persisted-index handle shared by the engine state and the
+    /// compactors' deferred-deletion gate (C-3); never build a second one.
+    pub(in crate::engine::storage_engine) persisted_index: Arc<RwLock<PersistedIndexState>>,
     pub(in crate::engine::storage_engine) next_segment_id: Arc<AtomicU64>,
     pub(in crate::engine::storage_engine) numeric_compactor: Option<Compactor>,
     pub(in crate::engine::storage_engine) blob_compactor: Option<Compactor>,
@@ -106,6 +109,22 @@ impl ChunkStorage {
         // the flush persist pipeline through this lock; see CoordinationState.
         let segment_replacement_lock = Arc::new(Mutex::new(()));
         let retention_cutoff_provider = l2_retention_cutoff_provider(options);
+        // C-3 deferred deletion: the live compactors gate applying a pending
+        // replacement marker on "every output root is in the persisted index".
+        // The index itself is created by `StorageStateAssembly`, so this is a
+        // handle to the shared lock; `try_read` only (the predicate runs inside
+        // the compaction worker, which never holds an index write lock, and a
+        // blocked read must not stall the pass — an unreadable index simply
+        // defers deletion one more tick).
+        let persisted_index = Arc::new(RwLock::new(PersistedIndexState::default()));
+        let replacement_output_visible: Arc<dyn Fn(&Path) -> bool + Send + Sync> = {
+            let persisted_index = Arc::clone(&persisted_index);
+            Arc::new(move |root: &Path| {
+                persisted_index
+                    .try_read()
+                    .is_some_and(|index| index.segments_by_root.contains_key(root))
+            })
+        };
         let numeric_compactor = numeric_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
                 path,
@@ -117,6 +136,7 @@ impl ChunkStorage {
             .with_output_segment_point_budget(options.output_segment_point_budget)
             .with_l2_compaction_trigger(options.l2_compaction_trigger)
             .with_retention_cutoff_provider_opt(retention_cutoff_provider.clone())
+            .with_replacement_output_visibility(Some(Arc::clone(&replacement_output_visible)))
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -129,6 +149,7 @@ impl ChunkStorage {
             .with_output_segment_point_budget(options.output_segment_point_budget)
             .with_l2_compaction_trigger(options.l2_compaction_trigger)
             .with_retention_cutoff_provider_opt(retention_cutoff_provider.clone())
+            .with_replacement_output_visibility(Some(replacement_output_visible))
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -155,6 +176,7 @@ impl ChunkStorage {
 
         Ok(StorageAssemblyResources {
             series_index_path,
+            persisted_index,
             next_segment_id,
             numeric_compactor,
             blob_compactor,

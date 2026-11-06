@@ -237,9 +237,13 @@ fn compaction_replacement_releases_source_segment_maps() {
                 !index.segments_by_root.contains_key(root),
                 "replacement must remove source roots from the index"
             );
+            // C-3 延迟删除：索引刷新本身不删源段目录，删除发生在下一拍
+            // compaction 开头的门控重放（见
+            // `compaction_keeps_source_readable_until_index_refresh`）。
             assert!(
-                !root.exists(),
-                "compactor must delete the source segment directory on disk"
+                root.exists(),
+                "source segment directory must survive the index refresh (deferred deletion): {}",
+                root.display()
             );
         }
         assert_eq!(storage.persisted.segment_maps.resident_slots(), live_slots);
@@ -365,4 +369,150 @@ fn segment_map_remap_after_source_deleted_retries_once() {
             .load(Ordering::Acquire),
         2,
     );
+}
+
+/// C-3（延迟删除）：compaction 只写 replacement marker 并校验输出段，源段目录
+/// 必须保留到**内存持久化索引刷新之后**才删除。
+///
+/// 时序（关后台线程，精确复现生产窗口）：真实 compaction 跑完（可能多轮 drain
+/// 拍）→ 维护拍尚未跑（索引仍指向源段）→ 预算驱逐源段 mmap → 查询源段覆盖的
+/// 时间窗。源段目录若已被删除，`get_or_remap` 的 NotFound 会把查询打成错误
+/// （当前实现即如此）；延迟删除后源段仍在盘，重映射必须成功并返回全部点。
+#[test]
+fn compaction_keeps_source_readable_until_index_refresh() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_storage_with_mmap_budget(temp_dir.path(), 8, usize::MAX);
+
+    // 四条 series 共享同一时间窗 → 四个重叠 L0 段，compaction 必须合并成一个 L1。
+    let all_labels = (0..4i64)
+        .map(|round| vec![Label::new("host", format!("window-node-{round}"))])
+        .collect::<Vec<_>>();
+    for labels in &all_labels {
+        let rows = (0..25)
+            .map(|offset| {
+                Row::with_labels("cpu", labels.clone(), DataPoint::new(offset, offset as f64))
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage.flush_all_active().unwrap();
+        assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+    }
+
+    let (source_roots, source_slots) = {
+        let index = storage.persisted.persisted_index.read();
+        let roots = index.segments_by_root.keys().cloned().collect::<Vec<_>>();
+        let slots = index
+            .segments_by_root
+            .values()
+            .map(|segment| segment.segment_slot)
+            .collect::<Vec<_>>();
+        (roots, slots)
+    };
+    assert_eq!(source_roots.len(), 4, "fixture 必须恰好 4 个源段");
+
+    // 真实 compaction 路径：反复跑到无进展（等价于 drain 的多次拍）。
+    // 关键：全程不调用 refresh_dirty_persisted_segments_claimed —— 维护拍尚未跑，
+    // 索引仍指向源段。
+    let compactor = storage
+        .persisted
+        .numeric_compactor
+        .as_ref()
+        .expect("numeric lane must have a compactor");
+    let mut passes = 0usize;
+    loop {
+        let stats = compactor.compact_once_with_stats().unwrap();
+        if !stats.compacted {
+            break;
+        }
+        passes += 1;
+        assert!(passes < 8, "fixture compaction must settle");
+    }
+    assert!(passes >= 1, "fixture 必须真的跑过 compaction");
+
+    // 窗口态：索引未刷新（仍含源段），把源段的 mmap 全部驱逐。
+    {
+        let index = storage.persisted.persisted_index.read();
+        for root in &source_roots {
+            assert!(
+                index.segments_by_root.contains_key(root),
+                "索引刷新前源段必须仍在索引里：{}",
+                root.display()
+            );
+        }
+    }
+    storage.persisted.segment_maps.evict_all_for_tests();
+    clear_sealed_chunks(&storage);
+
+    // 查询源段覆盖的时间窗：源段仍在盘 → 重映射成功 → 数据完整。
+    for (round, labels) in all_labels.iter().enumerate() {
+        let points = storage.select("cpu", labels, 0, 25).unwrap_or_else(|err| {
+            panic!(
+                "series {round} 在索引刷新前必须仍可读（源段不得在索引刷新前删除），实际错误：{err}"
+            )
+        });
+        assert_eq!(
+            points.len(),
+            25,
+            "series {round} 在索引刷新前必须返回全部 25 点"
+        );
+    }
+
+    // 收口：索引刷新让「输出段已入索引」为真 → 下一拍 compaction 开头的门控
+    // 重放（阶段二）删除源段。
+    storage.refresh_dirty_persisted_segments_claimed().unwrap();
+    {
+        // 索引已不再引用源段（映射随之释放），但源段目录仍在盘：删除延迟到
+        // 下一拍 compaction（R3/R4 的语义，close 时残留到下次启动）。
+        let index = storage.persisted.persisted_index.read();
+        for root in &source_roots {
+            assert!(
+                !index.segments_by_root.contains_key(root),
+                "索引刷新后源段必须离开索引：{}",
+                root.display()
+            );
+        }
+    }
+    for slot in &source_slots {
+        assert!(
+            !storage.persisted.segment_maps.contains_slot(*slot),
+            "索引刷新后源段映射必须释放（slot {slot}）"
+        );
+    }
+    for root in &source_roots {
+        assert!(
+            root.exists(),
+            "源段目录必须留到下一拍 compaction（延迟删除）：{}",
+            root.display()
+        );
+    }
+
+    // 下一拍 compaction：门控放行 → 阶段二删源 + 消费 marker。
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(
+        !stats.compacted,
+        "收口拍不得产生新压缩（L0 已空），实际 {stats:?}"
+    );
+    for root in &source_roots {
+        assert!(
+            !root.exists(),
+            "门控放行后源段必须被删除：{}",
+            root.display()
+        );
+    }
+    let marker_dir = temp_dir.path().join(".compaction-replacements");
+    assert_eq!(
+        std::fs::read_dir(&marker_dir)
+            .map(|dir| dir.count())
+            .unwrap_or(0),
+        0,
+        "门控放行后 marker 必须被消费"
+    );
+
+    clear_sealed_chunks(&storage);
+    for (round, labels) in all_labels.iter().enumerate() {
+        let points = storage.select("cpu", labels, 0, 25).unwrap();
+        assert_eq!(points.len(), 25, "series {round} 刷新后仍须可读");
+    }
+
+    storage.close().unwrap();
 }

@@ -565,6 +565,20 @@ fn collect_segment_dirs(base: &Path, levels: impl IntoIterator<Item = u8>) -> Re
                 continue;
             }
 
+            // C-3 延迟删除：compaction 已发布替换、源段目录要等内存持久化
+            // 索引刷新后才删——期间源段仍在盘（查询可读），但必须从所有扫描
+            // 路径里消失：选窗若还能看到它们，会把「已被替换」的源段再合并
+            // 一次（活锁 + 幻影输出）；inventory/启动扫描/retention sweep 看到
+            // 它们会与 marker 的待删清单打架。哨兵是段目录内的一个空文件，
+            // 每候选目录一次 stat（只对本层列出的 `seg-` 目录，成本可忽略）。
+            if path
+                .join(super::types::PENDING_REPLACEMENT_DELETE_SENTINEL)
+                .symlink_metadata()
+                .is_ok()
+            {
+                continue;
+            }
+
             dirs.push(path);
         }
     }

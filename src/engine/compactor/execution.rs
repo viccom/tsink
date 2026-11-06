@@ -1,6 +1,8 @@
 use super::*;
 use tracing::warn;
 
+use crate::engine::segment::PENDING_REPLACEMENT_DELETE_SENTINEL;
+
 /// How many ids a compaction output tries before giving up on publish. The
 /// shared allocator starts as a scan-time snapshot, so a segment that appeared
 /// after that snapshot can already occupy the first allocated id.
@@ -18,6 +20,69 @@ fn output_segment_id_already_taken(err: &TsinkError) -> bool {
 
 fn compaction_replacement_dir(data_path: &Path) -> PathBuf {
     data_path.join(COMPACTION_REPLACEMENT_DIR)
+}
+
+/// 阶段一（扫描不可见标记）：在每个待删源段目录内放一个空哨兵文件。
+///
+/// 段目录扫描的唯一收口 `collect_segment_dirs` 会跳过含哨兵的目录，因此从
+/// 发布替换到索引刷新完成的这段窗口里，源段目录**留在盘上**（预算驱逐后的
+/// 重映射仍能读到真实数据）却对所有扫描路径不可见（不会被选窗重复合并、
+/// 不会被 inventory/retention 当成活段）。
+///
+/// 幂等：`create_new` 撞上已存在的哨兵（重放/重复发布）视为成功；源段目录
+/// 已消失（并发删除）同样视为成功。哨兵自身不做 fsync——它不是权威记录，
+/// marker 才是；崩溃后由启动期无条件重放删源目录（哨兵随目录一起消失）。
+///
+/// 失败即回滚：本函数自己负责撤掉**本次**新建的哨兵，保证「哨兵存在 ⟹
+/// marker 存在」双向成立。否则半途失败会留下无 marker 的哨兵——那些源段
+/// 将永久对扫描不可见、也永远不会被删（无 marker 就无人删它们），比整拍
+/// 失败严重得多。
+fn mark_pending_replacement_delete_sources(source_segments: &[PathBuf]) -> Result<()> {
+    let mut created = Vec::with_capacity(source_segments.len());
+    for source in source_segments {
+        let sentinel = source.join(PENDING_REPLACEMENT_DELETE_SENTINEL);
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&sentinel)
+        {
+            Ok(_) => created.push(sentinel),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // 源段目录已被删除（重放或并发清理）：无需再标记。
+            }
+            Err(err) => {
+                let rollback = clear_pending_replacement_delete_sentinels(&created);
+                if let Err(rollback_err) = rollback {
+                    return Err(TsinkError::Other(format!(
+                        "compaction replacement sentinel write failed and sentinel rollback failed: write={err}, rollback={rollback_err}"
+                    )));
+                }
+                return Err(TsinkError::IoWithPath {
+                    path: sentinel,
+                    source: err,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 撤掉给定的哨兵文件（marker 写失败时的补偿动作）。缺失视为成功。
+fn clear_pending_replacement_delete_sentinels(sentinels: &[PathBuf]) -> Result<()> {
+    for sentinel in sentinels {
+        match fs::remove_file(sentinel) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: sentinel.clone(),
+                    source: err,
+                })
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_relative_segment_path(path: &str) -> Result<&Path> {
@@ -68,7 +133,7 @@ pub(super) fn write_compaction_replacement_marker(
         ));
     }
 
-    let source_segments = source_segments
+    let marker_source_segments = source_segments
         .iter()
         .map(|path| segment_rel_path(data_path, path))
         .collect::<Result<Vec<_>>>()?;
@@ -78,7 +143,7 @@ pub(super) fn write_compaction_replacement_marker(
         .collect::<Result<Vec<_>>>()?;
     let marker = CompactionReplacementMarker {
         version: COMPACTION_REPLACEMENT_VERSION,
-        source_segments,
+        source_segments: marker_source_segments,
         output_segments,
     };
 
@@ -90,6 +155,22 @@ pub(super) fn write_compaction_replacement_marker(
     let marker_path = replacement_marker_path(data_path);
     let payload = serde_json::to_vec(&marker)?;
     write_file_atomically_and_sync_parent(&marker_path, &payload)?;
+
+    // 阶段一后半：marker 落盘之后才写哨兵（marker 是权威待删清单，先持久化
+    // 它；哨兵只是扫描不可见标记）。哨兵写失败则撤掉 marker 并让整拍失败：
+    // 保持「marker 存在 ⟹ 源段已带哨兵」这一不变式——否则源段对扫描仍可见，
+    // 下一拍会把已被替换的源段再合并一次。
+    if let Err(err) = mark_pending_replacement_delete_sources(source_segments) {
+        if let Err(remove_err) = fs::remove_file(&marker_path) {
+            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                return Err(TsinkError::Other(format!(
+                    "compaction replacement sentinel write failed and marker rollback failed: write={err}, rollback={remove_err}"
+                )));
+            }
+        }
+        return Err(err);
+    }
+
     Ok(marker_path)
 }
 
@@ -113,9 +194,11 @@ fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacem
     Ok(marker)
 }
 
-fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> Result<()> {
-    let marker = parse_compaction_replacement_marker(marker_path)?;
-
+fn apply_compaction_replacement_marker(
+    data_path: &Path,
+    marker_path: &Path,
+    marker: &CompactionReplacementMarker,
+) -> Result<()> {
     let output_segments = marker
         .output_segments
         .iter()
@@ -173,7 +256,28 @@ fn rollback_output_segments(output_segments: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Path) -> Result<()> {
+/// Replays every pending compaction replacement marker under `<data>/
+/// .compaction-replacements/`, in sorted order.
+///
+/// `gate` decides whether a marker may be applied *now*:
+/// - `None` — unconditional (startup replay and standalone compactors): a
+///   marker left behind by a crash is completed without waiting for anything.
+/// - `Some(predicate)` — gated on the live persisted index (C-3 deferred
+///   deletion). A marker is applied only once **every** output root it names
+///   is visible in the persisted index; until then the marker is left in
+///   place, its source directories stay on disk (hidden from scans by their
+///   sentinel) and readable, and the next compaction pass retries.
+///
+/// A blocked gated marker ends the scan (`break`) rather than being skipped:
+/// markers are applied in publish order, and a later marker's source set can
+/// contain an earlier marker's output (chained level promotion). Applying the
+/// later marker while the earlier one is pending would delete that earlier
+/// marker's outputs as sources and permanently strand it. Stopping preserves
+/// the chain order; the later marker simply waits one more pass.
+pub(super) fn finalize_pending_compaction_replacements_gated(
+    data_path: &Path,
+    gate: Option<&(dyn Fn(&Path) -> bool + Send + Sync)>,
+) -> Result<()> {
     let marker_dir = compaction_replacement_dir(data_path);
     let read_dir = match fs::read_dir(&marker_dir) {
         Ok(read_dir) => read_dir,
@@ -213,10 +317,36 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Pa
     marker_paths.sort();
 
     for marker_path in marker_paths {
-        apply_compaction_replacement_marker(data_path, &marker_path)?;
+        let marker = parse_compaction_replacement_marker(&marker_path)?;
+        if let Some(gate) = gate {
+            let outputs_visible = marker.output_segments.iter().all(|path| {
+                validate_relative_segment_path(path)
+                    .map(|relative| gate(&data_path.join(relative)))
+                    .unwrap_or(false)
+            });
+            if !outputs_visible {
+                // 输出段尚未进入持久化索引：替换还没生效，源段必须继续
+                // 留在盘上（查询可读）。留给下一拍/启动兜底。
+                //
+                // 必须**在此停下**而不是跳过继续：marker 按时间戳排序，后一个
+                // marker 的源段可能是前一个 marker 的输出段（同一 level 的级联
+                // 压缩：L0→L1 输出又在下一拍被 L1→L2 吃掉）。若前一个未放行
+                // 就应用后一个，后一个会把前一个的输出目录当源删掉，前一个
+                // 随后永远无法应用（输出段 manifest 缺失 = 硬错误）。停下即
+                // 保住「先发布者先落地」的链序，代价是后一个多等一拍。
+                break;
+            }
+        }
+        apply_compaction_replacement_marker(data_path, &marker_path, &marker)?;
     }
 
     Ok(())
+}
+
+/// Unconditional replay: startup recovery and standalone compactors. See
+/// [`finalize_pending_compaction_replacements_gated`].
+pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Path) -> Result<()> {
+    finalize_pending_compaction_replacements_gated(data_path, None)
 }
 
 impl Compactor {
@@ -400,13 +530,19 @@ impl Compactor {
         }
 
         if apply_replacement {
-            // Publishing the replacement (marker write + source deletion) is
-            // the only destructive step of a pass; gate exactly this against
-            // the flush persist pipeline, never the multi-GB merge above it.
+            // Stage one of the replacement (C-3 deferred deletion): publish the
+            // marker and hide every source directory from scans with a
+            // sentinel. The source directories stay on disk, readable, until
+            // stage two deletes them — which happens only after every output
+            // root has entered the persisted index (see
+            // `finalize_pending_compaction_replacements_gated`).
+            //
+            // Publishing is the only destructive step of a pass (it writes the
+            // marker that authorizes a later deletion), so gate exactly this
+            // against the flush persist pipeline, never the multi-GB merge above
+            // it.
             let _replacement_guard = self.segment_replacement_guard();
-            let replacement_marker_path =
-                write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
-            apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
+            write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
         }
 
         Ok(CompactionOutcome {
@@ -444,12 +580,10 @@ impl Compactor {
         apply_replacement: bool,
     ) -> Result<CompactionOutcome> {
         if apply_replacement {
-            // 与非空替换同一纪律：marker 写 + 源删除是破坏性步骤，先拿
-            // replacement gate 再动手
+            // 与非空替换同一纪律（C-3 延迟删除）：阶段一只写 marker + 哨兵，
+            // 源段目录留到索引刷新后的阶段二删除。
             let _replacement_guard = self.segment_replacement_guard();
-            let replacement_marker_path =
-                write_compaction_replacement_marker(&self.data_path, &source_roots, &[])?;
-            apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
+            write_compaction_replacement_marker(&self.data_path, &source_roots, &[])?;
         }
         Ok(CompactionOutcome {
             stats: CompactionRunStats {
