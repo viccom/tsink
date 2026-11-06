@@ -84,8 +84,11 @@
 | C-13 | 三路仲裁实际只有两路轮转（L0/L1 持续可触发时饿死 L2ToL2） | `6e618c9` |
 | C-15 | `pending_series` 子集为空时静默丢弃本拍 root 变更 | `9eb985c` |
 | C-16 | 合并支路丢弃 outcome（`SkippedUnchanged` 虚报为 checkpoint） | `9eb985c` |
+| C-3 | 删源到索引刷新之间的查询 NotFound 窗口（哨兵标记 + 门控重放，方案 A 根治） | `0d41878` |
 
-**仍开放**（需设计决策或后续排期）：C-3（W4-T0 resolver 在生产窗口内无效，需动删除时序——`docs/research/2026-11-03-edge-hardening-review.md §7` 有 A/B 方案对比，建议先做方案 B 登记）、C-14（series 预算 < 单条目致缓存塌缩）、C-17（close 128 拍上限静默截断）、R-3（Gate 2 去重遮蔽）、R-5~R-9、X-2~X-6。
+**C-3 实施记录**：第一版设计（重命名到隐藏暂存区）被实测证伪——四条致命问题（重命名关不上窗口、pass-start 重放破坏延迟删除、指定挂钩点是死代码、在该点取锁同线程自死锁）均已第一手复核。第二版改为**哨兵文件 + 门控重放**：阶段一写 marker 后在源段目录内放 `.pending-replacement-delete` 空文件（`collect_segment_dirs` 跳过含哨兵的目录，一处改动覆盖选窗/inventory/启动/retention 全部扫描路径）；阶段二挂在下一拍 compaction 开头，门控条件为「marker 全部输出段已进入持久化索引」。不引入新锁。门控未放行时 `break` 而非 `continue`（跨层链式压缩中后一 marker 的源段可能是前一 marker 的输出段）。详见复核报告 §7。
+
+**仍开放**（需设计决策或后续排期）：C-14（series 预算 < 单条目致缓存塌缩）、C-17（close 128 拍上限静默截断）、R-3（Gate 2 去重遮蔽）、R-5~R-9、X-2~X-6。
 
 ---
 

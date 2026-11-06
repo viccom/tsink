@@ -4,7 +4,7 @@
 > **权威计划**：`docs/plans/2026-10-30-edge-hardening-catalog-terminal-crash.md`（其「实施状态」表为进度权威）。
 > **方法**：三路只读深度审查子代理（W1 / W2+W3 / W4，第一轮）+ 两路横切面审查（旋钮观测文档 / 并发异常资源，第二轮）；主会话对**每一条**缺陷级结论做第一手取证——读代码行、穷举写点、实测运行、必要时自证伪。凡未能第一手复现的结论，标注「未复现」而非「确认」。
 > **基线**：初版报告基线 HEAD `76fb802`；第二轮横切面基线 HEAD `15951e1`。
-> **状态**：共确认 17 项缺陷（初版 7 + 横切面 4 + 并发 5 + 1 项已实证 flaky），**已修 15 项**；仍开放 C-3（需架构裁决，见 §7 简报）、C-14/C-17/X-2~X-6 与 R-3/R-5~R-9（登记待排期）。逐项状态见 §6。
+> **状态**：共确认 17 项缺陷，**已修 16 项**（含 C-3 根治，`0d41878`）；仍开放 C-14/C-17/X-2~X-6 与 R-3/R-5~R-9（登记待排期）。逐项状态见 §6。
 
 ## 0. 复核证据总表
 
@@ -237,7 +237,7 @@
 | C-14 series 预算 < 单条目 → 缓存塌缩到 1 条 | ⏳ 登记待排期 | — |
 | C-17 close 128 拍上限静默截断 | ⏳ 登记待排期 | — |
 | X-2~X-6（含锁内深拷贝） | ⏳ 登记待排期 | — |
-| C-3 删源时序根治 | ⏳ 需设计决策（§7 简报，建议先做方案 B） | — |
+| C-3 删源时序根治（哨兵 + 门控重放） | ✅ 已修（方案 A，含一次设计被证伪，见 §7） | `0d41878` |
 | R-3 Gate 2 去重遮蔽 | ⏳ 需增强断言或登记边界 | — |
 | R-5/R-6/R-7/R-9 | ⏳ 登记待排期 | — |
 | R-8 崩溃门禁 `no acknowledged writes` 偶发 | ⏳ 已实证 2/20，登记 flaky | — |
@@ -300,16 +300,29 @@
 | 查询侧把 NotFound 改为「跳过该 chunk」 | 静默丢数据（查询结果少点），不可接受 |
 | 查询侧在 NotFound 时重试整条查询 | 窗口内索引仍陈旧，重试仍失败；除非阻塞等索引刷新（引入查询侧等待与死锁风险） |
 
-### 两个可选方案
-| | A. 根治：待删暂存区（推荐若排期允许） | B. 接受 + 登记（推荐立即） |
-|---|---|---|
-| 做法 | 删源段改为**原子重命名**到 `.compaction-replacements/pending-delete/`（隐藏目录，loader 与候选扫描均忽略）→ marker 保留 → 维护拍索引刷新后删除暂存区 → 启动期 `finalize_pending_compaction_replacements` 兜底 | 保持现状；文档登记「窗口内查询可能瞬时失败，重试即成功」；保留计数器 |
-| 为何安全 | 重命名原子且对扫描不可见（不会重复入选候选）；marker 保留使崩溃重放仍幂等（现有 `finalize_pending_compaction_replacements` 已幂等） | 不引入新失败面；数据零风险 |
-| 改动面 | `execution.rs`（删源改暂存）、`publication.rs`/`maintenance`（刷新后清暂存）、启动 `finalize`（清残留暂存）、1-2 测试（真实窗口语义：删源后索引未刷新时查询不再失败） | 文档 2 处 + 1 测试钉住「重试可恢复」 |
-| 风险 | 中：动删除时序是数据风险面；磁盘峰值多占一个窗口的源段 | 低：窗口期查询失败在部署上表现为偶发 500，需调用方重试 |
-| 量级 | 一个完整任务（含红测与崩溃门禁） | 半小时 |
+### 方案 A 的实施记录（2026-11-06，含一次设计被证伪）
 
-**主会话建议**：立即做 B（把已知窗口写进 `docs/storage-engine.md` 与 `docs/compaction.md`，并在计划登记 C-3 未解），A 单开任务排期——理由是本批次已证明「动删除时序」需要专门的崩溃窗设计（D1/D2 两次都是在这里翻车），不应用收尾阶段的余量去做。
+**第一版设计（错误，已被实测推翻）**：原方案 A 描述为「删源段改为原子重命名到隐藏暂存区」。实施时先由子代理按主会话指令逐条核实，**四条致命问题全部被第一手复核证实**：
+
+| # | 致命问题 | 证据 |
+|---|---|---|
+| 1 | 重命名**关不上窗口**：索引 slot 仍指原路径，重命名后原路径照样不存在 | `query_read/snapshot.rs:97` 的 `?` 仍 NotFound |
+| 2 | 「阶段一不删 + finalize 语义不变」自相矛盾：`drain_compactors_with_budget`（`shutdown.rs:118-145`）在同一次 gate 持有内连跑多拍，第 1 拍的 marker 在第 2 拍开头的 `finalize`（`planning.rs:167`）就被重放删源——早于索引刷新。子代理探针实测：`PROBE pass1 sources_on_disk=4/4 read_ok=true` → `PROBE pass2 sources_on_disk=0/4 read_ok=false` | 探针输出 + 代码路径 |
+| 3 | 指定的阶段二挂钩点是**死代码**：`refresh_dirty_persisted_segments_claimed`（`catalog_refresh.rs:143-146`）known-dirty 分支成功即 `return Ok(())`，scanned 分支（`:155-166`）在生产路径不可达（compaction drain 结果总写 `pending_persisted_segment_diff`，`runtime.rs:331`） | 代码路径 |
+| 4 | 在该挂钩点取 `segment_replacement` 锁会**同线程重入自死锁**：`flush.rs:472` 持该锁后 `:473` 调 known-dirty 刷新；且锁序明写 `maintenance > compaction > segment replacement`（`utilities.rs:346`），反序 | 代码路径 + 锁序注释 |
+
+**第二版设计（已落地，`0d41878`）**——四处关键修正：
+1. **哨兵文件**取代重命名：阶段一在源段目录内 `create_new` 一个 `.pending-replacement-delete` 空文件；段目录扫描的唯一收口 `collect_segment_dirs`（`loader.rs:502`，6 处调用全覆盖）跳过含哨兵的目录。一处改动即让待删源段对选窗/inventory/启动扫描/retention sweep **全部不可见**，同时**留在盘上可读**——窗口关闭且无活锁。
+2. **门控重放**取代「pass-start 无条件重放」：marker 仅当**全部输出段已进入持久化索引**（`segments_by_root`，经 `try_read` 谓词）才应用。启动期与 standalone compactor 接线为 `None` = 无条件重放（崩溃兜底语义不变）。
+3. **阶段二就是门控重放本身**：索引刷新把「输出段入索引」变真，下一拍 compaction 开头（已持 `segment_replacement_guard`）自然完成删除。**不引入任何新锁**，彻底消除死锁与死代码问题。代价：删除延迟到下一拍（默认 5s），窗口内查询读源段（合法数据）。
+4. **门控未放行时 `break` 而非 `continue`**（实施中发现）：marker 按发布序，后一 marker 的源段可能是前一 marker 的输出段（跨层链式压缩）。`continue` 会把前一 marker 的输出当源删掉并使其永久搁浅（`DataCorruption("output segment missing manifest")` 稳定复现）。`break` 保住链序，代价是后者多等一拍。
+
+**验收**：`compactor` 34/34；lib **638 passed / 1 failed**（唯一失败为已知基线红，HEAD 同样红）/ 2 ignored；`ITER=20` 崩溃门禁 **80 轮 PASS**（36s，0 抖动）；fmt + clippy 净。红测三条：`pending_replacement_sources_are_excluded_from_candidates`、`compaction_keeps_source_readable_until_index_refresh`、`sentinel_write_failure_rolls_back_marker_and_sentinels`。
+
+**残留边界（已登记于 `docs/compaction.md`）**：close 的 `compact_until_settled` 之后不再有 compaction 拍，最后一批 marker 的源段与哨兵残留到下次启动由无条件重放清除（有界，不累积）。
+
+### 方案 B（未采用，保留供参考）
+保持现状 + 文档登记窗口。因用户裁决走 A，此方案未实施；其内容（登记「窗口内查询可能瞬时失败、重试即成功」）已被 A 的实现超越。
 
 ---
 
