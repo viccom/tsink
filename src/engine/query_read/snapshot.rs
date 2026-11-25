@@ -149,6 +149,16 @@ impl QuerySnapshotContext<'_> {
         )
     }
 
+    /// 取读栅栏后取快照（**唯一**允许取栅栏的入口）。
+    ///
+    /// 2026-11-25：`select_with_options_api` 的降采样分支会**先持有外层读栅栏**
+    /// （用于覆盖 rollup 候选判定 + 数据读取的整段），期间再调本函数就会对同一把
+    /// 锁二次取读锁；此时若有发布拍在排队写锁，parking_lot 的公平性会让内层请求
+    /// 排到写者之后，而写者又在等外层读锁 → 查询与发布拍互等（现场：所有 history
+    /// 查询卡死、写入继续、只能重启）。
+    ///
+    /// 故拆出 [`Self::snapshot_series_read_sources_locked`]：**调用方已持栅栏**时
+    /// 走 `_locked`，全链路对该锁最多获取一次。
     pub(super) fn snapshot_series_read_sources(
         self,
         series_id: SeriesId,
@@ -156,11 +166,23 @@ impl QuerySnapshotContext<'_> {
         end: i64,
         plan: TieredQueryPlan,
     ) -> Result<(SeriesReadSnapshot, MergePathShardSnapshotStats)> {
-        let visibility_guard = self.visibility_read_fence();
+        let visibility_guard = self.visibility_read_fence_bounded()?;
+        let snapshot = self.snapshot_series_read_sources_locked(series_id, start, end, plan);
+        drop(visibility_guard);
+        snapshot
+    }
+
+    /// 快照读取主体（**调用方必须已持有可见性读栅栏**）。
+    pub(super) fn snapshot_series_read_sources_locked(
+        self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+    ) -> Result<(SeriesReadSnapshot, MergePathShardSnapshotStats)> {
         let persisted = self.snapshot_persisted_series_sources(series_id, start, end, plan)?;
         let (in_memory, shard_snapshot_stats) =
             self.snapshot_in_memory_series_sources(series_id, start, end);
-        drop(visibility_guard);
 
         let InMemorySeriesSourceSnapshot {
             sealed_chunks,

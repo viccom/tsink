@@ -17,6 +17,17 @@ trait SeriesQueryReadOps {
         out: &mut Vec<DataPoint>,
     ) -> Result<PersistedTierFetchStats>;
 
+    /// 同 [`Self::select_into_impl`]，但调用方已持有可见性读栅栏。
+    fn select_into_impl_locked(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats>;
+
     fn select_raw_series_page_with_plan(
         &self,
         metric: &str,
@@ -84,6 +95,13 @@ impl<'a> SeriesQueryContext<'a> {
         self.visibility_fence.read()
     }
 
+    /// 有上限的栅栏读等待（读不被发布拍永久拖死，2026-11-25）。
+    pub(super) fn visibility_read_fence_bounded(self) -> Result<RwLockReadGuard<'a, ()>> {
+        crate::engine::storage_engine::visibility::fence::try_read_visibility_fence_bounded(
+            self.visibility_fence,
+        )
+    }
+
     pub(super) fn resolve_series_batch(
         self,
         series: &[MetricSeries],
@@ -141,6 +159,20 @@ impl<'a> SeriesQueryContext<'a> {
     ) -> Result<PersistedTierFetchStats> {
         self.ops
             .select_into_impl(metric, labels, start, end, plan, out)
+    }
+
+    /// 同 [`Self::select_into`]，但**调用方已持有可见性读栅栏**（不再二次取锁）。
+    pub(super) fn select_into_locked(
+        self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats> {
+        self.ops
+            .select_into_impl_locked(metric, labels, start, end, plan, out)
     }
 
     pub(super) fn select_raw_series_page(
@@ -247,6 +279,13 @@ impl<'a> TimeRangeFilterContext<'a> {
         self.visibility_fence.read()
     }
 
+    /// 有上限的栅栏读等待（读不被发布拍永久拖死，2026-11-25）。
+    pub(super) fn visibility_read_fence_bounded(self) -> Result<RwLockReadGuard<'a, ()>> {
+        crate::engine::storage_engine::visibility::fence::try_read_visibility_fence_bounded(
+            self.visibility_fence,
+        )
+    }
+
     pub(super) fn refresh_missing_visibility_summaries(
         self,
         series_ids: &RoaringTreemap,
@@ -289,6 +328,18 @@ impl SeriesQueryReadOps for ChunkStorage {
         out: &mut Vec<DataPoint>,
     ) -> Result<PersistedTierFetchStats> {
         ChunkStorage::select_into_impl(self, metric, labels, start, end, plan, out)
+    }
+
+    fn select_into_impl_locked(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats> {
+        ChunkStorage::select_into_impl_locked(self, metric, labels, start, end, plan, out)
     }
 
     fn select_raw_series_page_with_plan(

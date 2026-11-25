@@ -128,7 +128,7 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
     ) -> Result<bool> {
-        let _visibility_guard = self.visibility_read_fence();
+        let _visibility_guard = self.visibility_read_fence_bounded()?;
         let tombstones = self.tombstones.read();
         let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
         let active = self.chunks.active_shard(series_id).read();

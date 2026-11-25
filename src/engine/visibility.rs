@@ -12,6 +12,6 @@ use crate::engine::tombstone::{self, TombstoneMap, TombstoneRange};
 #[path = "visibility/cache.rs"]
 mod cache;
 #[path = "visibility/fence.rs"]
-mod fence;
+pub(super) mod fence;
 #[path = "visibility/tombstones.rs"]
 mod tombstones;

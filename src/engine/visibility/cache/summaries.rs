@@ -333,7 +333,8 @@ impl ChunkStorage {
     where
         I: IntoIterator<Item = SeriesId>,
     {
-        let _visibility_guard = self.visibility_read_fence();
+        // 读侧统一走有预算的栅栏等待（2026-11-25）：无预算的读在发布拍异常时会永久挂死。
+        let _visibility_guard = self.visibility_read_fence_bounded()?;
         self.refresh_series_visible_timestamp_cache_locked(series_ids)
     }
 

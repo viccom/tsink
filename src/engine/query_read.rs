@@ -39,6 +39,13 @@ impl<'a> QuerySnapshotContext<'a> {
     fn visibility_read_fence(self) -> RwLockReadGuard<'a, ()> {
         self.visibility_fence.read()
     }
+
+    /// 有上限的栅栏读等待（读不被发布拍永久拖死，2026-11-25）。
+    fn visibility_read_fence_bounded(self) -> Result<RwLockReadGuard<'a, ()>> {
+        crate::engine::storage_engine::visibility::fence::try_read_visibility_fence_bounded(
+            self.visibility_fence,
+        )
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +108,7 @@ impl ChunkStorage {
         }
     }
 
+    /// 单 series 读取（**自行获取**可见性读栅栏）。
     pub(super) fn collect_points_for_series_into_with_plan(
         &self,
         series_id: SeriesId,
@@ -112,6 +120,51 @@ impl ChunkStorage {
         let (snapshot, shard_snapshot_stats) = self
             .query_snapshot_context()
             .snapshot_series_read_sources(series_id, start, end, plan)?;
+        self.collect_points_from_snapshot(
+            series_id,
+            start,
+            end,
+            snapshot,
+            shard_snapshot_stats,
+            out,
+        )
+    }
+
+    /// 单 series 读取（**调用方已持有可见性读栅栏**）。
+    ///
+    /// 2026-11-25 嵌套重入修复：`select_with_options_api` 的降采样分支已持外层读栅栏，
+    /// 内层必须走本入口，否则对同一把锁二次取读锁 → 与排队的发布拍互等（现场楔死）。
+    pub(super) fn collect_points_for_series_into_with_plan_locked(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats> {
+        let (snapshot, shard_snapshot_stats) = self
+            .query_snapshot_context()
+            .snapshot_series_read_sources_locked(series_id, start, end, plan)?;
+        self.collect_points_from_snapshot(
+            series_id,
+            start,
+            end,
+            snapshot,
+            shard_snapshot_stats,
+            out,
+        )
+    }
+
+    /// 快照 → 数据点的公共尾部（merge path / append-sort path 分派）。
+    fn collect_points_from_snapshot(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        snapshot: snapshot::SeriesReadSnapshot,
+        shard_snapshot_stats: snapshot::MergePathShardSnapshotStats,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats> {
         self.record_merge_path_shard_snapshot_stats(shard_snapshot_stats);
         #[cfg(test)]
         self.invoke_query_merge_in_memory_source_snapshot_hook();
@@ -166,6 +219,29 @@ impl ChunkStorage {
             return Ok(PersistedTierFetchStats::default());
         };
         self.collect_points_for_series_into_with_plan(series_id, start, end, plan, out)
+    }
+
+    /// 同 [`Self::select_into_impl`]，但调用方**已持有可见性读栅栏**（内层不再取锁）。
+    pub(super) fn select_into_impl_locked(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<PersistedTierFetchStats> {
+        let Some(series_id) = self
+            .catalog
+            .registry
+            .read()
+            .resolve_existing(metric, labels)
+            .map(|resolution| resolution.series_id)
+        else {
+            out.clear();
+            return Ok(PersistedTierFetchStats::default());
+        };
+        self.collect_points_for_series_into_with_plan_locked(series_id, start, end, plan, out)
     }
 
     pub(super) fn select_raw_series_page_with_plan(

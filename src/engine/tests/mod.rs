@@ -79,6 +79,8 @@ mod rollups;
 mod segment_map_residency;
 mod series_selection;
 mod timestamp_index_residency;
+mod visibility_fence_bounded;
+mod visibility_fence_reentrant;
 
 /// Lists on-disk WAL segments as `(segment_id, size_bytes)`, sorted by id.
 ///

@@ -142,13 +142,44 @@ enum MaintenanceInventorySource {
 pub(super) struct PersistedCatalogPublicationGuard<'a> {
     storage: &'a ChunkStorage,
     _visibility_guard: RwLockWriteGuard<'a, ()>,
+    /// 插桩：持写锁的进入时刻与线程名（诊断可见性栅栏阻塞用；2026-11-25 临时）
+    acquired_at: std::time::Instant,
+    thread_name: String,
+}
+
+impl<'a> Drop for PersistedCatalogPublicationGuard<'a> {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        if held > std::time::Duration::from_secs(5) {
+            tracing::warn!(
+                target: "tsink::diag",
+                held_ms = held.as_millis() as u64,
+                thread = %self.thread_name,
+                "DIAG publication fence released after long hold"
+            );
+        }
+    }
 }
 
 impl<'a> PersistedCatalogPublicationGuard<'a> {
     fn new(storage: &'a ChunkStorage) -> Self {
+        let t0 = std::time::Instant::now();
+        let guard = storage.visibility_write_fence();
+        let waited = t0.elapsed();
+        let thread_name = std::thread::current().name().unwrap_or("?").to_string();
+        if waited > std::time::Duration::from_millis(200) {
+            tracing::warn!(
+                target: "tsink::diag",
+                waited_ms = waited.as_millis() as u64,
+                thread = %thread_name,
+                "DIAG publication fence acquired (slow)"
+            );
+        }
         Self {
             storage,
-            _visibility_guard: storage.visibility_write_fence(),
+            _visibility_guard: guard,
+            acquired_at: std::time::Instant::now(),
+            thread_name,
         }
     }
 

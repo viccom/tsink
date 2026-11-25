@@ -6,6 +6,12 @@ impl ChunkStorage {
         super::invoke_commit_hook(&self.persist_test_hooks.query_persisted_chunk_decode_hook);
     }
 
+    /// 降采样查询已持有外层读栅栏之后触发：让测试在这个确定位置停住，
+    /// 从而确定性地排队一个写者（嵌套读锁重入回归）。
+    pub(in super::super) fn invoke_query_visibility_fence_held_hook(&self) {
+        super::invoke_commit_hook(&self.persist_test_hooks.query_visibility_fence_held_hook);
+    }
+
     pub(in super::super) fn set_shard_metadata_fallback_scan_hook<F>(&self, hook: F)
     where
         F: Fn() + Send + Sync + 'static,
@@ -227,6 +233,20 @@ impl ChunkStorage {
 
     pub(in super::super) fn clear_query_persisted_chunk_decode_hook(&self) {
         super::clear_commit_hook(&self.persist_test_hooks.query_persisted_chunk_decode_hook);
+    }
+
+    pub(in super::super) fn set_query_visibility_fence_held_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(
+            &self.persist_test_hooks.query_visibility_fence_held_hook,
+            hook,
+        );
+    }
+
+    pub(in super::super) fn clear_query_visibility_fence_held_hook(&self) {
+        super::clear_commit_hook(&self.persist_test_hooks.query_visibility_fence_held_hook);
     }
 
     pub(in super::super) fn invoke_metadata_all_series_seed_hook(&self) {

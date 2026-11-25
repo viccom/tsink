@@ -170,7 +170,14 @@ impl ChunkStorage {
                         .collect::<Vec<DataPoint>>()
                 }
             } else {
-                let _visibility_guard = context.visibility_read_fence();
+                // 外层读栅栏：覆盖 rollup 候选判定 + 数据读取的整段（保持"同一次查询看到
+                // 同一份可见性快照"）。**块内所有数据读取必须走 `*_locked` 变体**——
+                // 若内层对同一把锁二次取读锁，一旦有发布拍排队写锁，parking_lot 的公平性
+                // 会让内层请求排到写者之后，而写者又在等这把外层读锁 → 查询与发布拍互等
+                // （2026-11-25 现场：所有 history 查询卡死、写入继续、只能重启）。
+                let _visibility_guard = context.visibility_read_fence_bounded()?;
+                #[cfg(test)]
+                self.invoke_query_visibility_fence_held_hook();
                 let mut rollup_stats = PersistedTierFetchStats::default();
                 let mut used_rollup = false;
                 let mut partial_rollup = false;
@@ -190,7 +197,7 @@ impl ChunkStorage {
                         if covered_end > opts.start {
                             let rollup_plan = context.query_tier_plan(opts.start, covered_end);
                             let mut rollup_points = Vec::new();
-                            rollup_stats.accumulate(context.select_into(
+                            rollup_stats.accumulate(context.select_into_locked(
                                 candidate.metric.as_str(),
                                 &opts.labels,
                                 opts.start,
@@ -208,7 +215,7 @@ impl ChunkStorage {
                             if partial_rollup {
                                 let tail_plan = context.query_tier_plan(covered_end, opts.end);
                                 let mut raw_tail = Vec::new();
-                                rollup_stats.accumulate(context.select_into(
+                                rollup_stats.accumulate(context.select_into_locked(
                                     metric,
                                     &opts.labels,
                                     covered_end,
@@ -238,7 +245,7 @@ impl ChunkStorage {
                     processed
                 } else {
                     let mut points = Vec::new();
-                    let stats = context.select_into(
+                    let stats = context.select_into_locked(
                         metric,
                         &opts.labels,
                         opts.start,
