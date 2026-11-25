@@ -63,3 +63,12 @@ opt-level = 3
 
 [profile.bench]
 inherits = "release"
+
+# Local-only: slim debuginfo (keep file:line backtraces, drop variable/type detail).
+# Full detail for a debugger session: cargo build --profile dev-full
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev-full]
+inherits = "dev"
+debug = true
